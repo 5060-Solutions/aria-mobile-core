@@ -1,0 +1,209 @@
+namespace aria_mobile {
+    /// Initialize the Rust runtime. Must be called once at app startup.
+    void init_runtime();
+
+    /// Shut down the Rust runtime. Call on app termination.
+    void shutdown_runtime();
+};
+
+/// Configuration for connecting to the push gateway.
+dictionary GatewayConfig {
+    string base_url;
+    string api_key;
+};
+
+/// SIP account credentials for device registration.
+dictionary SipCredentials {
+    string username;
+    string password;
+    string domain;
+    string? registrar;
+    string transport;
+    u16 port;
+    string? auth_username;
+    string display_name;
+};
+
+/// Device registration request.
+dictionary DeviceRegistration {
+    string platform;
+    string push_token;
+    string? bundle_id;
+    SipCredentials sip;
+};
+
+/// Response from device registration.
+dictionary DeviceRegistrationResponse {
+    string device_id;
+    string auth_token;
+};
+
+/// Incoming call offer from the gateway.
+dictionary CallOffer {
+    string call_token;
+    string caller_uri;
+    string? caller_name;
+    string sdp_offer;
+};
+
+/// Current call state.
+enum CallState {
+    "Idle",
+    "Incoming",
+    "Ringing",
+    "Connecting",
+    "Connected",
+    "OnHold",
+    "Ended",
+};
+
+/// Call direction.
+enum CallDirection {
+    "Inbound",
+    "Outbound",
+};
+
+/// Information about an active call.
+dictionary CallInfo {
+    string call_id;
+    string remote_uri;
+    string? remote_name;
+    CallState state;
+    CallDirection direction;
+    boolean muted;
+    boolean on_hold;
+    u64 duration_secs;
+};
+
+/// Audio codec selection.
+enum AudioCodec {
+    "Pcmu",
+    "Pcma",
+    "Opus",
+    "G729",
+};
+
+/// RTP media statistics.
+dictionary MediaStats {
+    u64 packets_sent;
+    u64 packets_received;
+    u64 bytes_sent;
+    u64 bytes_received;
+    f64 jitter_ms;
+    u32 packet_loss;
+    f64 rtt_ms;
+};
+
+/// Push notification payload (parsed from APNs/FCM data).
+dictionary PushCallPayload {
+    string call_token;
+    string caller_uri;
+    string? caller_name;
+    string gateway_url;
+};
+
+/// Callback interface for receiving events from the Rust core.
+callback interface MobileEventHandler {
+    /// Called when registration state changes.
+    void on_registration_changed(string device_id, string status, string? error);
+
+    /// Called when an incoming call arrives (via push notification).
+    void on_incoming_call(CallOffer offer);
+
+    /// Called when call state changes.
+    void on_call_state_changed(CallInfo info);
+
+    /// Called when media statistics are updated.
+    void on_media_stats(string call_id, MediaStats stats);
+
+    /// Called when an error occurs.
+    void on_error(string context, string message);
+};
+
+/// The main mobile SIP engine interface.
+interface AriaMobileEngine {
+    /// Create a new engine with the given gateway configuration.
+    constructor(GatewayConfig gateway_config);
+
+    /// Set the event handler for receiving callbacks.
+    void set_event_handler(MobileEventHandler handler);
+
+    // ── Device Registration ─────────────────────────────────────────
+
+    /// Register this device with the push gateway.
+    /// Returns device_id and auth token.
+    [Throws=MobileError]
+    DeviceRegistrationResponse register_device(DeviceRegistration registration);
+
+    /// Unregister this device from the push gateway.
+    [Throws=MobileError]
+    void unregister_device(string device_id);
+
+    /// Update the push token (e.g., after token refresh).
+    [Throws=MobileError]
+    void update_push_token(string device_id, string new_token);
+
+    // ── Incoming Call Handling (via push gateway) ───────────────────
+
+    /// Process a push notification payload and retrieve the call offer.
+    [Throws=MobileError]
+    CallOffer handle_push_notification(PushCallPayload payload);
+
+    /// Accept an incoming call with local SDP answer.
+    [Throws=MobileError]
+    CallInfo accept_incoming_call(string call_token, sequence<AudioCodec> preferred_codecs);
+
+    /// Reject an incoming call.
+    [Throws=MobileError]
+    void reject_incoming_call(string call_token);
+
+    // ── Outgoing Calls (direct SIP) ────────────────────────────────
+
+    /// Make an outgoing call directly via SIP.
+    [Throws=MobileError]
+    CallInfo make_call(string uri, SipCredentials credentials, sequence<AudioCodec> preferred_codecs);
+
+    // ── Mid-call Controls ──────────────────────────────────────────
+
+    /// Hang up an active call.
+    [Throws=MobileError]
+    void hangup(string call_id);
+
+    /// Set mute state.
+    [Throws=MobileError]
+    void set_mute(string call_id, boolean muted);
+
+    /// Set hold state.
+    [Throws=MobileError]
+    void set_hold(string call_id, boolean on_hold);
+
+    /// Send a DTMF digit.
+    [Throws=MobileError]
+    void send_dtmf(string call_id, string digit);
+
+    // ── State Queries ──────────────────────────────────────────────
+
+    /// Get current call info, if any.
+    CallInfo? get_active_call();
+
+    /// Get media statistics for a call.
+    MediaStats? get_media_stats(string call_id);
+
+    // ── Audio ──────────────────────────────────────────────────────
+
+    /// Set the preferred audio codec order.
+    void set_codec_preferences(sequence<AudioCodec> codecs);
+};
+
+/// Errors that can occur in the mobile engine.
+[Error]
+enum MobileError {
+    "NetworkError",
+    "AuthenticationError",
+    "RegistrationFailed",
+    "CallFailed",
+    "MediaError",
+    "InvalidState",
+    "GatewayError",
+    "Timeout",
+};
