@@ -15,10 +15,10 @@ name = "aria_mobile_core"
 uniffi = { version = "0.28", features = ["cli"] }
 
 # Shared SIP utilities
-aria-sip-core = { path = "../aria-sip-core" }
+aria-sip-core = { git = "https://github.com/5060-Solutions/aria-sip-core.git" }
 
 # RTP media engine (no device feature on mobile — we use platform audio)
-rtp-engine = { path = "../rtp-engine", default-features = false, features = ["g711", "opus", "srtp"] }
+rtp-engine = { git = "https://github.com/5060-Solutions/rtp-engine.git", default-features = false, features = ["g711", "opus", "srtp"] }
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "macros"] }
