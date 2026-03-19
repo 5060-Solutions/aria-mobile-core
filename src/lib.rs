@@ -6,6 +6,7 @@
 //! - RTP media session management (codec encode/decode, SRTP)
 //! - UniFFI bindings for Swift (iOS) and Kotlin (Android)
 
+pub mod dns;
 mod gateway_client;
 mod media;
 mod types;
