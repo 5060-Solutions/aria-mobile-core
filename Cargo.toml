@@ -15,7 +15,7 @@ name = "aria_mobile_core"
 uniffi = { version = "0.28", features = ["cli"] }
 
 # Shared SIP utilities
-aria-sip-core = { git = "https://github.com/5060-Solutions/aria-sip-core.git" }
+sip-5060 = { git = "https://github.com/5060-Solutions/5060-sip.git" }
 
 # RTP media engine (no device feature on mobile — we use platform audio)
 rtp-engine = { git = "https://github.com/5060-Solutions/rtp-engine.git", default-features = false, features = ["g711", "opus", "srtp"] }
