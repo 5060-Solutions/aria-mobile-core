@@ -102,6 +102,18 @@ dictionary PushCallPayload {
     string gateway_url;
 };
 
+/// Callback interface for platform audio I/O (microphone + speaker).
+/// Implemented by the Android (Oboe/AudioTrack) or iOS (AudioUnit) layer.
+callback interface PlatformAudioBridge {
+    /// Called when decoded PCM audio is ready for playback (speaker).
+    /// Samples are mono i16 at the given sample rate.
+    void on_playback_audio(sequence<i16> samples, u32 sample_rate);
+
+    /// Called to request microphone audio for sending.
+    /// Should return mono i16 PCM at the given sample rate, frame_size samples.
+    sequence<i16> on_capture_audio(u32 sample_rate, u32 frame_size);
+};
+
 /// Callback interface for receiving events from the Rust core.
 callback interface MobileEventHandler {
     /// Called when registration state changes.
@@ -127,6 +139,9 @@ interface AriaMobileEngine {
 
     /// Set the event handler for receiving callbacks.
     void set_event_handler(MobileEventHandler handler);
+
+    /// Set the platform audio bridge for microphone/speaker I/O.
+    void set_audio_bridge(PlatformAudioBridge bridge);
 
     // ── Device Registration ─────────────────────────────────────────
 
@@ -191,8 +206,19 @@ interface AriaMobileEngine {
 
     // ── Audio ──────────────────────────────────────────────────────
 
+    /// Get RX audio level for a call (0.0 = silence).
+    f32 get_rx_audio_level(string call_id);
+
+    /// Get TX audio level for a call (0.0 = silence).
+    f32 get_tx_audio_level(string call_id);
+
     /// Set the preferred audio codec order.
     void set_codec_preferences(sequence<AudioCodec> codecs);
+
+    /// Check if any active call was ended by the remote party.
+    /// Returns the call_id if detected, null otherwise.
+    /// The app should call this periodically from a UI timer (~2s).
+    string? check_remote_hangup();
 };
 
 /// Errors that can occur in the mobile engine.

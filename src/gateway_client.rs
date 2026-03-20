@@ -103,6 +103,21 @@ impl GatewayClient {
         }
     }
 
+    /// Check if the api_key looks like a JWT (starts with "eyJ").
+    pub fn api_key_is_jwt(&self) -> bool {
+        self.api_key.starts_with("eyJ")
+    }
+
+    /// Get the raw api_key value.
+    pub fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
+    /// Get the base URL.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url.trim_end_matches('/'), path)
     }
@@ -250,13 +265,9 @@ impl GatewayClient {
         token: &str,
         registration: &DeviceRegistration,
     ) -> Result<DeviceRegistrationResponse, MobileError> {
-        // Resolve the SIP registrar domain via SRV so we can tell the
-        // gateway which server handles this domain.
-        let resolved_registrar = self
-            .resolve_sip_registrar(&registration.sip)
-            .await;
-
-        let mut req = RegisterDeviceRequest {
+        // Let the gateway handle SIP registrar resolution itself —
+        // passing a resolved IP:port can break the gateway's DNS parser.
+        let req = RegisterDeviceRequest {
             platform: registration.platform.clone(),
             push_token: registration.push_token.clone(),
             bundle_id: registration.bundle_id.clone(),
@@ -269,11 +280,6 @@ impl GatewayClient {
             sip_auth_username: registration.sip.auth_username.clone(),
             sip_display_name: registration.sip.display_name.clone(),
         };
-
-        // If SRV resolved a different registrar, use it
-        if let Some(ref addr) = resolved_registrar {
-            req.sip_registrar = Some(addr.clone());
-        }
 
         let target_count = self.resolved_target_count();
         let mut last_err = MobileError::NetworkError;
@@ -309,39 +315,7 @@ impl GatewayClient {
         Err(last_err)
     }
 
-    /// Resolve the SIP registrar/domain via SRV and return the best address
-    /// as a "host:port" string for the gateway to use.
-    async fn resolve_sip_registrar(&self, creds: &SipCredentials) -> Option<String> {
-        let domain = creds.registrar.as_deref().unwrap_or(&creds.domain);
 
-        // Skip if already an IP address
-        if domain.parse::<std::net::IpAddr>().is_ok() {
-            return None;
-        }
-
-        let transport = match creds.transport.to_lowercase().as_str() {
-            "udp" => dns::SipTransport::Udp,
-            "tcp" => dns::SipTransport::Tcp,
-            "tls" => dns::SipTransport::Tls,
-            _ => dns::SipTransport::Udp,
-        };
-
-        match dns::resolve_sip_server(domain, transport, creds.port).await {
-            Ok(targets) if !targets.is_empty() => {
-                let best = &targets[0];
-                log::info!(
-                    "SIP registrar SRV resolved {} -> {}:{} (priority={}, weight={})",
-                    domain,
-                    best.host,
-                    best.port,
-                    best.priority,
-                    best.weight,
-                );
-                Some(format!("{}:{}", best.addr.ip(), best.port))
-            }
-            _ => None,
-        }
-    }
 
     /// Unregister a device.
     pub async fn unregister_device(
@@ -447,16 +421,15 @@ impl GatewayClient {
         sdp_offer: &str,
         credentials: &crate::types::SipCredentials,
     ) -> Result<(String, String), MobileError> {
-        // Resolve the SIP registrar for the call credentials
-        let resolved_registrar = self.resolve_sip_registrar(credentials).await;
-
+        // Let the gateway handle DNS resolution — passing pre-resolved
+        // IP:port breaks the gateway's DNS parser.
         let req = MakeCallRequest {
             destination_uri: destination_uri.to_string(),
             sdp_offer: sdp_offer.to_string(),
             sip_username: credentials.username.clone(),
             sip_password: credentials.password.clone(),
             sip_domain: credentials.domain.clone(),
-            sip_registrar: resolved_registrar.or_else(|| credentials.registrar.clone()),
+            sip_registrar: credentials.registrar.clone(),
             sip_transport: credentials.transport.clone(),
             sip_port: credentials.port,
             sip_auth_username: credentials.auth_username.clone(),
@@ -492,6 +465,27 @@ impl GatewayClient {
         }
 
         Err(last_err)
+    }
+
+    /// Poll the status of a call. Returns "active", "ended", "cancelled", etc.
+    pub async fn get_call_status(
+        &self,
+        token: &str,
+        call_token: &str,
+    ) -> Result<CallStatusResponse, MobileError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/v1/calls/{}/status", call_token)))
+            .bearer_auth(token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(MobileError::CallFailed);
+        }
+
+        let body: CallStatusResponse = resp.json().await?;
+        Ok(body)
     }
 
     /// Hang up an active call via the gateway.

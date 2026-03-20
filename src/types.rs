@@ -143,6 +143,14 @@ pub struct PushCallPayload {
     pub gateway_url: String,
 }
 
+/// Response from call status polling.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CallStatusResponse {
+    pub status: String,
+    /// Reason the call ended (if status == "ended")
+    pub reason: Option<String>,
+}
+
 /// Errors from the mobile engine.
 #[derive(Debug, thiserror::Error)]
 pub enum MobileError {

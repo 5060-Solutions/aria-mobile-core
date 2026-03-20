@@ -12,9 +12,11 @@ mod media;
 mod types;
 
 use std::collections::HashMap;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use types::*;
+pub use media::PlatformAudioBridge;
 
 uniffi::include_scaffolding!("aria_mobile");
 
@@ -25,6 +27,13 @@ static RUNTIME: once_cell::sync::OnceCell<tokio::runtime::Runtime> =
 
 /// Initialize the tokio async runtime. Call once at app startup.
 fn init_runtime() {
+    #[cfg(target_os = "android")]
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Debug)
+            .with_tag("aria_mobile"),
+    );
+
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -61,6 +70,8 @@ pub trait MobileEventHandler: Send + Sync + 'static {
 pub struct AriaMobileEngine {
     gateway: gateway_client::GatewayClient,
     event_handler: RwLock<Option<Box<dyn MobileEventHandler>>>,
+    /// Platform audio bridge for mic/speaker I/O
+    audio_bridge: RwLock<Option<Arc<dyn media::PlatformAudioBridge>>>,
     /// Active calls keyed by call_id
     calls: Mutex<HashMap<String, ActiveCallState>>,
     /// Auth token from gateway
@@ -69,6 +80,9 @@ pub struct AriaMobileEngine {
     device_id: RwLock<Option<String>>,
     /// Preferred codecs
     codec_prefs: RwLock<Vec<AudioCodec>>,
+    /// Call IDs that were ended by the remote party (detected via polling).
+    /// The app checks this via `check_remote_hangup()`.
+    remote_ended: Arc<Mutex<Vec<String>>>,
 }
 
 struct ActiveCallState {
@@ -76,6 +90,8 @@ struct ActiveCallState {
     media: Option<media::MobileMediaSession>,
     /// For gateway-routed calls
     call_token: Option<String>,
+    /// Set to true to stop the status polling loop
+    poll_stop: Arc<AtomicBool>,
 }
 
 impl AriaMobileEngine {
@@ -86,6 +102,7 @@ impl AriaMobileEngine {
                 gateway_config.api_key,
             ),
             event_handler: RwLock::new(None),
+            audio_bridge: RwLock::new(None),
             calls: Mutex::new(HashMap::new()),
             auth_token: RwLock::new(None),
             device_id: RwLock::new(None),
@@ -94,12 +111,18 @@ impl AriaMobileEngine {
                 AudioCodec::Pcmu,
                 AudioCodec::Pcma,
             ]),
+            remote_ended: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     pub fn set_event_handler(&self, handler: Box<dyn MobileEventHandler>) {
         let mut eh = self.event_handler.write().unwrap();
         *eh = Some(handler);
+    }
+
+    pub fn set_audio_bridge(&self, bridge: Box<dyn media::PlatformAudioBridge>) {
+        let mut ab = self.audio_bridge.write().unwrap();
+        *ab = Some(Arc::from(bridge));
     }
 
     fn emit_call_state(&self, info: &CallInfo) {
@@ -131,13 +154,18 @@ impl AriaMobileEngine {
     ) -> Result<DeviceRegistrationResponse, MobileError> {
         let rt = runtime();
         rt.block_on(async {
-            // First get an auth token
-            let token = self
-                .gateway
-                .create_token(
-                    &format!("{}@{}", registration.sip.username, registration.sip.domain),
-                )
-                .await?;
+            // Use pre-existing token if the api_key looks like a JWT (starts with "eyJ"),
+            // otherwise obtain a new token from the gateway's /v1/auth/token endpoint.
+            let token = if self.gateway.api_key_is_jwt() {
+                log::info!("Using pre-supplied JWT as gateway auth token");
+                self.gateway.api_key().to_string()
+            } else {
+                self.gateway
+                    .create_token(
+                        &format!("{}@{}", registration.sip.username, registration.sip.domain),
+                    )
+                    .await?
+            };
 
             // Register the device
             let resp = self.gateway.register_device(&token, &registration).await?;
@@ -262,6 +290,8 @@ impl AriaMobileEngine {
                 duration_secs: 0,
             };
 
+            let poll_stop = Arc::new(AtomicBool::new(false));
+
             {
                 let mut calls = self.calls.lock().unwrap();
                 calls.insert(
@@ -269,10 +299,14 @@ impl AriaMobileEngine {
                     ActiveCallState {
                         info: info.clone(),
                         media: Some(media_session),
-                        call_token: Some(call_token),
+                        call_token: Some(call_token.clone()),
+                        poll_stop: poll_stop.clone(),
                     },
                 );
             }
+
+            // Start polling for remote hangup
+            self.start_call_status_poll(call_id.clone(), call_token, poll_stop);
 
             self.emit_call_state(&info);
             Ok(info)
@@ -307,7 +341,7 @@ impl AriaMobileEngine {
             };
 
             // Allocate RTP port and build SDP offer
-            let (mut media_session, sdp_offer) =
+            let (media_session, sdp_offer) =
                 media::create_offer_session(&codecs).await?;
 
             let call_id = format!("outgoing-{}", uuid::Uuid::new_v4().as_simple());
@@ -337,8 +371,18 @@ impl AriaMobileEngine {
                 media_session.update_remote(remote_addr);
             }
 
+            // Start RTP processing with platform audio bridge
+            if let Some(bridge) = self.audio_bridge.read().unwrap().clone() {
+                media_session.start_with_bridge(bridge);
+                log::info!("Started RTP media session with audio bridge");
+            } else {
+                log::warn!("No audio bridge set — call will have no audio");
+            }
+
             // Transition to connected
             info.state = CallState::Connected;
+
+            let poll_stop = Arc::new(AtomicBool::new(false));
 
             {
                 let mut calls = self.calls.lock().unwrap();
@@ -347,10 +391,14 @@ impl AriaMobileEngine {
                     ActiveCallState {
                         info: info.clone(),
                         media: Some(media_session),
-                        call_token: Some(call_token),
+                        call_token: Some(call_token.clone()),
+                        poll_stop: poll_stop.clone(),
                     },
                 );
             }
+
+            // Start polling for remote hangup
+            self.start_call_status_poll(call_id.clone(), call_token, poll_stop);
 
             self.emit_call_state(&info);
             log::info!("Outgoing call to {} connected via gateway", uri);
@@ -372,6 +420,9 @@ impl AriaMobileEngine {
             let Some(mut call) = call else {
                 return Err(MobileError::InvalidState);
             };
+
+            // Stop status polling
+            call.poll_stop.store(true, Ordering::Relaxed);
 
             // Stop media
             if let Some(media) = call.media.take() {
@@ -439,6 +490,89 @@ impl AriaMobileEngine {
         Ok(())
     }
 
+    // ── Call Status Polling ────────────────────────────────────────
+
+    /// Spawn a background task that polls the gateway for call status changes.
+    /// Detects remote hangup (BYE from PBX) and ends the local call.
+    fn start_call_status_poll(
+        &self,
+        call_id: String,
+        call_token: String,
+        stop: Arc<AtomicBool>,
+    ) {
+        let base_url = self.gateway.base_url().to_string();
+        let api_key = self.gateway.api_key().to_string();
+        let auth_token = self.auth_token.read().unwrap().clone().unwrap_or_default();
+        let remote_ended = Arc::clone(&self.remote_ended);
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            let gateway = gateway_client::GatewayClient::new(base_url, api_key);
+
+            rt.block_on(async {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                    if stop.load(Ordering::Relaxed) {
+                        log::debug!("Call status poll stopped for {}", call_id);
+                        break;
+                    }
+
+                    match gateway.get_call_status(&auth_token, &call_token).await {
+                        Ok(status) => {
+                            if status.status == "ended" || status.status == "unknown" {
+                                log::info!(
+                                    "Remote hangup detected for {} (reason: {:?})",
+                                    call_id,
+                                    status.reason,
+                                );
+                                stop.store(true, Ordering::Relaxed);
+                                remote_ended.lock().unwrap().push(call_id.clone());
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Call status poll error: {}", e);
+                        }
+                    }
+                }
+            });
+        });
+    }
+
+    /// Check if any active call was ended by the remote party.
+    /// Returns the call_id if so, and cleans up the call state.
+    /// The app should call this periodically (e.g., from a UI timer).
+    pub fn check_remote_hangup(&self) -> Option<String> {
+        let ended_id = {
+            let mut ended = self.remote_ended.lock().unwrap();
+            ended.pop()
+        };
+
+        if let Some(ref call_id) = ended_id {
+            let call = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.remove(call_id)
+            };
+
+            if let Some(mut call) = call {
+                call.poll_stop.store(true, Ordering::Relaxed);
+                if let Some(media) = call.media.take() {
+                    media.stop();
+                }
+                let mut info = call.info.clone();
+                info.state = CallState::Ended;
+                self.emit_call_state(&info);
+            }
+        }
+
+        ended_id
+    }
+
     // ── State Queries ───────────────────────────────────────────────
 
     pub fn get_active_call(&self) -> Option<CallInfo> {
@@ -455,6 +589,26 @@ impl AriaMobileEngine {
             .get(&call_id)
             .and_then(|c| c.media.as_ref())
             .map(|m| m.stats())
+    }
+
+    /// Get RX audio level (0.0 = silence, ~4000+ = loud speech).
+    pub fn get_rx_audio_level(&self, call_id: String) -> f32 {
+        let calls = self.calls.lock().unwrap();
+        calls
+            .get(&call_id)
+            .and_then(|c| c.media.as_ref())
+            .map(|m| m.rx_audio_level())
+            .unwrap_or(0.0)
+    }
+
+    /// Get TX audio level (0.0 = silence, ~4000+ = loud speech).
+    pub fn get_tx_audio_level(&self, call_id: String) -> f32 {
+        let calls = self.calls.lock().unwrap();
+        calls
+            .get(&call_id)
+            .and_then(|c| c.media.as_ref())
+            .map(|m| m.tx_audio_level())
+            .unwrap_or(0.0)
     }
 
     pub fn set_codec_preferences(&self, codecs: Vec<AudioCodec>) {
