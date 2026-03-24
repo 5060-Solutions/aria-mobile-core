@@ -215,6 +215,10 @@ interface AriaMobileEngine {
     /// Set the preferred audio codec order.
     void set_codec_preferences(sequence<AudioCodec> codecs);
 
+    /// Notify the core of a network connectivity change.
+    /// Call this from the platform when WiFi/cellular changes, or after reconnect.
+    void notify_network_change();
+
     /// Check if any active call was ended by the remote party.
     /// Returns the call_id if detected, null otherwise.
     /// The app should call this periodically from a UI timer (~2s).

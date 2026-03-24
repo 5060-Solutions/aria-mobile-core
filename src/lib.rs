@@ -615,4 +615,19 @@ impl AriaMobileEngine {
         let mut prefs = self.codec_prefs.write().unwrap();
         *prefs = codecs;
     }
+
+    /// Notify the core that the network has changed (WiFi→cellular, reconnect, etc.).
+    ///
+    /// Called by the platform (Android/iOS) when it detects a connectivity change.
+    /// Logs the event so active media sessions can detect the socket change on
+    /// their next send/recv and rebind. The gateway auth token remains valid
+    /// across network changes — no re-auth needed.
+    pub fn notify_network_change(&self) {
+        log::info!("Network change detected by platform");
+
+        let active_count = self.calls.lock().unwrap().len();
+        if active_count > 0 {
+            log::info!("Network change with {} active call(s) — media will rebind", active_count);
+        }
+    }
 }
