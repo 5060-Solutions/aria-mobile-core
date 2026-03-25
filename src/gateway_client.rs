@@ -317,6 +317,31 @@ impl GatewayClient {
 
 
 
+    /// Send a device heartbeat — forces SIP re-registration after network change.
+    pub async fn device_heartbeat(
+        &self,
+        token: &str,
+        device_id: &str,
+    ) -> Result<(), MobileError> {
+        let target_count = self.resolved_target_count();
+        for idx in 0..target_count {
+            let url = self.url_for_target(idx, &format!("/v1/devices/{}/heartbeat", device_id));
+            match self.http.post(&url).bearer_auth(token).send().await {
+                Ok(resp) if resp.status().is_success() || resp.status() == 204 => {
+                    log::info!("Device heartbeat successful for {}", device_id);
+                    return Ok(());
+                }
+                Ok(resp) => {
+                    log::warn!("Device heartbeat failed: {}", resp.status());
+                }
+                Err(e) => {
+                    log::warn!("Device heartbeat to {} failed: {}", url, e);
+                }
+            }
+        }
+        Err(MobileError::NetworkError)
+    }
+
     /// Unregister a device.
     pub async fn unregister_device(
         &self,

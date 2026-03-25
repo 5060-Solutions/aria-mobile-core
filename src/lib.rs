@@ -619,15 +619,49 @@ impl AriaMobileEngine {
     /// Notify the core that the network has changed (WiFi→cellular, reconnect, etc.).
     ///
     /// Called by the platform (Android/iOS) when it detects a connectivity change.
-    /// Logs the event so active media sessions can detect the socket change on
-    /// their next send/recv and rebind. The gateway auth token remains valid
-    /// across network changes — no re-auth needed.
+    /// Re-registers the device with the push gateway if a device_id is set,
+    /// and notifies active media sessions to rebind their sockets.
     pub fn notify_network_change(&self) {
         log::info!("Network change detected by platform");
 
+        // Send heartbeat to push gateway — re-registers SIP with fresh socket
+        let device_id = self.device_id.read().unwrap().clone();
+        let token = self.auth_token.read().unwrap().clone();
+        if let (Some(did), Some(tok)) = (device_id, token) {
+            log::info!("Sending heartbeat for device {} after network change", did);
+            // Build heartbeat URL and send via a simple HTTP POST.
+            // We avoid cloning GatewayClient by constructing the request directly.
+            let base_url = self.gateway.base_url().to_string();
+            let url = format!("{}/v1/devices/{}/heartbeat", base_url, did);
+            std::thread::spawn(move || {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    rt.block_on(async {
+                        let client = reqwest::Client::new();
+                        match client.post(&url).bearer_auth(&tok).send().await {
+                            Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 204 => {
+                                log::info!("Gateway heartbeat successful after network change");
+                            }
+                            Ok(resp) => {
+                                log::warn!("Gateway heartbeat failed: HTTP {}", resp.status());
+                            }
+                            Err(e) => {
+                                log::warn!("Gateway heartbeat failed: {}", e);
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
         let active_count = self.calls.lock().unwrap().len();
         if active_count > 0 {
-            log::info!("Network change with {} active call(s) — media will rebind", active_count);
+            log::info!(
+                "Network change with {} active call(s) — media sockets will rebind on next packet",
+                active_count
+            );
         }
     }
 }
