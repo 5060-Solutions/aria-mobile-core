@@ -4,6 +4,7 @@
 //! via DNS SRV records before connecting. If the primary server fails, it
 //! automatically tries the next target in the SRV priority list.
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::RwLock;
 use std::time::Duration;
@@ -11,13 +12,74 @@ use std::time::Duration;
 use crate::dns;
 use crate::types::*;
 
+/// Maximum size of a gateway JSON response we will buffer. Gateway payloads are
+/// small (tokens, SDP, call metadata); anything larger is treated as hostile.
+/// Bounding this prevents a malicious or MITM'd gateway from OOM-ing the app by
+/// streaming an unbounded body.
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read and deserialize a JSON response body, aborting if it exceeds
+/// [`MAX_RESPONSE_BYTES`]. Rejects up front on an oversized declared
+/// `Content-Length`, and also streams the body so a chunked response with no
+/// (or a lying) `Content-Length` is capped as it arrives rather than after the
+/// whole thing is buffered.
+async fn read_json_capped<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+) -> Result<T, MobileError> {
+    if let Some(len) = resp.content_length() {
+        if len > MAX_RESPONSE_BYTES as u64 {
+            log::warn!("gateway response declared {len} bytes, exceeds cap; rejecting");
+            return Err(MobileError::GatewayError);
+        }
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| MobileError::NetworkError)?;
+        if buf.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            log::warn!("gateway response exceeded {MAX_RESPONSE_BYTES} byte cap; aborting");
+            return Err(MobileError::GatewayError);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&buf).map_err(|_| MobileError::GatewayError)
+}
+
 pub struct GatewayClient {
     base_url: String,
     api_key: String,
     http: reqwest::Client,
-    /// Resolved gateway URLs from SRV lookup, ordered by priority.
+    /// Resolved gateway failover targets from SRV lookup, ordered by priority.
     /// First entry is the primary; rest are failover targets.
-    resolved_urls: RwLock<Vec<String>>,
+    resolved_targets: RwLock<Vec<ResolvedTarget>>,
+}
+
+/// A resolved SRV failover target.
+///
+/// The `url` keeps the **original gateway hostname** as its host so TLS SNI and
+/// certificate validation are performed against the domain (matching the cert's
+/// SANs), while `client` is pinned so the connection actually goes to the
+/// resolved IP address. Building the URL as `https://<ip>:<port>` instead —
+/// as the code previously did — makes rustls reject the certificate on a
+/// hostname mismatch, which silently broke HTTPS failover entirely.
+struct ResolvedTarget {
+    url: String,
+    client: reqwest::Client,
+}
+
+/// Build a failover URL that keeps `domain` as the host (so TLS validates
+/// against it) using the target `port`. The port is omitted when it is the
+/// scheme default, mirroring how the base URL is normally written.
+fn build_target_url(scheme: &str, domain: &str, port: u16, path_prefix: &str) -> String {
+    let is_tls = scheme == "https";
+    let host_port = if (is_tls && port == 443) || (!is_tls && port == 80) {
+        domain.to_string()
+    } else {
+        format!("{domain}:{port}")
+    };
+    format!("{scheme}://{host_port}{path_prefix}")
 }
 
 #[derive(Serialize)]
@@ -29,7 +91,8 @@ struct TokenRequest {
 #[derive(Deserialize)]
 struct TokenResponse {
     token: String,
-    #[allow(dead_code)]
+    /// Token lifetime in seconds, as reported by the gateway. Used by the
+    /// caller to schedule a transparent refresh before expiry.
     expires_in: u64,
 }
 
@@ -88,6 +151,28 @@ struct MakeCallResponse {
     sdp_answer: String,
 }
 
+/// Enforce TLS on the gateway base URL to protect the SIP password and JWT
+/// bearer token in transit. A `http://` URL to a non-loopback host is upgraded
+/// to `https://` (an on-path attacker on a cleartext link could otherwise
+/// capture full account credentials). Cleartext is tolerated only for local
+/// development against loopback / `.local` hosts.
+fn enforce_https(base_url: String) -> String {
+    if let Some(rest) = base_url.strip_prefix("http://") {
+        let host = rest.split(['/', ':']).next().unwrap_or("");
+        let is_local = host == "localhost"
+            || host == "127.0.0.1"
+            || host == "::1"
+            || host.ends_with(".local");
+        if !is_local {
+            log::warn!(
+                "Gateway base_url used cleartext http://; upgrading to https:// to protect credentials"
+            );
+            return format!("https://{rest}");
+        }
+    }
+    base_url
+}
+
 impl GatewayClient {
     pub fn new(base_url: String, api_key: String) -> Self {
         let http = reqwest::Client::builder()
@@ -96,11 +181,22 @@ impl GatewayClient {
             .expect("Failed to create HTTP client");
 
         Self {
-            base_url,
+            base_url: enforce_https(base_url),
             api_key,
             http,
-            resolved_urls: RwLock::new(Vec::new()),
+            resolved_targets: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Build an HTTP client pinned so that `domain` resolves to `addr`. This
+    /// lets us connect to a specific SRV-resolved IP while TLS still validates
+    /// the certificate against the original hostname (SNI + cert SANs).
+    fn build_pinned_client(domain: &str, addr: std::net::SocketAddr) -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .resolve(domain, addr)
+            .build()
+            .expect("Failed to create pinned HTTP client")
     }
 
     /// Check if the api_key looks like a JWT (starts with "eyJ").
@@ -122,15 +218,21 @@ impl GatewayClient {
         format!("{}{}", self.base_url.trim_end_matches('/'), path)
     }
 
-    /// Build a URL using one of the resolved SRV targets instead of the
-    /// original base_url. Falls back to the original base_url if no resolved
-    /// targets are available.
-    fn url_for_target(&self, target_idx: usize, path: &str) -> String {
-        let resolved = self.resolved_urls.read().unwrap();
-        if let Some(base) = resolved.get(target_idx) {
-            format!("{}{}", base.trim_end_matches('/'), path)
+    /// Select the (client, url) to use for a given failover target index.
+    ///
+    /// For a resolved SRV target this returns a client pinned to that target's
+    /// IP together with a URL whose host is the original gateway domain, so TLS
+    /// validation uses the domain while the connection reaches the resolved IP.
+    /// Falls back to the base client and base_url when no targets are resolved.
+    fn target_request(&self, target_idx: usize, path: &str) -> (reqwest::Client, String) {
+        let resolved = self.resolved_targets.read().unwrap();
+        if let Some(t) = resolved.get(target_idx) {
+            (
+                t.client.clone(),
+                format!("{}{}", t.url.trim_end_matches('/'), path),
+            )
         } else {
-            self.url(path)
+            (self.http.clone(), self.url(path))
         }
     }
 
@@ -175,29 +277,28 @@ impl GatewayClient {
                 let scheme = url.scheme();
                 let path_prefix = url.path().trim_end_matches('/');
 
-                let urls: Vec<String> = targets
+                // For each SRV target, keep the ORIGINAL domain in the URL (so
+                // TLS validates against it) and pin the client's DNS to the
+                // resolved IP. This is what makes HTTPS failover work: a URL
+                // with a bare IP host would fail rustls hostname verification.
+                let resolved_targets: Vec<ResolvedTarget> = targets
                     .iter()
-                    .map(|t| {
-                        let host_port = if (is_tls && t.port == 443)
-                            || (!is_tls && t.port == 80)
-                        {
-                            t.addr.ip().to_string()
-                        } else {
-                            format!("{}:{}", t.addr.ip(), t.port)
-                        };
-                        format!("{}://{}{}", scheme, host_port, path_prefix)
+                    .map(|t| ResolvedTarget {
+                        url: build_target_url(scheme, &domain, t.port, path_prefix),
+                        client: Self::build_pinned_client(&domain, t.addr),
                     })
                     .collect();
 
                 log::info!(
-                    "Gateway SRV resolved {} -> {} targets (primary: {})",
+                    "Gateway SRV resolved {} -> {} targets (primary: {} via {})",
                     domain,
-                    urls.len(),
-                    urls[0],
+                    resolved_targets.len(),
+                    resolved_targets[0].url,
+                    targets[0].addr,
                 );
 
-                let mut resolved = self.resolved_urls.write().unwrap();
-                *resolved = urls;
+                let mut resolved = self.resolved_targets.write().unwrap();
+                *resolved = resolved_targets;
             }
             Ok(_) => {
                 log::debug!("No SRV targets for gateway domain {}", domain);
@@ -213,12 +314,15 @@ impl GatewayClient {
     /// Get the number of resolved gateway targets available for failover.
     #[allow(dead_code)]
     pub fn resolved_target_count(&self) -> usize {
-        let resolved = self.resolved_urls.read().unwrap();
+        let resolved = self.resolved_targets.read().unwrap();
         if resolved.is_empty() { 1 } else { resolved.len() }
     }
 
     /// Obtain a JWT auth token from the gateway, with SRV failover.
-    pub async fn create_token(&self, user_id: &str) -> Result<String, MobileError> {
+    ///
+    /// Returns the token together with its lifetime in seconds (`expires_in`)
+    /// so the caller can schedule a transparent refresh before expiry.
+    pub async fn create_token(&self, user_id: &str) -> Result<(String, u64), MobileError> {
         // Resolve gateway via SRV on first use
         let _ = self.resolve_gateway().await;
 
@@ -226,9 +330,8 @@ impl GatewayClient {
         let mut last_err = MobileError::NetworkError;
 
         for idx in 0..target_count {
-            let url = self.url_for_target(idx, "/v1/auth/token");
-            match self
-                .http
+            let (client, url) = self.target_request(idx, "/v1/auth/token");
+            match client
                 .post(&url)
                 .json(&TokenRequest {
                     user_id: user_id.to_string(),
@@ -242,8 +345,8 @@ impl GatewayClient {
                         log::error!("Token request failed: {}", resp.status());
                         return Err(MobileError::AuthenticationError);
                     }
-                    let body: TokenResponse = resp.json().await?;
-                    return Ok(body.token);
+                    let body: TokenResponse = read_json_capped(resp).await?;
+                    return Ok((body.token, body.expires_in));
                 }
                 Err(e) => {
                     log::warn!("Token request to {} failed: {} (trying next)", url, e);
@@ -285,9 +388,8 @@ impl GatewayClient {
         let mut last_err = MobileError::NetworkError;
 
         for idx in 0..target_count {
-            let url = self.url_for_target(idx, "/v1/devices");
-            match self
-                .http
+            let (client, url) = self.target_request(idx, "/v1/devices");
+            match client
                 .post(&url)
                 .bearer_auth(token)
                 .json(&req)
@@ -299,7 +401,7 @@ impl GatewayClient {
                         log::error!("Device registration failed: {}", resp.status());
                         return Err(MobileError::RegistrationFailed);
                     }
-                    let body: RegisterDeviceResponse = resp.json().await?;
+                    let body: RegisterDeviceResponse = read_json_capped(resp).await?;
                     return Ok(DeviceRegistrationResponse {
                         device_id: body.device_id,
                         auth_token: token.to_string(),
@@ -325,8 +427,9 @@ impl GatewayClient {
     ) -> Result<(), MobileError> {
         let target_count = self.resolved_target_count();
         for idx in 0..target_count {
-            let url = self.url_for_target(idx, &format!("/v1/devices/{}/heartbeat", device_id));
-            match self.http.post(&url).bearer_auth(token).send().await {
+            let (client, url) =
+                self.target_request(idx, &format!("/v1/devices/{}/heartbeat", device_id));
+            match client.post(&url).bearer_auth(token).send().await {
                 Ok(resp) if resp.status().is_success() || resp.status() == 204 => {
                     log::info!("Device heartbeat successful for {}", device_id);
                     return Ok(());
@@ -381,7 +484,7 @@ impl GatewayClient {
             return Err(MobileError::CallFailed);
         }
 
-        let body: GatewayCallOffer = resp.json().await?;
+        let body: GatewayCallOffer = read_json_capped(resp).await?;
         Ok(CallOffer {
             call_token: body.call_token,
             caller_uri: body.caller_uri,
@@ -465,9 +568,8 @@ impl GatewayClient {
         let mut last_err = MobileError::NetworkError;
 
         for idx in 0..target_count {
-            let url = self.url_for_target(idx, "/v1/calls");
-            match self
-                .http
+            let (client, url) = self.target_request(idx, "/v1/calls");
+            match client
                 .post(&url)
                 .bearer_auth(token)
                 .json(&req)
@@ -479,7 +581,7 @@ impl GatewayClient {
                         log::error!("Make call failed: {}", resp.status());
                         return Err(MobileError::CallFailed);
                     }
-                    let body: MakeCallResponse = resp.json().await?;
+                    let body: MakeCallResponse = read_json_capped(resp).await?;
                     return Ok((body.call_token, body.sdp_answer));
                 }
                 Err(e) => {
@@ -509,7 +611,7 @@ impl GatewayClient {
             return Err(MobileError::CallFailed);
         }
 
-        let body: CallStatusResponse = resp.json().await?;
+        let body: CallStatusResponse = read_json_capped(resp).await?;
         Ok(body)
     }
 
@@ -532,5 +634,45 @@ impl GatewayClient {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression test for the SRV-failover TLS hostname bug: failover URLs must
+    // keep the ORIGINAL domain as the host (never a bare IP), otherwise rustls
+    // rejects the certificate on a hostname mismatch and HTTPS failover breaks.
+    #[test]
+    fn failover_url_keeps_domain_not_ip() {
+        // Default TLS port -> host only, no explicit port.
+        assert_eq!(
+            build_target_url("https", "gw.example.com", 443, ""),
+            "https://gw.example.com"
+        );
+        // Non-default TLS port -> domain:port, path preserved.
+        assert_eq!(
+            build_target_url("https", "gw.example.com", 8443, "/api"),
+            "https://gw.example.com:8443/api"
+        );
+        // Default plain-HTTP port -> host only.
+        assert_eq!(
+            build_target_url("http", "gw.local", 80, ""),
+            "http://gw.local"
+        );
+        // Non-default plain-HTTP port -> domain:port.
+        assert_eq!(
+            build_target_url("http", "127.0.0.1", 8080, ""),
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    // The pinned client must build successfully so TLS can validate against the
+    // domain while connecting to the resolved IP.
+    #[test]
+    fn pinned_client_builds() {
+        let addr: std::net::SocketAddr = "203.0.113.10:443".parse().unwrap();
+        let _ = GatewayClient::build_pinned_client("gw.example.com", addr);
     }
 }

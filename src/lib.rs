@@ -14,6 +14,11 @@ mod types;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+/// Refresh the gateway auth token this many seconds before it actually expires,
+/// so an in-flight request never races the expiry boundary.
+const TOKEN_REFRESH_SKEW_SECS: u64 = 60;
 
 use types::*;
 pub use media::PlatformAudioBridge;
@@ -76,10 +81,18 @@ pub struct AriaMobileEngine {
     calls: Mutex<HashMap<String, ActiveCallState>>,
     /// Auth token from gateway
     auth_token: RwLock<Option<String>>,
+    /// Deadline after which `auth_token` is considered expired, computed from
+    /// the gateway's `expires_in`. `None` means "unknown lifetime" (e.g. an
+    /// app-supplied JWT) and disables automatic refresh.
+    token_expires_at: RwLock<Option<Instant>>,
     /// Registered device ID
     device_id: RwLock<Option<String>>,
     /// Preferred codecs
     codec_prefs: RwLock<Vec<AudioCodec>>,
+    /// The most recent device registration, retained so `update_push_token`
+    /// can re-register with a rotated push token without the app re-supplying
+    /// the full SIP credentials.
+    last_registration: RwLock<Option<DeviceRegistration>>,
     /// Call IDs that were ended by the remote party (detected via polling).
     /// The app checks this via `check_remote_hangup()`.
     remote_ended: Arc<Mutex<Vec<String>>>,
@@ -105,12 +118,14 @@ impl AriaMobileEngine {
             audio_bridge: RwLock::new(None),
             calls: Mutex::new(HashMap::new()),
             auth_token: RwLock::new(None),
+            token_expires_at: RwLock::new(None),
             device_id: RwLock::new(None),
             codec_prefs: RwLock::new(vec![
                 AudioCodec::Opus,
                 AudioCodec::Pcmu,
                 AudioCodec::Pcma,
             ]),
+            last_registration: RwLock::new(None),
             remote_ended: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -126,15 +141,33 @@ impl AriaMobileEngine {
     }
 
     fn emit_call_state(&self, info: &CallInfo) {
-        if let Some(handler) = self.event_handler.read().unwrap().as_ref() {
-            handler.on_call_state_changed(info.clone());
+        // Recover from a poisoned lock rather than panicking across the FFI
+        // boundary, and run the foreign callback inside catch_unwind so a
+        // panicking host callback cannot unwind across FFI (UB) or poison the
+        // lock for every subsequent caller.
+        let guard = self
+            .event_handler
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(handler) = guard.as_ref() {
+            let info = info.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler.on_call_state_changed(info);
+            }));
         }
     }
 
     #[allow(dead_code)]
     fn emit_error(&self, context: &str, message: &str) {
-        if let Some(handler) = self.event_handler.read().unwrap().as_ref() {
-            handler.on_error(context.to_string(), message.to_string());
+        let guard = self
+            .event_handler
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(handler) = guard.as_ref() {
+            let (context, message) = (context.to_string(), message.to_string());
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler.on_error(context, message);
+            }));
         }
     }
 
@@ -144,6 +177,84 @@ impl AriaMobileEngine {
             .unwrap()
             .clone()
             .ok_or(MobileError::AuthenticationError)
+    }
+
+    /// Store a freshly minted token and, when known, the deadline at which it
+    /// expires (derived from the gateway's `expires_in` seconds). Passing
+    /// `None` for `expires_in` disables automatic refresh for this token
+    /// (used for app-supplied JWTs whose lifetime we don't manage).
+    fn store_token(&self, token: String, expires_in: Option<u64>) {
+        {
+            let mut t = self.auth_token.write().unwrap();
+            *t = Some(token);
+        }
+        let mut e = self.token_expires_at.write().unwrap();
+        *e = expires_in.map(|secs| Instant::now() + Duration::from_secs(secs));
+    }
+
+    /// Return a currently-valid auth token, transparently refreshing it first
+    /// if it is missing or within [`TOKEN_REFRESH_SKEW_SECS`] of expiry.
+    ///
+    /// For a non-JWT `api_key` a new token is minted via the gateway's
+    /// `/v1/auth/token` endpoint (using the retained registration to rebuild
+    /// the `user_id`). App-supplied JWTs cannot be refreshed by us — the app is
+    /// responsible for supplying a fresh one — so those are returned as-is with
+    /// no refresh attempt (and no loop).
+    ///
+    /// Callable only from an async context; it never holds a lock across an
+    /// `.await`.
+    async fn ensure_valid_token(&self) -> Result<String, MobileError> {
+        // App-supplied JWT: we can't re-mint it, so just use what we have.
+        if self.gateway.api_key_is_jwt() {
+            return self.get_token();
+        }
+
+        let needs_refresh = {
+            let have_token = self.auth_token.read().unwrap().is_some();
+            let expires_at = *self.token_expires_at.read().unwrap();
+            match (have_token, expires_at) {
+                // No token yet — must obtain one.
+                (false, _) => true,
+                // Known deadline — refresh once we're inside the skew window.
+                (true, Some(deadline)) => {
+                    Instant::now() + Duration::from_secs(TOKEN_REFRESH_SKEW_SECS) >= deadline
+                }
+                // Have a token but no known expiry — assume it's still valid.
+                (true, None) => false,
+            }
+        };
+
+        if !needs_refresh {
+            return self.get_token();
+        }
+
+        // Rebuild the user_id from the retained registration to re-mint.
+        let user_id = {
+            let last = self
+                .last_registration
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match last.as_ref() {
+                Some(reg) => format!("{}@{}", reg.sip.username, reg.sip.domain),
+                // Nothing to refresh from — fall back to whatever we hold.
+                None => return self.get_token(),
+            }
+        };
+
+        match self.gateway.create_token(&user_id).await {
+            Ok((token, expires_in)) => {
+                log::info!("Refreshed gateway auth token (expires_in={}s)", expires_in);
+                self.store_token(token.clone(), Some(expires_in));
+                Ok(token)
+            }
+            Err(e) => {
+                log::warn!("Auth token refresh failed: {}", e);
+                // Fall back to the existing token if we still have one, so a
+                // transient refresh failure doesn't break an otherwise-usable
+                // (possibly still-valid) token; otherwise surface the error.
+                self.get_token().map_err(|_| e)
+            }
+        }
     }
 
     // ── Device Registration ─────────────────────────────────────────
@@ -156,25 +267,36 @@ impl AriaMobileEngine {
         rt.block_on(async {
             // Use pre-existing token if the api_key looks like a JWT (starts with "eyJ"),
             // otherwise obtain a new token from the gateway's /v1/auth/token endpoint.
-            let token = if self.gateway.api_key_is_jwt() {
+            // `expires_in` is `None` for a JWT (lifetime managed by the app) and
+            // `Some(secs)` for a minted token, which drives transparent refresh.
+            let (token, expires_in) = if self.gateway.api_key_is_jwt() {
                 log::info!("Using pre-supplied JWT as gateway auth token");
-                self.gateway.api_key().to_string()
+                (self.gateway.api_key().to_string(), None)
             } else {
-                self.gateway
+                let (token, expires_in) = self
+                    .gateway
                     .create_token(
                         &format!("{}@{}", registration.sip.username, registration.sip.domain),
                     )
-                    .await?
+                    .await?;
+                (token, Some(expires_in))
             };
 
             // Register the device
             let resp = self.gateway.register_device(&token, &registration).await?;
 
-            // Store auth state
+            // Retain the registration so a later push-token rotation can
+            // re-register without the app re-supplying SIP credentials.
             {
-                let mut t = self.auth_token.write().unwrap();
-                *t = Some(token);
+                let mut last = self
+                    .last_registration
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *last = Some(registration.clone());
             }
+
+            // Store auth state (token + its expiry deadline for auto-refresh)
+            self.store_token(token, expires_in);
             {
                 let mut d = self.device_id.write().unwrap();
                 *d = Some(resp.device_id.clone());
@@ -195,7 +317,7 @@ impl AriaMobileEngine {
     pub fn unregister_device(&self, device_id: String) -> Result<(), MobileError> {
         let rt = runtime();
         rt.block_on(async {
-            let token = self.get_token()?;
+            let token = self.ensure_valid_token().await?;
             self.gateway.unregister_device(&token, &device_id).await?;
 
             {
@@ -218,12 +340,22 @@ impl AriaMobileEngine {
     pub fn update_push_token(
         &self,
         _device_id: String,
-        _new_token: String,
+        new_token: String,
     ) -> Result<(), MobileError> {
-        // Re-register with new push token
-        // For now, the app should call unregister + register with the new token
-        log::info!("Push token update — re-registration required");
-        Ok(())
+        // Re-register with the rotated push token. Previously this was a silent
+        // no-op that returned Ok, so after the OS rotated the push token the
+        // device would stop receiving call pushes entirely. We re-use the
+        // retained registration, swap in the new token, and register again
+        // (the gateway treats registration as an upsert keyed by device).
+        let mut registration = {
+            let last = self
+                .last_registration
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            last.clone().ok_or(MobileError::InvalidState)?
+        };
+        registration.push_token = new_token;
+        self.register_device(registration).map(|_| ())
     }
 
     // ── Incoming Call Handling ───────────────────────────────────────
@@ -234,7 +366,7 @@ impl AriaMobileEngine {
     ) -> Result<CallOffer, MobileError> {
         let rt = runtime();
         rt.block_on(async {
-            let token = self.get_token()?;
+            let token = self.ensure_valid_token().await?;
             let offer = self
                 .gateway
                 .get_call_offer(&token, &payload.call_token)
@@ -255,7 +387,7 @@ impl AriaMobileEngine {
     ) -> Result<CallInfo, MobileError> {
         let rt = runtime();
         rt.block_on(async {
-            let token = self.get_token()?;
+            let token = self.ensure_valid_token().await?;
 
             // Get the call offer to know what codecs the remote supports
             let offer = self
@@ -278,7 +410,10 @@ impl AriaMobileEngine {
                 .accept_call(&token, &call_token, &sdp_answer)
                 .await?;
 
-            let call_id = format!("incoming-{}", &call_token[..8.min(call_token.len())]);
+            // Use the full call token, not a truncated prefix: two concurrent
+            // incoming calls whose tokens share the first 8 chars would collide
+            // on the same HashMap key, orphaning one call's media/poll threads.
+            let call_id = format!("incoming-{call_token}");
             let info = CallInfo {
                 call_id: call_id.clone(),
                 remote_uri: offer.caller_uri,
@@ -316,7 +451,7 @@ impl AriaMobileEngine {
     pub fn reject_incoming_call(&self, call_token: String) -> Result<(), MobileError> {
         let rt = runtime();
         rt.block_on(async {
-            let token = self.get_token()?;
+            let token = self.ensure_valid_token().await?;
             self.gateway.reject_call(&token, &call_token).await?;
             Ok(())
         })
@@ -332,7 +467,7 @@ impl AriaMobileEngine {
     ) -> Result<CallInfo, MobileError> {
         let rt = runtime();
         rt.block_on(async {
-            let token = self.get_token()?;
+            let token = self.ensure_valid_token().await?;
 
             let codecs = if preferred_codecs.is_empty() {
                 self.codec_prefs.read().unwrap().clone()
@@ -431,7 +566,7 @@ impl AriaMobileEngine {
 
             // If gateway-routed, send hangup to gateway
             if let Some(call_token) = &call.call_token {
-                if let Ok(token) = self.get_token() {
+                if let Ok(token) = self.ensure_valid_token().await {
                     let _ = self.gateway.hangup_call(&token, call_token).await;
                 }
             }

@@ -28,7 +28,10 @@ rtp-engine = { git = "https://github.com/5060-Solutions/rtp-engine.git", default
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "macros"] }
 
 # HTTP client for gateway API
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+# Streaming response bodies with a size cap (prevents OOM from a hostile gateway)
+futures-util = { version = "0.3", default-features = false }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
