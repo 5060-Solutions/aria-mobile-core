@@ -4,12 +4,48 @@
 //! via DNS SRV records before connecting. If the primary server fails, it
 //! automatically tries the next target in the SRV priority list.
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::RwLock;
 use std::time::Duration;
 
 use crate::dns;
 use crate::types::*;
+
+/// Maximum size of a gateway JSON response we will buffer. Gateway payloads are
+/// small (tokens, SDP, call metadata); anything larger is treated as hostile.
+/// Bounding this prevents a malicious or MITM'd gateway from OOM-ing the app by
+/// streaming an unbounded body.
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read and deserialize a JSON response body, aborting if it exceeds
+/// [`MAX_RESPONSE_BYTES`]. Rejects up front on an oversized declared
+/// `Content-Length`, and also streams the body so a chunked response with no
+/// (or a lying) `Content-Length` is capped as it arrives rather than after the
+/// whole thing is buffered.
+async fn read_json_capped<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+) -> Result<T, MobileError> {
+    if let Some(len) = resp.content_length() {
+        if len > MAX_RESPONSE_BYTES as u64 {
+            log::warn!("gateway response declared {len} bytes, exceeds cap; rejecting");
+            return Err(MobileError::GatewayError);
+        }
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| MobileError::NetworkError)?;
+        if buf.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            log::warn!("gateway response exceeded {MAX_RESPONSE_BYTES} byte cap; aborting");
+            return Err(MobileError::GatewayError);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&buf).map_err(|_| MobileError::GatewayError)
+}
 
 pub struct GatewayClient {
     base_url: String,
@@ -88,6 +124,28 @@ struct MakeCallResponse {
     sdp_answer: String,
 }
 
+/// Enforce TLS on the gateway base URL to protect the SIP password and JWT
+/// bearer token in transit. A `http://` URL to a non-loopback host is upgraded
+/// to `https://` (an on-path attacker on a cleartext link could otherwise
+/// capture full account credentials). Cleartext is tolerated only for local
+/// development against loopback / `.local` hosts.
+fn enforce_https(base_url: String) -> String {
+    if let Some(rest) = base_url.strip_prefix("http://") {
+        let host = rest.split(['/', ':']).next().unwrap_or("");
+        let is_local = host == "localhost"
+            || host == "127.0.0.1"
+            || host == "::1"
+            || host.ends_with(".local");
+        if !is_local {
+            log::warn!(
+                "Gateway base_url used cleartext http://; upgrading to https:// to protect credentials"
+            );
+            return format!("https://{rest}");
+        }
+    }
+    base_url
+}
+
 impl GatewayClient {
     pub fn new(base_url: String, api_key: String) -> Self {
         let http = reqwest::Client::builder()
@@ -96,7 +154,7 @@ impl GatewayClient {
             .expect("Failed to create HTTP client");
 
         Self {
-            base_url,
+            base_url: enforce_https(base_url),
             api_key,
             http,
             resolved_urls: RwLock::new(Vec::new()),
@@ -242,7 +300,7 @@ impl GatewayClient {
                         log::error!("Token request failed: {}", resp.status());
                         return Err(MobileError::AuthenticationError);
                     }
-                    let body: TokenResponse = resp.json().await?;
+                    let body: TokenResponse = read_json_capped(resp).await?;
                     return Ok(body.token);
                 }
                 Err(e) => {
@@ -299,7 +357,7 @@ impl GatewayClient {
                         log::error!("Device registration failed: {}", resp.status());
                         return Err(MobileError::RegistrationFailed);
                     }
-                    let body: RegisterDeviceResponse = resp.json().await?;
+                    let body: RegisterDeviceResponse = read_json_capped(resp).await?;
                     return Ok(DeviceRegistrationResponse {
                         device_id: body.device_id,
                         auth_token: token.to_string(),
@@ -381,7 +439,7 @@ impl GatewayClient {
             return Err(MobileError::CallFailed);
         }
 
-        let body: GatewayCallOffer = resp.json().await?;
+        let body: GatewayCallOffer = read_json_capped(resp).await?;
         Ok(CallOffer {
             call_token: body.call_token,
             caller_uri: body.caller_uri,
@@ -479,7 +537,7 @@ impl GatewayClient {
                         log::error!("Make call failed: {}", resp.status());
                         return Err(MobileError::CallFailed);
                     }
-                    let body: MakeCallResponse = resp.json().await?;
+                    let body: MakeCallResponse = read_json_capped(resp).await?;
                     return Ok((body.call_token, body.sdp_answer));
                 }
                 Err(e) => {
@@ -509,7 +567,7 @@ impl GatewayClient {
             return Err(MobileError::CallFailed);
         }
 
-        let body: CallStatusResponse = resp.json().await?;
+        let body: CallStatusResponse = read_json_capped(resp).await?;
         Ok(body)
     }
 

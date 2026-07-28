@@ -80,6 +80,10 @@ pub struct AriaMobileEngine {
     device_id: RwLock<Option<String>>,
     /// Preferred codecs
     codec_prefs: RwLock<Vec<AudioCodec>>,
+    /// The most recent device registration, retained so `update_push_token`
+    /// can re-register with a rotated push token without the app re-supplying
+    /// the full SIP credentials.
+    last_registration: RwLock<Option<DeviceRegistration>>,
     /// Call IDs that were ended by the remote party (detected via polling).
     /// The app checks this via `check_remote_hangup()`.
     remote_ended: Arc<Mutex<Vec<String>>>,
@@ -111,6 +115,7 @@ impl AriaMobileEngine {
                 AudioCodec::Pcmu,
                 AudioCodec::Pcma,
             ]),
+            last_registration: RwLock::new(None),
             remote_ended: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -126,15 +131,33 @@ impl AriaMobileEngine {
     }
 
     fn emit_call_state(&self, info: &CallInfo) {
-        if let Some(handler) = self.event_handler.read().unwrap().as_ref() {
-            handler.on_call_state_changed(info.clone());
+        // Recover from a poisoned lock rather than panicking across the FFI
+        // boundary, and run the foreign callback inside catch_unwind so a
+        // panicking host callback cannot unwind across FFI (UB) or poison the
+        // lock for every subsequent caller.
+        let guard = self
+            .event_handler
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(handler) = guard.as_ref() {
+            let info = info.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler.on_call_state_changed(info);
+            }));
         }
     }
 
     #[allow(dead_code)]
     fn emit_error(&self, context: &str, message: &str) {
-        if let Some(handler) = self.event_handler.read().unwrap().as_ref() {
-            handler.on_error(context.to_string(), message.to_string());
+        let guard = self
+            .event_handler
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(handler) = guard.as_ref() {
+            let (context, message) = (context.to_string(), message.to_string());
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler.on_error(context, message);
+            }));
         }
     }
 
@@ -169,6 +192,16 @@ impl AriaMobileEngine {
 
             // Register the device
             let resp = self.gateway.register_device(&token, &registration).await?;
+
+            // Retain the registration so a later push-token rotation can
+            // re-register without the app re-supplying SIP credentials.
+            {
+                let mut last = self
+                    .last_registration
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *last = Some(registration.clone());
+            }
 
             // Store auth state
             {
@@ -218,12 +251,22 @@ impl AriaMobileEngine {
     pub fn update_push_token(
         &self,
         _device_id: String,
-        _new_token: String,
+        new_token: String,
     ) -> Result<(), MobileError> {
-        // Re-register with new push token
-        // For now, the app should call unregister + register with the new token
-        log::info!("Push token update — re-registration required");
-        Ok(())
+        // Re-register with the rotated push token. Previously this was a silent
+        // no-op that returned Ok, so after the OS rotated the push token the
+        // device would stop receiving call pushes entirely. We re-use the
+        // retained registration, swap in the new token, and register again
+        // (the gateway treats registration as an upsert keyed by device).
+        let mut registration = {
+            let last = self
+                .last_registration
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            last.clone().ok_or(MobileError::InvalidState)?
+        };
+        registration.push_token = new_token;
+        self.register_device(registration).map(|_| ())
     }
 
     // ── Incoming Call Handling ───────────────────────────────────────
@@ -278,7 +321,10 @@ impl AriaMobileEngine {
                 .accept_call(&token, &call_token, &sdp_answer)
                 .await?;
 
-            let call_id = format!("incoming-{}", &call_token[..8.min(call_token.len())]);
+            // Use the full call token, not a truncated prefix: two concurrent
+            // incoming calls whose tokens share the first 8 chars would collide
+            // on the same HashMap key, orphaning one call's media/poll threads.
+            let call_id = format!("incoming-{call_token}");
             let info = CallInfo {
                 call_id: call_id.clone(),
                 remote_uri: offer.caller_uri,
