@@ -425,6 +425,24 @@ impl AriaMobileEngine {
                 duration_secs: 0,
             };
 
+            // Start RTP processing with the platform audio bridge. Without this
+            // the media session is created and stored but its RX/TX threads
+            // never run, so an ANSWERED INBOUND CALL HAS NO AUDIO in either
+            // direction. (The remote RTP address is already set by
+            // `create_answer_session` from the caller's SDP offer, so unlike the
+            // outbound path there is no separate `update_remote` step here.)
+            if let Some(bridge) = self
+                .audio_bridge
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
+                media_session.start_with_bridge(bridge);
+                log::info!("Started RTP media session with audio bridge (inbound)");
+            } else {
+                log::warn!("No audio bridge set — inbound call will have no audio");
+            }
+
             let poll_stop = Arc::new(AtomicBool::new(false));
 
             {
