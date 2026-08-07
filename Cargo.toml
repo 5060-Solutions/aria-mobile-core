@@ -30,17 +30,15 @@ ai = ["dep:aria-ai-core", "aria-ai-core/stt-whisper"]
 
 # On-device summarisation, on top of `ai`.
 #
-# Separate from `ai` because it does not work yet: whisper.cpp and llama.cpp each
-# vendor their own copy of ggml, and linking both into one binary collides
-# (`duplicate symbol: ggml_backend_buffer_set_usage`). On iOS the archive builds
-# and the clash is deferred to Xcode's final link, which is worse. The fix is to
-# build one shared ggml via WHISPER_USE_SYSTEM_GGML / LLAMA_USE_SYSTEM_GGML —
-# verified feasible, but it needs patched -sys crates. See
+# Pulls llama.cpp in alongside whisper.cpp. That combination only links because
+# aria-ai-core patches both -sys crates to share a single ggml; each vendors its
+# own copy otherwise, and the two collide
+# (`duplicate symbol: ggml_backend_buffer_set_usage`). See
 # aria-ai-core/docs/mobile-integration.md.
 #
-# Until that lands this feature will not link on Android and will misbehave on
-# iOS. Transcription via `ai` alone is unaffected.
-ai-summaries = ["ai", "aria-ai-core/llm-llama"]
+# Kept separate from `ai` because it roughly doubles the C++ build and the
+# on-device footprint, and transcription is useful without it.
+ai-summaries = ["ai", "aria-ai-core/stt-whisper-with-llm"]
 
 [dependencies]
 # UniFFI for Swift/Kotlin bindings
@@ -87,3 +85,13 @@ rand = "0.9"
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }
+
+# Must be repeated here: [patch.crates-io] only applies at a workspace root, so
+# depending on aria-ai-core does not inherit its patches. Without this,
+# `ai-summaries` fails to resolve whisper-rs-sys's `system-ggml` feature, which
+# only exists in the patched copy.
+#
+# The patches let whisper.cpp and llama.cpp share one ggml; see ../vendor/README.md.
+[patch.crates-io]
+whisper-rs-sys = { path = "../vendor/whisper-rs-sys" }
+llama-cpp-sys-2 = { path = "../vendor/llama-cpp-sys-2" }
