@@ -182,3 +182,49 @@ impl From<reqwest::Error> for MobileError {
         }
     }
 }
+
+// ── On-device AI (mirrors the `Ai*` dictionaries in aria_mobile.udl) ─────────
+
+/// One model the user can install.
+#[derive(Debug, Clone)]
+pub struct AiModel {
+    pub id: String,
+    pub display_name: String,
+    pub kind: String,
+    pub size_bytes: u64,
+    pub available: bool,
+    pub unavailable_reason: Option<String>,
+    pub installed: bool,
+}
+
+/// Progress of a model download. Polled, not pushed.
+#[derive(Debug, Clone)]
+pub struct AiDownloadProgress {
+    pub model_id: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub state: String,
+    pub error: Option<String>,
+}
+
+/// One utterance in a transcript.
+#[derive(Debug, Clone)]
+pub struct AiTranscriptSegment {
+    pub speaker: String,
+    pub start_ms: u32,
+    pub end_ms: u32,
+    pub text: String,
+}
+
+/// The finished result for one call.
+#[derive(Debug, Clone)]
+pub struct AiCallInsight {
+    pub call_id: String,
+    pub created_at: i64,
+    pub duration_secs: u32,
+    pub segments: Vec<AiTranscriptSegment>,
+    pub language: Option<String>,
+    pub summary_headline: Option<String>,
+    pub summary_points: Vec<String>,
+    pub status: String,
+}

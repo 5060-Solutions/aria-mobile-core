@@ -219,10 +219,117 @@ interface AriaMobileEngine {
     /// Call this from the platform when WiFi/cellular changes, or after reconnect.
     void notify_network_change();
 
+    // ── On-device AI ────────────────────────────────────────────────────────
+
+    /// Was this binary built with transcription support?
+    ///
+    /// Lets one app package probe at runtime instead of the host guessing from
+    /// its build flavour.
+    boolean ai_available();
+
+    /// Prepare on-device AI, storing models under `storage_dir`.
+    ///
+    /// The host owns the path — iOS Application Support, Android filesDir — so
+    /// nothing here hardcodes a platform location.
+    [Throws=MobileError]
+    void ai_init(string storage_dir);
+
+    /// Models this device could install, annotated with whether it can run them.
+    sequence<AiModel> ai_models();
+
+    /// Start downloading a model. Poll `ai_download_progress` for state.
+    [Throws=MobileError]
+    void ai_start_download(string model_id);
+
+    AiDownloadProgress? ai_download_progress(string model_id);
+
+    void ai_cancel_download(string model_id);
+
+    [Throws=MobileError]
+    void ai_delete_model(string model_id);
+
+    /// Begin capturing a call's audio for later transcription.
+    ///
+    /// Audio is tapped where it is decoded, so calling this does not move any
+    /// samples across this boundary. Safe to call mid-call.
+    [Throws=MobileError]
+    void ai_start_capture(string call_id);
+
+    /// Stop capturing without transcribing.
+    void ai_stop_capture(string call_id);
+
+    /// Transcribe what was captured, and summarise it when an LLM is installed.
+    ///
+    /// Runs the models, so it takes seconds to minutes depending on call length
+    /// and device. Call it off the UI thread.
+    [Throws=MobileError]
+    AiCallInsight ai_transcribe(string call_id);
+
+    /// Discard a captured call without transcribing it.
+    void ai_discard_capture(string call_id);
+
     /// Check if any active call was ended by the remote party.
     /// Returns the call_id if detected, null otherwise.
     /// The app should call this periodically from a UI timer (~2s).
     string? check_remote_hangup();
+};
+
+// ── On-device AI (feature `ai`) ──────────────────────────────────────────────
+//
+// Transcription runs entirely on the device: call audio is tapped inside Rust,
+// where it already exists, and never crosses this boundary. The app only ever
+// sees control calls and finished text.
+//
+// Every call below is a no-op returning an error when the core was built
+// without the `ai` feature, so a host can ship one binary and probe at runtime
+// with `ai_available()`.
+
+/// One model the user can install.
+dictionary AiModel {
+    string id;
+    /// Plain-language name for the picker. Never show a bare model id.
+    string display_name;
+    /// "stt" or "llm".
+    string kind;
+    u64 size_bytes;
+    /// True when this device has the memory and class to run it.
+    boolean available;
+    /// Why it is unavailable, in words a user can act on.
+    string? unavailable_reason;
+    boolean installed;
+};
+
+/// Progress of a model download, polled rather than pushed.
+dictionary AiDownloadProgress {
+    string model_id;
+    u64 downloaded_bytes;
+    u64 total_bytes;
+    /// "queued", "running", "verifying", "completed", "cancelled", "failed".
+    string state;
+    string? error;
+};
+
+/// One utterance in a transcript.
+dictionary AiTranscriptSegment {
+    /// "local" (this handset) or "remote" (the far end).
+    string speaker;
+    u32 start_ms;
+    u32 end_ms;
+    string text;
+};
+
+/// The finished result for one call.
+dictionary AiCallInsight {
+    string call_id;
+    i64 created_at;
+    u32 duration_secs;
+    sequence<AiTranscriptSegment> segments;
+    string? language;
+    /// Present only when a summarisation model is installed and ran.
+    string? summary_headline;
+    sequence<string> summary_points;
+    /// "pending", "transcribing", "complete", "transcript_only", "failed".
+    string status;
 };
 
 /// Errors that can occur in the mobile engine.

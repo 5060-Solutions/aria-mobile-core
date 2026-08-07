@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 /// so an in-flight request never races the expiry boundary.
 const TOKEN_REFRESH_SKEW_SECS: u64 = 60;
 
+pub mod ai;
+
 use types::*;
 pub use media::PlatformAudioBridge;
 
@@ -87,6 +89,9 @@ pub struct AriaMobileEngine {
     token_expires_at: RwLock<Option<Instant>>,
     /// Registered device ID
     device_id: RwLock<Option<String>>,
+    /// On-device AI, created by `ai_init`. `None` until a host asks for it, so
+    /// a build with the feature on still costs nothing until it is used.
+    ai: RwLock<Option<Arc<ai::AiState>>>,
     /// Preferred codecs
     codec_prefs: RwLock<Vec<AudioCodec>>,
     /// The most recent device registration, retained so `update_push_token`
@@ -120,6 +125,7 @@ impl AriaMobileEngine {
             auth_token: RwLock::new(None),
             token_expires_at: RwLock::new(None),
             device_id: RwLock::new(None),
+            ai: RwLock::new(None),
             codec_prefs: RwLock::new(vec![
                 AudioCodec::Opus,
                 AudioCodec::Pcmu,
@@ -695,6 +701,106 @@ impl AriaMobileEngine {
                 }
             });
         });
+    }
+
+    // ── On-device AI ────────────────────────────────────────────────
+
+    /// Was this binary built with transcription support?
+    pub fn ai_available(&self) -> bool {
+        cfg!(feature = "ai")
+    }
+
+    /// Prepare on-device AI, storing models under `storage_dir`.
+    pub fn ai_init(&self, storage_dir: String) -> Result<(), MobileError> {
+        let state = ai::AiState::new(&storage_dir)?;
+        *self
+            .ai
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(state));
+        log::info!("on-device AI initialised at {storage_dir}");
+        Ok(())
+    }
+
+    fn ai_state(&self) -> Result<Arc<ai::AiState>, MobileError> {
+        self.ai
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or(MobileError::InvalidState)
+    }
+
+    pub fn ai_models(&self) -> Vec<AiModel> {
+        self.ai_state().map(|s| s.models()).unwrap_or_default()
+    }
+
+    pub fn ai_start_download(&self, model_id: String) -> Result<(), MobileError> {
+        self.ai_state()?.start_download(&model_id)
+    }
+
+    pub fn ai_download_progress(&self, model_id: String) -> Option<AiDownloadProgress> {
+        self.ai_state().ok()?.download_progress(&model_id)
+    }
+
+    pub fn ai_cancel_download(&self, model_id: String) {
+        if let Ok(s) = self.ai_state() {
+            s.cancel_download(&model_id);
+        }
+    }
+
+    pub fn ai_delete_model(&self, model_id: String) -> Result<(), MobileError> {
+        self.ai_state()?.delete_model(&model_id)
+    }
+
+    /// Begin capturing this call's audio.
+    ///
+    /// The tap is attached to the live media session, so audio starts flowing
+    /// to the AI from the next RTP packet and never crosses the FFI boundary.
+    #[cfg(feature = "ai")]
+    pub fn ai_start_capture(&self, call_id: String) -> Result<(), MobileError> {
+        let state = self.ai_state()?;
+        let session = state.start_capture(&call_id)?;
+        let calls = self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let call = calls.get(&call_id).ok_or(MobileError::InvalidState)?;
+        let media = call.media.as_ref().ok_or(MobileError::MediaError)?;
+        media.set_ai_tap(Some(session));
+        log::info!("AI capture started for {call_id}");
+        Ok(())
+    }
+
+    #[cfg(not(feature = "ai"))]
+    pub fn ai_start_capture(&self, _call_id: String) -> Result<(), MobileError> {
+        Err(MobileError::InvalidState)
+    }
+
+    /// Stop feeding the AI, without discarding what was captured.
+    pub fn ai_stop_capture(&self, call_id: String) {
+        #[cfg(feature = "ai")]
+        {
+            let calls = self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(media) = calls.get(&call_id).and_then(|c| c.media.as_ref()) {
+                media.set_ai_tap(None);
+            }
+        }
+        if let Ok(s) = self.ai_state() {
+            s.stop_capture(&call_id);
+        }
+    }
+
+    /// Transcribe a captured call, summarising it when an LLM is installed.
+    ///
+    /// Runs inference, so this blocks for seconds to minutes. Call it off the
+    /// UI thread.
+    pub fn ai_transcribe(&self, call_id: String) -> Result<AiCallInsight, MobileError> {
+        self.ai_stop_capture(call_id.clone());
+        self.ai_state()?.transcribe(&call_id)
+    }
+
+    /// Throw away a capture without transcribing it.
+    pub fn ai_discard_capture(&self, call_id: String) {
+        self.ai_stop_capture(call_id.clone());
+        if let Ok(s) = self.ai_state() {
+            s.discard(&call_id);
+        }
     }
 
     /// Check if any active call was ended by the remote party.
