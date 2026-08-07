@@ -14,9 +14,46 @@ name = "aria_mobile_core"
 name = "uniffi-bindgen"
 path = "uniffi-bindgen.rs"
 
+[features]
+default = []
+# On-device transcription and summarisation.
+#
+# aria-ai-core is depended on here, rather than shipped as a second UniFFI
+# library, so that call audio never crosses the FFI boundary: the RTP threads in
+# media.rs already hold the decoded PCM and hand it straight to the tap. The
+# alternative — surfacing frames to Kotlin/Swift and pushing them back — would
+# cross the boundary about a hundred times a second per call.
+#
+# Off by default: it pulls in whisper.cpp, a slow C++ build that a host not
+# shipping AI should not pay for.
+ai = ["dep:aria-ai-core", "aria-ai-core/stt-whisper"]
+
+# On-device summarisation, on top of `ai`.
+#
+# Separate from `ai` because it does not work yet: whisper.cpp and llama.cpp each
+# vendor their own copy of ggml, and linking both into one binary collides
+# (`duplicate symbol: ggml_backend_buffer_set_usage`). On iOS the archive builds
+# and the clash is deferred to Xcode's final link, which is worse. The fix is to
+# build one shared ggml via WHISPER_USE_SYSTEM_GGML / LLAMA_USE_SYSTEM_GGML —
+# verified feasible, but it needs patched -sys crates. See
+# aria-ai-core/docs/mobile-integration.md.
+#
+# Until that lands this feature will not link on Android and will misbehave on
+# iOS. Transcription via `ai` alone is unaffected.
+ai-summaries = ["ai", "aria-ai-core/llm-llama"]
+
 [dependencies]
 # UniFFI for Swift/Kotlin bindings
 uniffi = { version = "0.28", features = ["cli"] }
+
+# Optional on-device AI. `default-features = false` keeps its HTTP stack and
+# SQLite out unless a host asks for them; the mobile hosts enable what they need
+# via the `ai-*` features below.
+aria-ai-core = { path = "../aria-ai-core", optional = true, default-features = false, features = [
+    "net",
+    "disk-space",
+    "insights",
+] }
 
 # Shared SIP utilities
 sip-5060 = { git = "https://github.com/5060-Solutions/5060-sip.git" }

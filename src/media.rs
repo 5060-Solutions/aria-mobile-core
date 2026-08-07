@@ -32,6 +32,15 @@ pub trait PlatformAudioBridge: Send + Sync + 'static {
 
 // ── Media Session ──────────────────────────────────────────────────────────
 
+/// Where decoded call audio is handed to the on-device AI, if it is running.
+///
+/// Both legs are tapped inside Rust, at the point where the PCM already exists,
+/// so audio never crosses the FFI boundary. The tap is a ring-buffer write; the
+/// expensive work (resampling, VAD, inference) happens on the AI core's own
+/// drain thread, never on an RTP thread.
+#[cfg(feature = "ai")]
+pub type AiTap = std::sync::Arc<aria_ai_core::session::CallSession>;
+
 /// A media session for mobile — processes RTP with platform audio bridge.
 pub struct MobileMediaSession {
     rtp_socket: Arc<UdpSocket>,
@@ -51,6 +60,11 @@ pub struct MobileMediaSession {
     // Audio levels (RMS * 1000, stored as u64 for atomic access)
     rx_level: Arc<AtomicU64>,
     tx_level: Arc<AtomicU64>,
+    /// Optional on-device AI capture for this call. `None` until a host asks
+    /// for it, so a call with no AI running costs one uncontended lock per
+    /// frame and nothing else.
+    #[cfg(feature = "ai")]
+    ai_tap: Arc<Mutex<Option<AiTap>>>,
 }
 
 impl MobileMediaSession {
@@ -85,7 +99,23 @@ impl MobileMediaSession {
             bytes_received: Arc::new(AtomicU64::new(0)),
             rx_level: Arc::new(AtomicU64::new(0)),
             tx_level: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "ai")]
+            ai_tap: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Attach (or with `None`, detach) the on-device AI capture for this call.
+    ///
+    /// Safe to call at any point in the call: the RTP threads read the tap per
+    /// frame, so audio starts flowing to the AI from the next packet and stops
+    /// the moment it is cleared. Detaching does not end the AI session — the
+    /// caller still owns it and decides when to transcribe.
+    #[cfg(feature = "ai")]
+    pub fn set_ai_tap(&self, tap: Option<AiTap>) {
+        *self
+            .ai_tap
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = tap;
     }
 
     /// Local RTP port for SDP.
@@ -123,6 +153,8 @@ impl MobileMediaSession {
             let bytes_rx = self.bytes_received.clone();
             let rx_level = self.rx_level.clone();
             let bridge_rx = bridge.clone();
+            #[cfg(feature = "ai")]
+            let ai_tap_rx = self.ai_tap.clone();
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -203,6 +235,25 @@ impl MobileMediaSession {
                             let rms = (sum / pcm.len() as f64).sqrt();
                             rx_level.store((rms * 1000.0) as u64, Ordering::Relaxed);
 
+                            // Tap the far end for the AI before the buffer is
+                            // handed to the platform. This is a ring-buffer
+                            // write; nothing expensive runs on the RTP thread.
+                            #[cfg(feature = "ai")]
+                            {
+                                if let Some(tap) = ai_tap_rx
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .as_ref()
+                                {
+                                    if let Err(e) = tap.push_remote(&pcm, sample_rate) {
+                                        // Never let an AI problem disturb the
+                                        // call: log once per frame at debug and
+                                        // keep the audio flowing.
+                                        log::debug!("AI tap (remote) dropped a frame: {e}");
+                                    }
+                                }
+                            }
+
                             bridge_rx.on_playback_audio(pcm, sample_rate);
                         }
                     }
@@ -224,6 +275,8 @@ impl MobileMediaSession {
             let pkts_tx = self.packets_sent.clone();
             let bytes_tx = self.bytes_sent.clone();
             let tx_level = self.tx_level.clone();
+            #[cfg(feature = "ai")]
+            let ai_tap_tx = self.ai_tap.clone();
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -266,6 +319,25 @@ impl MobileMediaSession {
                                 let sum: f64 = captured.iter().map(|&s| (s as f64) * (s as f64)).sum();
                                 let rms = (sum / captured.len() as f64).sqrt();
                                 tx_level.store((rms * 1000.0) as u64, Ordering::Relaxed);
+
+                                // Tap the near end. Taken after the mute/hold
+                                // check above, so held or muted audio is
+                                // silence to the AI exactly as it is to the far
+                                // end — the transcript cannot contain words the
+                                // other party never heard.
+                                #[cfg(feature = "ai")]
+                                {
+                                    if let Some(tap) = ai_tap_tx
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .as_ref()
+                                    {
+                                        if let Err(e) = tap.push_local(&captured, sample_rate) {
+                                            log::debug!("AI tap (local) dropped a frame: {e}");
+                                        }
+                                    }
+                                }
+
                                 captured
                             }
                         };
@@ -601,5 +673,229 @@ async fn discover_local_ip() -> String {
             }
             "0.0.0.0".to_string()
         }
+    }
+}
+
+/// End-to-end proof that call audio reaches the on-device AI without crossing
+/// the FFI boundary.
+///
+/// These drive the real path rather than calling the tap directly: a
+/// `MobileMediaSession` is started, genuine RTP is sent at its socket, and the
+/// AI session is checked for accumulated audio. A tap wired to the wrong leg,
+/// dropped after mute, or left attached after detach would fail here.
+#[cfg(all(test, feature = "ai"))]
+mod ai_tap_tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use aria_ai_core::session::{CallSession, SessionConfig};
+
+    /// Records what the platform layer was handed, so we can prove the tap does not
+    /// steal or corrupt the audio the user actually hears.
+    #[derive(Default)]
+    struct RecordingBridge {
+        played: Mutex<Vec<i16>>,
+        /// Mic audio this bridge will hand to the TX thread each time it is asked.
+        capture: Mutex<Vec<i16>>,
+    }
+
+    impl PlatformAudioBridge for RecordingBridge {
+        fn on_playback_audio(&self, samples: Vec<i16>, _sample_rate: u32) {
+            self.played
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(&samples);
+        }
+
+        fn on_capture_audio(&self, _sample_rate: u32, frame_size: u32) -> Vec<i16> {
+            let src = self
+                .capture
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if src.is_empty() {
+                return vec![0_i16; frame_size as usize];
+            }
+            // Repeat the canned tone for as long as the session asks.
+            src.iter().cycle().take(frame_size as usize).copied().collect()
+        }
+    }
+
+    /// One 20 ms G.711 µ-law RTP packet of 440 Hz tone.
+    fn ulaw_rtp_packet(seq: u16, timestamp: u32, ssrc: u32, phase: u32) -> Vec<u8> {
+        let mut pkt = Vec::with_capacity(12 + 160);
+        pkt.push(0x80); // V=2
+        pkt.push(0); // PT=0 (PCMU)
+        pkt.extend_from_slice(&seq.to_be_bytes());
+        pkt.extend_from_slice(&timestamp.to_be_bytes());
+        pkt.extend_from_slice(&ssrc.to_be_bytes());
+        for i in 0..160_u32 {
+            let t = f64::from(phase + i) / 8000.0;
+            let sample = (f64::sin(2.0 * std::f64::consts::PI * 440.0 * t) * 12000.0) as i16;
+            pkt.push(linear_to_ulaw(sample));
+        }
+        pkt
+    }
+
+    /// G.711 µ-law encoder, so the test feeds a decoder real audio rather than noise.
+    fn linear_to_ulaw(sample: i16) -> u8 {
+        const BIAS: i16 = 0x84;
+        const CLIP: i16 = 32635;
+        let (sign, mut mag) = if sample < 0 { (0x80_u8, -sample.max(-CLIP)) } else { (0, sample.min(CLIP)) };
+        mag = mag.saturating_add(BIAS);
+        let exponent = match mag {
+            m if m <= 0x00FF => 0,
+            m if m <= 0x01FF => 1,
+            m if m <= 0x03FF => 2,
+            m if m <= 0x07FF => 3,
+            m if m <= 0x0FFF => 4,
+            m if m <= 0x1FFF => 5,
+            m if m <= 0x3FFF => 6,
+            _ => 7,
+        };
+        let mantissa = (mag >> (exponent + 3)) & 0x0F;
+        !(sign | ((exponent as u8) << 4) | mantissa as u8)
+    }
+
+    struct Fixture {
+        session: MobileMediaSession,
+        ai: Arc<CallSession>,
+        bridge: Arc<RecordingBridge>,
+        port: u16,
+    }
+
+    async fn fixture(call_id: &str) -> Fixture {
+        // Somewhere to send TX to that will not bother anyone.
+        let sink: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let session = MobileMediaSession::new(sink, AudioCodec::Pcmu)
+            .await
+            .expect("media session");
+        let port = session.local_port();
+
+        let ai = CallSession::start(SessionConfig::new(call_id)).expect("ai session");
+        session.set_ai_tap(Some(ai.clone()));
+
+        let bridge = Arc::new(RecordingBridge::default());
+        session.start_with_bridge(bridge.clone());
+
+        Fixture { session, ai, bridge, port }
+    }
+
+    /// Send `n` packets of tone at the session's RTP port.
+    async fn send_tone(port: u16, n: u16) {
+        let tx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let target: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let ssrc = 0x1234_5678;
+        for i in 0..n {
+            let pkt = ulaw_rtp_packet(i, u32::from(i) * 160, ssrc, u32::from(i) * 160);
+            let _ = tx.send_to(&pkt, target).await;
+            // Real pacing: the RX path is a live socket loop, not a batch API.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Let the last packets drain through decode and into the tap.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn far_end_rtp_reaches_the_ai_and_still_reaches_the_speaker() {
+        let f = fixture("call-tap-1").await;
+        send_tone(f.port, 50).await;
+
+        // push_* only fills the ring buffer; captured_ms counts what pump()
+        // has drained and resampled. In production this is the AI core's own
+        // drain thread; here it is explicit so the test is deterministic.
+        f.ai.pump().expect("pump");
+        let (_local, remote) = f.ai.tap().stats();
+        assert!(
+            remote.captured_ms > 0,
+            "the AI received no far-end audio (captured_ms = 0)"
+        );
+        assert_eq!(
+            remote.source_rate_hz, 8000,
+            "far-end leg should report the RTP clock rate"
+        );
+
+        // The tap must not consume the audio the user is supposed to hear.
+        let played = f
+            .bridge
+            .played
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert!(played > 0, "platform bridge got no playback audio");
+
+        f.session.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn detaching_the_tap_stops_the_flow_without_ending_the_call() {
+        let f = fixture("call-tap-2").await;
+        send_tone(f.port, 25).await;
+        f.ai.pump().expect("pump");
+        let before = f.ai.tap().stats().1.captured_ms;
+        assert!(before > 0, "expected audio before detaching");
+
+        f.session.set_ai_tap(None);
+        send_tone(f.port, 25).await;
+        f.ai.pump().expect("pump");
+        let after = f.ai.tap().stats().1.captured_ms;
+        assert_eq!(after, before, "audio kept flowing to the AI after detach");
+
+        // Audio to the user must be unaffected by detaching the AI.
+        let played = f
+            .bridge
+            .played
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert!(played > 0, "detaching the tap broke playback");
+
+        f.session.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn microphone_audio_reaches_the_ai_as_the_near_end() {
+        // The positive control for the mute test below. Without this, "muted is
+        // silent" would also hold if the near-end tap were never wired at all.
+        let f = fixture("call-tap-4").await;
+        *f.bridge
+            .capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = vec![8000_i16; 160];
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        f.ai.pump().expect("pump");
+
+        let local = f.ai.tap().stats().0;
+        assert!(
+            local.captured_ms > 0,
+            "near-end microphone audio never reached the AI"
+        );
+        f.session.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_muted_microphone_is_silence_to_the_ai_as_well() {
+        // The transcript must not contain words the far end never heard.
+        let f = fixture("call-tap-3").await;
+        *f.bridge
+            .capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = vec![8000_i16; 160];
+
+        f.session.set_mute(true);
+        // TX only runs once a remote address is known; the fixture already has one.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // Pump first, or this test passes simply because nothing was drained —
+        // it has to be capable of failing.
+        f.ai.pump().expect("pump");
+        let local = f.ai.tap().stats().0;
+        assert_eq!(
+            local.captured_ms, 0,
+            "muted microphone audio reached the AI"
+        );
+
+        f.session.stop();
     }
 }
