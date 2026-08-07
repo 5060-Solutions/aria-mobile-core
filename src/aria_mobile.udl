@@ -232,7 +232,7 @@ interface AriaMobileEngine {
     /// The host owns the path — iOS Application Support, Android filesDir — so
     /// nothing here hardcodes a platform location.
     [Throws=MobileError]
-    void ai_init(string storage_dir);
+    void ai_init(string storage_dir, sequence<u8>? insight_key);
 
     /// Models this device could install, annotated with whether it can run them.
     sequence<AiModel> ai_models();
@@ -267,6 +267,17 @@ interface AriaMobileEngine {
 
     /// Discard a captured call without transcribing it.
     void ai_discard_capture(string call_id);
+
+    /// Past insights, newest first. Empty when transcripts are not stored.
+    sequence<AiInsightSummary> ai_insights(u32 limit, u32 offset);
+
+    /// One stored insight in full, including its transcript.
+    AiCallInsight? ai_insight(string call_id);
+
+    boolean ai_delete_insight(string call_id);
+
+    /// Returns how many insights were deleted.
+    u64 ai_clear_insights();
 
     /// Check if any active call was ended by the remote party.
     /// Returns the call_id if detected, null otherwise.
@@ -319,6 +330,14 @@ dictionary AiTranscriptSegment {
 };
 
 /// The finished result for one call.
+/// A stored insight in list form, without the transcript text.
+dictionary AiInsightSummary {
+    string call_id;
+    i64 created_at;
+    u32 duration_secs;
+    string status;
+};
+
 dictionary AiCallInsight {
     string call_id;
     i64 created_at;

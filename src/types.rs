@@ -228,3 +228,13 @@ pub struct AiCallInsight {
     pub summary_points: Vec<String>,
     pub status: String,
 }
+
+/// A stored insight in list form: enough for a history row, without carrying
+/// the transcript text until something actually opens it.
+#[derive(Debug, Clone)]
+pub struct AiInsightSummary {
+    pub call_id: String,
+    pub created_at: i64,
+    pub duration_secs: u32,
+    pub status: String,
+}

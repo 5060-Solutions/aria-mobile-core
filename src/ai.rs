@@ -12,7 +12,7 @@
 //! That lets a host ship one binary and ask [`AriaMobileEngine::ai_available`]
 //! at runtime rather than inferring support from its build flavour.
 
-use crate::types::{AiCallInsight, AiDownloadProgress, AiModel, MobileError};
+use crate::types::{AiCallInsight, AiDownloadProgress, AiInsightSummary, AiModel, MobileError};
 #[cfg(feature = "ai")]
 use crate::types::AiTranscriptSegment;
 
@@ -28,6 +28,10 @@ pub struct AiState {
     /// Capture sessions keyed by call id, plus the drain handle keeping the
     /// resampler fed. Dropping the handle stops the thread.
     sessions: Mutex<HashMap<String, CaptureSession>>,
+    /// Encrypted transcript storage. `None` when the host supplied no key, in
+    /// which case an insight lives only as long as the call that produced it —
+    /// a transcript is never written to disk in the clear as a fallback.
+    store: Option<aria_ai_core::insights::InsightStore>,
 }
 
 #[cfg(feature = "ai")]
@@ -51,17 +55,75 @@ impl AiState {
     /// # Errors
     /// [`MobileError::InvalidState`] if the engine cannot be created, which in
     /// practice means the directory is unusable.
-    pub fn new(storage_dir: &str) -> Result<Self, MobileError> {
+    pub fn new(storage_dir: &str, insight_key: Option<&[u8]>) -> Result<Self, MobileError> {
         let capability = device_capability();
         let config = aria_ai_core::engine::AiConfig::new(storage_dir, capability);
         let engine = aria_ai_core::engine::AiEngine::new(config).map_err(|e| {
             log::error!("AI engine init failed: {e}");
             MobileError::InvalidState
         })?;
+        // Persistence is opt-in on the host handing over a key. Key custody
+        // belongs to the platform keystore, not to this crate, so nothing here
+        // ever generates or stores one.
+        let store = match insight_key {
+            Some(key) => {
+                let path = std::path::Path::new(storage_dir).join("insights.db");
+                match aria_ai_core::insights::InsightStore::open(&path, key) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        // A failed store must not cost the user transcription
+                        // itself; they just do not get history.
+                        log::error!("insight store unavailable, transcripts will not persist: {e}");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
         Ok(Self {
             engine,
             sessions: Mutex::new(HashMap::new()),
+            store,
         })
+    }
+
+    /// Past insights, newest first. Empty when no store is open.
+    pub fn insights(&self, limit: u32, offset: u32) -> Vec<AiInsightSummary> {
+        let Some(store) = self.store.as_ref() else {
+            return Vec::new();
+        };
+        store.list(limit, offset).map_or_else(
+            |e| {
+                log::warn!("listing insights failed: {e}");
+                Vec::new()
+            },
+            |rows| rows.iter().map(to_summary).collect(),
+        )
+    }
+
+    /// One stored insight in full, or `None` if it was never stored.
+    pub fn insight(&self, call_id: &str) -> Option<AiCallInsight> {
+        self.store
+            .as_ref()?
+            .get(call_id)
+            .unwrap_or_else(|e| {
+                log::warn!("reading insight {call_id} failed: {e}");
+                None
+            })
+            .as_ref()
+            .map(to_insight)
+    }
+
+    pub fn delete_insight(&self, call_id: &str) -> bool {
+        self.store
+            .as_ref()
+            .is_some_and(|s| s.delete(call_id).unwrap_or(false))
+    }
+
+    pub fn clear_insights(&self) -> u64 {
+        self.store
+            .as_ref()
+            .map_or(0, |s| s.clear().unwrap_or(0))
     }
 
     pub fn models(&self) -> Vec<AiModel> {
@@ -212,7 +274,16 @@ impl AiState {
         // installed.
         self.summarize_if_possible(&session);
 
-        Ok(to_insight(&session.insight()))
+        let insight = session.insight();
+        // Storing is best effort for the same reason summarising is: the caller
+        // already has the transcript in hand and losing history is not a reason
+        // to report the transcription itself as failed.
+        if let Some(store) = self.store.as_ref() {
+            if let Err(e) = store.put(&insight) {
+                log::warn!("could not persist insight for {call_id}: {e}");
+            }
+        }
+        Ok(to_insight(&insight))
     }
 
     fn summarize_if_possible(&self, session: &Arc<aria_ai_core::session::CallSession>) {
@@ -268,6 +339,16 @@ fn device_capability() -> aria_ai_core::models::capability::DeviceCapability {
         .unwrap_or(4),
         is_64bit: cfg!(target_pointer_width = "64"),
         has_gpu_backend: cfg!(any(target_os = "ios", target_os = "macos")),
+    }
+}
+
+#[cfg(feature = "ai")]
+fn to_summary(r: &aria_ai_core::insights::InsightSummaryRow) -> AiInsightSummary {
+    AiInsightSummary {
+        call_id: r.call_id.clone(),
+        created_at: r.created_at,
+        duration_secs: r.duration_secs,
+        status: r.status.clone(),
     }
 }
 
@@ -332,7 +413,7 @@ pub struct AiState;
 impl AiState {
     /// # Errors
     /// Always: this binary has no transcription support.
-    pub fn new(_storage_dir: &str) -> Result<Self, MobileError> {
+    pub fn new(_storage_dir: &str, _insight_key: Option<&[u8]>) -> Result<Self, MobileError> {
         log::warn!("ai_init called, but this build has no `ai` feature");
         Err(MobileError::InvalidState)
     }
@@ -369,5 +450,21 @@ impl AiState {
     /// Always.
     pub fn transcribe(&self, _call_id: &str) -> Result<AiCallInsight, MobileError> {
         Err(MobileError::InvalidState)
+    }
+
+    pub fn insights(&self, _limit: u32, _offset: u32) -> Vec<AiInsightSummary> {
+        Vec::new()
+    }
+
+    pub fn insight(&self, _call_id: &str) -> Option<AiCallInsight> {
+        None
+    }
+
+    pub fn delete_insight(&self, _call_id: &str) -> bool {
+        false
+    }
+
+    pub fn clear_insights(&self) -> u64 {
+        0
     }
 }

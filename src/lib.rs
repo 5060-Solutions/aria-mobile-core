@@ -711,8 +711,20 @@ impl AriaMobileEngine {
     }
 
     /// Prepare on-device AI, storing models under `storage_dir`.
-    pub fn ai_init(&self, storage_dir: String) -> Result<(), MobileError> {
-        let state = ai::AiState::new(&storage_dir)?;
+    pub fn ai_init(
+        &self,
+        storage_dir: String,
+        insight_key: Option<Vec<u8>>,
+    ) -> Result<(), MobileError> {
+        // A wrong-length key would fail deep inside the cipher, so reject it
+        // here where the message can say what was actually wrong.
+        if let Some(k) = insight_key.as_ref() {
+            if k.len() != 32 {
+                log::error!("insight key must be 32 bytes, got {}", k.len());
+                return Err(MobileError::InvalidState);
+            }
+        }
+        let state = ai::AiState::new(&storage_dir, insight_key.as_deref())?;
         *self
             .ai
             .write()
@@ -793,6 +805,31 @@ impl AriaMobileEngine {
     pub fn ai_transcribe(&self, call_id: String) -> Result<AiCallInsight, MobileError> {
         self.ai_stop_capture(call_id.clone());
         self.ai_state()?.transcribe(&call_id)
+    }
+
+    /// Past insights, newest first, for a history list.
+    ///
+    /// Returns an empty list rather than an error when no store is open, since
+    /// "AI is off" and "no calls yet" are the same thing to a caller drawing a
+    /// list.
+    pub fn ai_insights(&self, limit: u32, offset: u32) -> Vec<AiInsightSummary> {
+        self.ai_state()
+            .map_or_else(|_| Vec::new(), |s| s.insights(limit, offset))
+    }
+
+    /// One stored insight with its transcript, or `None` if it was not stored.
+    pub fn ai_insight(&self, call_id: String) -> Option<AiCallInsight> {
+        self.ai_state().ok().and_then(|s| s.insight(&call_id))
+    }
+
+    /// Delete one stored insight. True if a row was removed.
+    pub fn ai_delete_insight(&self, call_id: String) -> bool {
+        self.ai_state().is_ok_and(|s| s.delete_insight(&call_id))
+    }
+
+    /// Delete every stored insight. Returns how many were removed.
+    pub fn ai_clear_insights(&self) -> u64 {
+        self.ai_state().map_or(0, |s| s.clear_insights())
     }
 
     /// Throw away a capture without transcribing it.
