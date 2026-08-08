@@ -191,14 +191,28 @@ impl MobileMediaSession {
                             continue;
                         }
 
-                        // Symmetric RTP: learn remote address from first packet
+                        // Symmetric RTP: learn the remote address from the
+                        // FIRST packet, then hold it.
+                        //
+                        // Despite the old comment this used to re-point on
+                        // every packet from a new source, for the life of the
+                        // call — and `remote_addr` is shared with the TX
+                        // thread, which is where the microphone goes. One
+                        // 12-byte datagram to this port redirected the user's
+                        // audio to the sender and silenced the real peer. The
+                        // port is published in our SDP and the NAT pinhole is
+                        // already open, so no privileged position was needed.
+                        //
+                        // rtp-engine's own session latches correctly; this loop
+                        // was reimplemented by hand and dropped it.
                         {
                             let mut addr = remote_addr.lock().unwrap();
-                            if addr.port() == 0 || *addr != src {
-                                if addr.port() == 0 {
-                                    log::info!("Learned remote RTP address: {}", src);
-                                }
+                            if addr.port() == 0 {
+                                log::info!("Learned remote RTP address: {src}");
                                 *addr = src;
+                            } else if *addr != src {
+                                // Not our peer. Drop it rather than adopting it.
+                                continue;
                             }
                         }
 
