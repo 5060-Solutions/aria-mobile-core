@@ -225,6 +225,13 @@ interface AriaMobileEngine {
     ///
     /// Lets one app package probe at runtime instead of the host guessing from
     /// its build flavour.
+    /// Whether media on this call is actually encrypted.
+    ///
+    /// Reports what SRTP negotiation produced, not what was configured — a UI
+    /// that derives a padlock from settings lies whenever the peer declines
+    /// the crypto line.
+    boolean call_is_encrypted(string call_id);
+
     boolean ai_available();
 
     /// Prepare on-device AI, storing models under `storage_dir`.

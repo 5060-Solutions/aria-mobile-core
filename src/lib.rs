@@ -530,6 +530,13 @@ impl AriaMobileEngine {
                 media_session.update_remote(remote_addr);
             }
 
+            // Enable SRTP if the far end accepted our crypto line. Applied
+            // before the RTP threads start, so no frame is ever sent in the
+            // clear on a call that negotiated encryption.
+            if let Err(e) = media_session.apply_remote_sdp(&sdp_answer) {
+                log::warn!("SRTP negotiation failed, continuing without it: {e:?}");
+            }
+
             // Start RTP processing with platform audio bridge
             if let Some(bridge) = self.audio_bridge.read().unwrap().clone() {
                 media_session.start_with_bridge(bridge);
@@ -706,6 +713,17 @@ impl AriaMobileEngine {
     // ── On-device AI ────────────────────────────────────────────────
 
     /// Was this binary built with transcription support?
+    /// Whether this call's media is encrypted, as negotiated.
+    #[must_use]
+    pub fn call_is_encrypted(&self, call_id: String) -> bool {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&call_id)
+            .and_then(|c| c.media.as_ref())
+            .is_some_and(|m| m.srtp_active())
+    }
+
     pub fn ai_available(&self) -> bool {
         cfg!(feature = "ai")
     }

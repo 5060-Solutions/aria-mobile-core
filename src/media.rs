@@ -65,6 +65,16 @@ pub struct MobileMediaSession {
     /// frame and nothing else.
     #[cfg(feature = "ai")]
     ai_tap: Arc<Mutex<Option<AiTap>>>,
+    /// SDES-SRTP contexts, once a crypto line has been agreed.
+    ///
+    /// Separate inbound and outbound contexts because each carries its own
+    /// rollover counter and replay state; sharing one would corrupt both.
+    /// `None` means the peer offered no crypto and media is plain RTP — the
+    /// only configuration this crate supported before.
+    srtp_out: Arc<Mutex<Option<rtp_engine::srtp::SrtpContext>>>,
+    srtp_in: Arc<Mutex<Option<rtp_engine::srtp::SrtpContext>>>,
+    /// The key material we advertised, held until the answer arrives.
+    offered_srtp_key: Arc<Mutex<Option<String>>>,
 }
 
 impl MobileMediaSession {
@@ -101,6 +111,9 @@ impl MobileMediaSession {
             tx_level: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "ai")]
             ai_tap: Arc::new(Mutex::new(None)),
+            srtp_out: Arc::new(Mutex::new(None)),
+            srtp_in: Arc::new(Mutex::new(None)),
+            offered_srtp_key: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -155,6 +168,7 @@ impl MobileMediaSession {
             let bridge_rx = bridge.clone();
             #[cfg(feature = "ai")]
             let ai_tap_rx = self.ai_tap.clone();
+            let srtp_in = self.srtp_in.clone();
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -223,8 +237,32 @@ impl MobileMediaSession {
                             continue;
                         }
 
+                        // Decrypt before parsing, when SRTP was negotiated.
+                        //
+                        // A packet that fails to authenticate is dropped, not
+                        // played: on an encrypted call, anything that does not
+                        // carry a valid tag did not come from the peer.
+                        let plain: Vec<u8>;
+                        let payload_bytes: &[u8] = {
+                            let mut ctx =
+                                srtp_in.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            match ctx.as_mut() {
+                                Some(ctx) => match ctx.unprotect_rtp(&buf[..len]) {
+                                    Ok(p) => {
+                                        plain = p;
+                                        &plain
+                                    }
+                                    Err(e) => {
+                                        log::debug!("SRTP: dropping unauthenticated packet: {e}");
+                                        continue;
+                                    }
+                                },
+                                None => &buf[..len],
+                            }
+                        };
+
                         // Parse RTP header
-                        let header = match rtp_engine::rtp::RtpHeader::parse(&buf[..len]) {
+                        let header = match rtp_engine::rtp::RtpHeader::parse(payload_bytes) {
                             Some(h) => h,
                             None => continue,
                         };
@@ -291,6 +329,7 @@ impl MobileMediaSession {
             let tx_level = self.tx_level.clone();
             #[cfg(feature = "ai")]
             let ai_tap_tx = self.ai_tap.clone();
+            let srtp_out = self.srtp_out.clone();
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -360,6 +399,25 @@ impl MobileMediaSession {
                         let header = rtp_engine::rtp::RtpHeader::new(pt, seq, timestamp, ssrc);
                         let mut packet = header.to_bytes();
                         encoder.encode(&pcm, &mut packet);
+
+                        // Encrypt, when SRTP was negotiated. A protect failure
+                        // drops the frame rather than sending it in the clear —
+                        // a silent downgrade mid-call is exactly what an
+                        // attacker wants and the user cannot see.
+                        {
+                            let mut ctx = srtp_out
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if let Some(ctx) = ctx.as_mut() {
+                                match ctx.protect_rtp(&packet) {
+                                    Ok(sealed) => packet = sealed,
+                                    Err(e) => {
+                                        log::warn!("SRTP: dropping frame we could not protect: {e}");
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
 
                         // Send
                         if let Err(e) = socket.send_to(&packet, remote).await {
@@ -484,18 +542,104 @@ impl MobileMediaSession {
     pub fn tx_audio_level(&self) -> f32 {
         self.tx_level.load(Ordering::Relaxed) as f32 / 1000.0
     }
+
+    /// Remember the key we offered, so the answer can be paired with it.
+    pub fn set_offered_srtp_key(&self, key: Option<String>) {
+        *self
+            .offered_srtp_key
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = key;
+    }
+
+    /// Apply a peer's SDP answer: enable SRTP if it accepted our crypto line.
+    ///
+    /// # Errors
+    /// [`MobileError::MediaError`] if the peer's key material is unusable.
+    pub fn apply_remote_sdp(&self, remote_sdp: &str) -> Result<(), MobileError> {
+        let Some(remote_key) = rtp_engine::srtp::parse_sdp_crypto(remote_sdp) else {
+            log::info!("Peer answered without a crypto line; media is plain RTP");
+            return Ok(());
+        };
+        let local_key = self
+            .offered_srtp_key
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(local_key) = local_key else {
+            // They sent crypto we never asked for; without our own key there
+            // is nothing to protect the outbound direction with.
+            log::warn!("Peer sent a crypto line for an offer that had none; ignoring");
+            return Ok(());
+        };
+        self.set_srtp_keys(&local_key, &remote_key)
+    }
+
+    /// Install SDES-SRTP key material agreed in SDP.
+    ///
+    /// `local_key` is what we offered and protects what we send; `remote_key`
+    /// came from the peer and opens what we receive. Both are the base64
+    /// `inline:` values from the crypto lines.
+    ///
+    /// # Errors
+    /// [`MobileError::MediaError`] if either key is not valid AES_CM_128 key
+    /// material — SRTP is refused rather than silently downgraded to plain RTP,
+    /// which would be the one outcome the user cannot detect.
+    pub fn set_srtp_keys(&self, local_key: &str, remote_key: &str) -> Result<(), MobileError> {
+        let out = rtp_engine::srtp::SrtpContext::from_base64(local_key).map_err(|e| {
+            log::error!("SRTP: our own key material was rejected: {e}");
+            MobileError::MediaError
+        })?;
+        let inbound = rtp_engine::srtp::SrtpContext::from_base64(remote_key).map_err(|e| {
+            log::error!("SRTP: peer key material was rejected: {e}");
+            MobileError::MediaError
+        })?;
+        *self.srtp_out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(out);
+        *self.srtp_in.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(inbound);
+        log::info!("SRTP enabled for this call");
+        Ok(())
+    }
+
+    /// Whether media on this call is encrypted.
+    ///
+    /// Reports what was actually negotiated, not what was configured — a UI
+    /// that shows a padlock from configuration lies whenever the peer declines
+    /// the crypto line.
+    #[must_use]
+    pub fn srtp_active(&self) -> bool {
+        self.srtp_out
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
 }
 
 // ── SDP Helpers ─────────────────────────────────────────────────────────────
 
-fn build_sdp_offer(local_port: u16, local_ip: &str, codecs: &[AudioCodec]) -> String {
+/// Build an offer, optionally advertising SDES-SRTP.
+///
+/// `srtp_key` is the base64 key material we are offering. When present the
+/// media line becomes RTP/SAVP and carries a crypto attribute; when absent the
+/// offer is plain RTP, which is what this crate did unconditionally before —
+/// mobile call media was never encrypted, while the Android network security
+/// config claimed confidentiality came from "TLS transport + SRTP".
+fn build_sdp_offer(
+    local_port: u16,
+    local_ip: &str,
+    codecs: &[AudioCodec],
+    srtp_key: Option<&str>,
+) -> String {
+    let profile = if srtp_key.is_some() {
+        "RTP/SAVP"
+    } else {
+        "RTP/AVP"
+    };
     let mut sdp = format!(
         "v=0\r\n\
          o=aria 0 0 IN IP4 {local_ip}\r\n\
          s=Aria Mobile\r\n\
          c=IN IP4 {local_ip}\r\n\
          t=0 0\r\n\
-         m=audio {local_port} RTP/AVP"
+         m=audio {local_port} {profile}"
     );
 
     for codec in codecs {
@@ -517,6 +661,10 @@ fn build_sdp_offer(local_port: u16, local_ip: &str, codecs: &[AudioCodec]) -> St
 
     sdp.push_str("a=rtpmap:101 telephone-event/8000\r\n");
     sdp.push_str("a=fmtp:101 0-16\r\n");
+    if let Some(key) = srtp_key {
+        sdp.push_str(&rtp_engine::srtp::build_sdp_crypto_line(key));
+        sdp.push_str("\r\n");
+    }
     sdp.push_str("a=sendrecv\r\n");
 
     sdp
@@ -668,7 +816,25 @@ pub async fn create_offer_session(
         preferred_codecs.to_vec()
     };
 
-    let offer_sdp = build_sdp_offer(session.local_port(), &local_ip, &codecs);
+    // Offer SDES-SRTP. The key is generated per call and kept on the session
+    // so the answer's crypto line can be paired with it once it arrives.
+    //
+    // Offered, not required: a PBX that answers without a crypto line still
+    // gets a working plain-RTP call, which is what every deployment has today.
+    // Refusing outright would break every existing installation on upgrade;
+    // what matters is that the encrypted path now exists and that
+    // `srtp_active()` reports the truth either way.
+    let (offer_key, offer_sdp) = match rtp_engine::srtp::SrtpContext::generate() {
+        Ok((_ctx, key)) => {
+            let sdp = build_sdp_offer(session.local_port(), &local_ip, &codecs, Some(&key));
+            (Some(key), sdp)
+        }
+        Err(e) => {
+            log::warn!("SRTP: could not generate key material, offering plain RTP: {e}");
+            (None, build_sdp_offer(session.local_port(), &local_ip, &codecs, None))
+        }
+    };
+    session.set_offered_srtp_key(offer_key);
 
     Ok((session, offer_sdp))
 }
@@ -911,5 +1077,40 @@ mod ai_tap_tests {
         );
 
         f.session.stop();
+    }
+}
+
+#[cfg(test)]
+mod srtp_negotiation_tests {
+    use super::{build_sdp_offer, AudioCodec};
+
+    /// Mobile media was never encrypted: the offer was always RTP/AVP with no
+    /// crypto attribute, while the Android network security config claimed
+    /// confidentiality came from "TLS transport + SRTP".
+    #[test]
+    fn an_offer_with_a_key_advertises_savp_and_crypto() {
+        let sdp = build_sdp_offer(10000, "203.0.113.5", &[AudioCodec::Pcmu], Some("dGVzdGtleQ=="));
+        assert!(sdp.contains("RTP/SAVP"), "{sdp}");
+        assert!(sdp.contains("a=crypto:"), "{sdp}");
+    }
+
+    /// Plain RTP must still be offerable: refusing outright would break every
+    /// deployment that does not answer with a crypto line.
+    #[test]
+    fn an_offer_without_a_key_stays_plain_rtp() {
+        let sdp = build_sdp_offer(10000, "203.0.113.5", &[AudioCodec::Pcmu], None);
+        assert!(sdp.contains("RTP/AVP"), "{sdp}");
+        assert!(!sdp.contains("RTP/SAVP"), "{sdp}");
+        assert!(!sdp.contains("a=crypto:"), "{sdp}");
+    }
+
+    /// The crypto attribute must sit inside the media section, after the
+    /// rtpmap lines — a crypto line above m= is not part of the stream.
+    #[test]
+    fn the_crypto_line_is_inside_the_media_section() {
+        let sdp = build_sdp_offer(10000, "203.0.113.5", &[AudioCodec::Pcmu], Some("dGVzdGtleQ=="));
+        let m = sdp.find("m=audio").expect("media line");
+        let crypto = sdp.find("a=crypto:").expect("crypto line");
+        assert!(crypto > m, "crypto must follow the m= line:\n{sdp}");
     }
 }
