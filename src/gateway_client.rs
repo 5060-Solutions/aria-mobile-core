@@ -158,12 +158,26 @@ struct MakeCallResponse {
 /// development against loopback / `.local` hosts.
 fn enforce_https(base_url: String) -> String {
     if let Some(rest) = base_url.strip_prefix("http://") {
-        let host = rest.split(['/', ':']).next().unwrap_or("");
+        // Take the authority, then drop any userinfo before reading the host.
+        //
+        // Splitting straight on ':' treated "localhost:80@evil.example.com" as
+        // the host "localhost", so the loopback exemption applied and the URL
+        // was left cleartext — while reqwest's WHATWG parser resolves the real
+        // host as evil.example.com. base_url comes from the PBX's device
+        // registration response, and the bodies sent to it carry the SIP
+        // password in the clear, so this handed an attacker those credentials
+        // over plain HTTP.
+        let authority = rest.split('/').next().unwrap_or("");
+        let host_port = authority.rsplit('@').next().unwrap_or("");
+        let host = host_port.split(':').next().unwrap_or("");
         let is_local = host == "localhost"
             || host == "127.0.0.1"
             || host == "::1"
             || host.ends_with(".local");
-        if !is_local {
+        // Userinfo has no business in a gateway URL; if it is present, do not
+        // grant the exemption whatever the host looks like.
+        let has_userinfo = authority.contains('@');
+        if !is_local || has_userinfo {
             log::warn!(
                 "Gateway base_url used cleartext http://; upgrading to https:// to protect credentials"
             );
@@ -674,5 +688,52 @@ mod tests {
     fn pinned_client_builds() {
         let addr: std::net::SocketAddr = "203.0.113.10:443".parse().unwrap();
         let _ = GatewayClient::build_pinned_client("gw.example.com", addr);
+    }
+}
+
+#[cfg(test)]
+mod enforce_https_tests {
+    use super::enforce_https;
+
+    /// The regression: splitting the authority on ':' before '@' read
+    /// "localhost:80@evil.example.com" as the host "localhost", so the
+    /// loopback exemption applied and the URL stayed cleartext — while the
+    /// HTTP client resolves the real host as evil.example.com. The request
+    /// bodies carry the SIP password in the clear.
+    #[test]
+    fn userinfo_cannot_forge_the_loopback_exemption() {
+        assert_eq!(
+            enforce_https("http://localhost:80@evil.example.com/v1".to_string()),
+            "https://localhost:80@evil.example.com/v1",
+            "a userinfo-disguised remote host must still be upgraded"
+        );
+    }
+
+    #[test]
+    fn a_remote_host_is_upgraded() {
+        assert_eq!(
+            enforce_https("http://gw.example.com/v1".to_string()),
+            "https://gw.example.com/v1"
+        );
+    }
+
+    /// Genuine local development must keep working.
+    #[test]
+    fn real_loopback_is_left_alone() {
+        for url in [
+            "http://localhost:8080/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://dev.local/v1",
+        ] {
+            assert_eq!(enforce_https(url.to_string()), url);
+        }
+    }
+
+    #[test]
+    fn https_is_untouched() {
+        assert_eq!(
+            enforce_https("https://gw.example.com/v1".to_string()),
+            "https://gw.example.com/v1"
+        );
     }
 }
