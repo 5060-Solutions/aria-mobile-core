@@ -227,6 +227,31 @@ impl Route {
     }
 }
 
+/// Where `make_call` places a call, and how it reports the attempt.
+pub struct Placement<'a> {
+    /// Sent with the call so it can be cancelled before it has a token.
+    pub client_ref: &'a str,
+    /// Set to each route before the request is sent on it, so a cancel
+    /// issued while the request is in flight goes to the instance ringing
+    /// the call.
+    pub attempt: &'a std::sync::Mutex<Option<Route>>,
+    /// Place the call on this route only, with no failover: if it cannot be
+    /// reached the call fails. `None` tries every route in turn.
+    pub pin: Option<&'a Route>,
+}
+
+impl<'a> Placement<'a> {
+    /// A placement on any route, failing over on connect errors.
+    #[cfg(test)]
+    pub fn any(client_ref: &'a str, attempt: &'a std::sync::Mutex<Option<Route>>) -> Self {
+        Self {
+            client_ref,
+            attempt,
+            pin: None,
+        }
+    }
+}
+
 /// How long `POST /v1/calls` may take. Longer than the gateway's 30 s INVITE
 /// timeout, so the gateway, not the client, decides that an unanswered call
 /// has failed; a client that gave up first would orphan a call answered at
@@ -316,8 +341,17 @@ impl GatewayClient {
         what: &str,
         build: impl Fn(&Route) -> reqwest::RequestBuilder,
     ) -> Result<(reqwest::Response, Route), MobileError> {
+        Self::send_on(self.routes(), what, build).await
+    }
+
+    /// [`send`](Self::send) over the given routes rather than all of them.
+    async fn send_on(
+        routes: Vec<Route>,
+        what: &str,
+        build: impl Fn(&Route) -> reqwest::RequestBuilder,
+    ) -> Result<(reqwest::Response, Route), MobileError> {
         let mut last_err = MobileError::NetworkError;
-        for route in self.routes() {
+        for route in routes {
             match build(&route).send().await {
                 Ok(resp) => return Ok((resp, route)),
                 Err(e) if e.is_connect() => {
@@ -581,18 +615,21 @@ impl GatewayClient {
     /// connect errors only. The gateway acts as a B2BUA — it sends the SIP
     /// INVITE on our behalf and returns the SDP answer from the remote party.
     ///
-    /// `attempt` is set to each route before the request is sent on it, so a
-    /// cancel issued while this is in flight goes to the instance ringing the
-    /// call. Returns the call token, the SDP answer, and the route.
+    /// See [`Placement`] for where the call goes. Returns the call token, the
+    /// SDP answer, and the route.
     pub async fn make_call(
         &self,
         token: &str,
         destination_uri: &str,
         sdp_offer: &str,
         credentials: &crate::types::SipCredentials,
-        client_ref: &str,
-        attempt: &std::sync::Mutex<Option<Route>>,
+        placement: Placement<'_>,
     ) -> Result<(String, String, Route), MobileError> {
+        let Placement {
+            client_ref,
+            attempt,
+            pin,
+        } = placement;
         // Let the gateway handle DNS resolution — passing pre-resolved
         // IP:port breaks the gateway's DNS parser.
         let req = MakeCallRequest {
@@ -609,18 +646,21 @@ impl GatewayClient {
             client_ref: client_ref.to_string(),
         };
 
-        let (resp, route) = self
-            .send("Make call", |r| {
-                *attempt
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(r.clone());
-                r.client
-                    .post(r.url("/v1/calls"))
-                    .timeout(MAKE_CALL_TIMEOUT)
-                    .bearer_auth(token)
-                    .json(&req)
-            })
-            .await?;
+        let routes = match pin {
+            Some(route) => vec![route.clone()],
+            None => self.routes(),
+        };
+        let (resp, route) = Self::send_on(routes, "Make call", |r| {
+            *attempt
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(r.clone());
+            r.client
+                .post(r.url("/v1/calls"))
+                .timeout(MAKE_CALL_TIMEOUT)
+                .bearer_auth(token)
+                .json(&req)
+        })
+        .await?;
         if resp.status() == reqwest::StatusCode::CONFLICT {
             // 409 carries a reason. Only `cancelled` means the call was
             // cancelled through `cancel_call` while it rang; anything else
@@ -873,7 +913,7 @@ mod enforce_https_tests {
 
 #[cfg(test)]
 mod transfer_tests {
-    use super::GatewayClient;
+    use super::{GatewayClient, Placement};
     use crate::mock_gateway::MockGateway;
     use crate::types::MobileError;
 
@@ -938,6 +978,62 @@ mod transfer_tests {
         }
     }
 
+    /// A pinned call goes to its route even when another comes first.
+    #[test]
+    fn a_pinned_call_goes_only_to_its_route() {
+        let answer = || (200, r#"{"call_token":"ct","sdp_answer":""}"#.to_string());
+        let first = MockGateway::start(move |_| answer());
+        let second = MockGateway::start(move |_| answer());
+        let client = GatewayClient::new(first.base_url.clone());
+        client.set_test_routes(&[&first.base_url, &second.base_url]);
+        let pin = client.routes()[1].clone();
+        let attempt = std::sync::Mutex::new(None);
+
+        let (_, _, route) = block_on(client.make_call(
+            "jwt",
+            "1002",
+            "v=0",
+            &creds(),
+            Placement {
+                client_ref: "ref",
+                attempt: &attempt,
+                pin: Some(&pin),
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(route.base_url(), second.base_url);
+        assert!(first.requests().is_empty());
+        assert_eq!(second.requests().len(), 1);
+    }
+
+    /// A pinned route that cannot be connected to fails the call instead of
+    /// failing over.
+    #[test]
+    fn a_pinned_call_does_not_fail_over() {
+        let gw = MockGateway::start(|_| (200, r#"{"call_token":"ct","sdp_answer":""}"#.into()));
+        let client = GatewayClient::new(gw.base_url.clone());
+        client.set_test_routes(&["http://127.0.0.1:9", &gw.base_url]);
+        let pin = client.routes()[0].clone();
+        let attempt = std::sync::Mutex::new(None);
+
+        let err = block_on(client.make_call(
+            "jwt",
+            "1002",
+            "v=0",
+            &creds(),
+            Placement {
+                client_ref: "ref",
+                attempt: &attempt,
+                pin: Some(&pin),
+            },
+        ))
+        .unwrap_err();
+
+        assert!(matches!(err, MobileError::NetworkError), "{err:?}");
+        assert!(gw.requests().is_empty(), "the pinned call failed over");
+    }
+
     #[test]
     fn a_cancelled_outgoing_call_is_a_cancelled_error() {
         let gw = MockGateway::start(|_| (409, r#"{"error":"cancelled"}"#.into()));
@@ -952,9 +1048,14 @@ mod transfer_tests {
             auth_username: None,
             display_name: "Alice".into(),
         };
-        let err =
-            block_on(client.make_call("jwt", "1002", "v=0", &creds, "ref1", &Default::default()))
-                .unwrap_err();
+        let err = block_on(client.make_call(
+            "jwt",
+            "1002",
+            "v=0",
+            &creds,
+            Placement::any("ref1", &Default::default()),
+        ))
+        .unwrap_err();
         assert!(matches!(err, MobileError::Cancelled), "{err:?}");
         let body: serde_json::Value = serde_json::from_str(&gw.requests()[0].body).unwrap();
         assert_eq!(body["client_ref"], "ref1");
@@ -1014,8 +1115,14 @@ mod transfer_tests {
         client.set_test_routes(&["http://127.0.0.1:9", &gw.base_url]);
         let attempt = std::sync::Mutex::new(None);
 
-        let (token, _, route) =
-            block_on(client.make_call("jwt", "1002", "v=0", &creds(), "ref", &attempt)).unwrap();
+        let (token, _, route) = block_on(client.make_call(
+            "jwt",
+            "1002",
+            "v=0",
+            &creds(),
+            Placement::any("ref", &attempt),
+        ))
+        .unwrap();
 
         assert_eq!(token, "ct");
         assert_eq!(route.base_url(), gw.base_url);
@@ -1044,8 +1151,13 @@ mod transfer_tests {
         let client = GatewayClient::new(dropping.clone());
         client.set_test_routes(&[&dropping, &second.base_url]);
 
-        let result =
-            block_on(client.make_call("jwt", "1002", "v=0", &creds(), "ref", &Default::default()));
+        let result = block_on(client.make_call(
+            "jwt",
+            "1002",
+            "v=0",
+            &creds(),
+            Placement::any("ref", &Default::default()),
+        ));
 
         assert!(result.is_err());
         assert!(second.requests().is_empty(), "the call was sent twice");
@@ -1067,8 +1179,7 @@ mod transfer_tests {
                 "1002",
                 "v=0",
                 &creds(),
-                "ref",
-                &Default::default(),
+                Placement::any("ref", &Default::default()),
             ))
             .unwrap_err();
             if cancelled {

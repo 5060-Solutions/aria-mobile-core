@@ -335,6 +335,28 @@ fn live_call_count(
     calls.len() + outgoing.ringing.len() + accepting.len()
 }
 
+/// The gateway route of the oldest live call whose route is known: a
+/// connected call, or a ringing outgoing call once it has been sent.
+fn live_call_route(
+    calls: &HashMap<String, ActiveCallState>,
+    outgoing: &OutgoingCalls,
+) -> Option<Route> {
+    let connected = calls.values().map(|c| (c.seq, Some(c.route.clone())));
+    let ringing = outgoing.ringing.values().map(|p| {
+        let route = p
+            .route
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        (p.seq, route)
+    });
+    connected
+        .chain(ringing)
+        .filter_map(|(seq, route)| Some((seq, route?)))
+        .min_by_key(|(seq, _)| *seq)
+        .map(|(_, route)| route)
+}
+
 /// Every live call with its creation order: connected calls and ringing
 /// outgoing ones.
 fn live_calls(
@@ -604,6 +626,9 @@ struct ReservedOutgoing {
     outcome_rx: tokio::sync::watch::Receiver<Option<bool>>,
     attempt: Arc<Mutex<Option<Route>>>,
     done_tx: tokio::sync::watch::Sender<bool>,
+    /// The route of the other live call, which this one must use too (see
+    /// `reserve_outgoing`).
+    pin: Option<Route>,
 }
 
 struct ActiveCallState {
@@ -1072,6 +1097,16 @@ impl AriaMobileEngine {
     /// (`Cancelled`; its `Ended` has already been reported). Also refuses,
     /// with `InvalidState` and without using up the id, a call that would
     /// exceed [`MAX_LIVE_CALLS`].
+    ///
+    /// While another call is live, the new call is pinned to that call's
+    /// gateway route: it is placed on the same gateway instance, with no
+    /// failover to another SRV target, and fails if that instance cannot be
+    /// reached. The PBX joins two calls in an attended transfer only when
+    /// both reach it from the same gateway (the same source IP), and the
+    /// gateway can only refer a pair of calls it holds itself, so a second
+    /// call placed through a different instance could never be transferred
+    /// to the first. Failing it is better than a consultation call that
+    /// silently cannot complete the transfer the user placed it for.
     fn reserve_outgoing(
         &self,
         call_id: &str,
@@ -1080,6 +1115,16 @@ impl AriaMobileEngine {
         let client_ref = outgoing_client_ref(call_id)
             .ok_or(MobileError::InvalidState)?
             .to_string();
+        // Read before the other locks, which it is never taken under. Only
+        // used below if the call is still being accepted then.
+        let accepting_routes: Vec<(String, Route)> = self
+            .pending_incoming
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(_, p)| p.accepting)
+            .map(|(token, p)| (token.clone(), p.route.clone()))
+            .collect();
         // Lock order: calls, then pending_outgoing.
         let calls = self
             .calls
@@ -1099,16 +1144,25 @@ impl AriaMobileEngine {
         if calls.contains_key(call_id) || outgoing.ringing.contains_key(call_id) {
             return Err(MobileError::InvalidState);
         }
-        let live = {
+        let (live, pin) = {
             let accepting = self
                 .accepting
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            live_call_count(&calls, &outgoing, &accepting)
+            let pin = live_call_route(&calls, &outgoing).or_else(|| {
+                accepting_routes
+                    .into_iter()
+                    .find(|(token, _)| accepting.contains(token))
+                    .map(|(_, route)| route)
+            });
+            (live_call_count(&calls, &outgoing, &accepting), pin)
         };
         if live >= MAX_LIVE_CALLS {
             log::warn!("Refusing to dial {call_id}: {MAX_LIVE_CALLS} calls are live");
             return Err(MobileError::InvalidState);
+        }
+        if let Some(route) = &pin {
+            log::info!("Dialing {call_id} on {route:?}, the route of the other live call");
         }
         let token = self.auth.token()?;
 
@@ -1155,6 +1209,7 @@ impl AriaMobileEngine {
                 outcome_rx,
                 attempt,
                 done_tx,
+                pin,
             },
         ))
     }
@@ -1187,6 +1242,7 @@ impl AriaMobileEngine {
                 outcome_rx,
                 attempt,
                 done_tx,
+                pin,
             },
         ) = self.reserve_outgoing(&call_id, &uri)?;
 
@@ -1259,8 +1315,11 @@ impl AriaMobileEngine {
                     &destination,
                     &sdp_offer,
                     &credentials,
-                    &client_ref,
-                    &attempt,
+                    gateway_client::Placement {
+                        client_ref: &client_ref,
+                        attempt: &attempt,
+                        pin: pin.as_ref(),
+                    },
                 )
                 .await;
             let _ = done_tx.send(true);
@@ -2585,6 +2644,23 @@ mod tests {
 
     /// An address nothing listens on, for tests that must not reach a gateway.
     const NO_GATEWAY: &str = "http://127.0.0.1:9";
+
+    /// Put a connected call in the engine, as `insert_call` does, going
+    /// `direction` and held on `route`.
+    fn insert_call_on(
+        engine: &AriaMobileEngine,
+        call_id: &str,
+        call_token: &str,
+        direction: CallDirection,
+        route: Route,
+    ) -> Arc<AtomicBool> {
+        let stop = insert_call(engine, call_id, call_token);
+        let mut calls = engine.calls.lock().unwrap();
+        let call = calls.get_mut(call_id).unwrap();
+        call.info.direction = direction;
+        call.route = route;
+        stop
+    }
 
     #[test]
     fn transfer_target_validation() {
@@ -4402,6 +4478,82 @@ mod tests {
         assert!(eventually(|| count(&gw, "/v1/calls/tok-pin/status") >= 2));
         engine.reject_incoming_call("tok-pin".into()).unwrap();
         assert_eq!(count(&gw, "/v1/calls/tok-pin/reject"), 1);
+    }
+
+    /// A second call goes to the gateway instance holding the first, even
+    /// when another instance comes first in the SRV order, so the two can
+    /// be joined by an attended transfer.
+    #[test]
+    fn a_call_placed_while_another_is_up_uses_the_same_gateway() {
+        let first = call_waiting_gateway();
+        let held = call_waiting_gateway();
+        let (engine, _) = engine(&first.base_url);
+        engine
+            .gateway
+            .set_test_routes(&[first.base_url.as_str(), held.base_url.as_str()]);
+        let held_route = engine.gateway.routes()[1].clone();
+        insert_call_on(
+            &engine,
+            "incoming-tok-1",
+            "tok-1",
+            CallDirection::Inbound,
+            held_route,
+        );
+
+        let out = dial(&engine).unwrap();
+
+        assert_eq!(count(&held, "/v1/calls"), 1);
+        assert_eq!(count(&first, "/v1/calls"), 0);
+        assert_eq!(
+            engine.calls.lock().unwrap()[&out.call_id].route.base_url(),
+            held.base_url
+        );
+    }
+
+    /// If the instance holding the other call cannot be reached, the new
+    /// call fails rather than going to another instance.
+    #[test]
+    fn a_call_pinned_to_an_unreachable_gateway_fails_without_failover() {
+        let other = call_waiting_gateway();
+        let (engine, recorder) = engine(&other.base_url);
+        engine
+            .gateway
+            .set_test_routes(&[NO_GATEWAY, other.base_url.as_str()]);
+        let dead_route = engine.gateway.routes()[0].clone();
+        insert_call_on(
+            &engine,
+            "incoming-tok-1",
+            "tok-1",
+            CallDirection::Inbound,
+            dead_route,
+        );
+
+        let err = dial(&engine).unwrap_err();
+
+        assert!(matches!(err, MobileError::NetworkError), "{err:?}");
+        assert_eq!(count(&other, "/v1/calls"), 0);
+        let ended: Vec<_> = recorder
+            .states()
+            .into_iter()
+            .filter(|i| i.state == CallState::Ended)
+            .collect();
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].end_reason, Some(EndReason::Failed));
+        assert_eq!(ids(&engine.get_calls()), ["incoming-tok-1"]);
+    }
+
+    /// With no other call, a call still fails over between instances.
+    #[test]
+    fn a_lone_call_still_fails_over() {
+        let gw = call_waiting_gateway();
+        let (engine, _) = engine(&gw.base_url);
+        engine
+            .gateway
+            .set_test_routes(&[NO_GATEWAY, gw.base_url.as_str()]);
+
+        dial(&engine).unwrap();
+
+        assert_eq!(count(&gw, "/v1/calls"), 1);
     }
 
     /// `make_call_with_id` with an offer (media setup) that takes `setup`.
