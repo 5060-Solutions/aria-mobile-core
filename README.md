@@ -96,7 +96,9 @@ The API is defined in `src/aria_mobile.udl`. Key types:
 2. Engine rejects an empty target or one containing CR, LF, `<` or `>` with `InvalidTarget`, before any network request
 3. Engine sends `POST /v1/calls/{token}/transfer` with `{"target": "..."}`; the gateway sends the REFER to the PBX
 4. On `202` the local call and media are torn down and `on_call_state_changed` reports `Ended`, as for a remote hangup
-5. On failure the call stays up and the method throws: `400` -> `InvalidTarget`, `404` -> `InvalidState` (unknown call, or a gateway without the transfer route), `502` -> `CallFailed` (PBX refused), anything else -> `GatewayError`
+5. On failure the call stays up and the method throws: `400` -> `InvalidTarget`, `404` -> `InvalidState` (unknown call, a call not answered yet, or a gateway without the transfer route), `502` -> `CallFailed` (PBX refused), `504` -> `Timeout` (PBX did not answer the REFER within 8 s), anything else -> `GatewayError`
+
+`transfer_call` can block for up to about 8 s while the gateway waits on the PBX, so call it off the UI thread. The gateway accepts a bare target of letters, digits and `+*#.-_`, or a `sip:`/`sips:` URI. The core's local check is deliberately looser, so the gateway remains the authority and its refusal surfaces as `InvalidTarget`. After a `202` the PBX finishes the transfer and the gateway reports the call as ended with reason `transferred`. The core ends the local call as soon as the `202` arrives, without waiting for that.
 
 ## Event contract
 

@@ -635,9 +635,13 @@ impl GatewayClient {
     /// to the PBX.
     ///
     /// Status mapping: 202 (or any 2xx) is success; 400 means the gateway
-    /// refused the target; 404 means the gateway does not know the call token
-    /// (or, on a gateway that predates the route, the route itself); 502 means
-    /// the PBX rejected the REFER.
+    /// refused the target; 404 means the gateway has no active call for the
+    /// token (unknown, or not answered yet) or, on a gateway that predates the
+    /// route, has no such route; 502 means the PBX rejected the REFER; 504
+    /// means the PBX did not answer the REFER in time.
+    ///
+    /// The gateway can hold this request for up to 8 s while it waits on the
+    /// PBX, which the client's 30 s timeout covers.
     pub async fn transfer_call(
         &self,
         token: &str,
@@ -662,6 +666,7 @@ impl GatewayClient {
             401 | 403 => MobileError::AuthenticationError,
             404 => MobileError::InvalidState,
             502 => MobileError::CallFailed,
+            504 => MobileError::Timeout,
             _ => MobileError::GatewayError,
         })
     }
@@ -794,6 +799,7 @@ mod transfer_tests {
             (401, "AuthenticationError"),
             (404, "InvalidState"),
             (502, "CallFailed"),
+            (504, "Timeout"),
             (500, "GatewayError"),
         ];
         for (status, expected) in cases {
@@ -806,6 +812,7 @@ mod transfer_tests {
                 MobileError::InvalidState => "InvalidState",
                 MobileError::CallFailed => "CallFailed",
                 MobileError::GatewayError => "GatewayError",
+                MobileError::Timeout => "Timeout",
                 other => panic!("unexpected error for {status}: {other:?}"),
             };
             assert_eq!(got, expected, "HTTP {status}");

@@ -196,9 +196,10 @@ interface AriaMobileEngine {
     /// `Ended` for `call_id`, exactly as for a remote hangup.
     ///
     /// Errors leave the call up: `InvalidTarget` for a target rejected locally
-    /// or by the gateway, `InvalidState` for an unknown call (or a gateway that
-    /// does not know the call or the transfer route), `CallFailed` when the
-    /// PBX refused the transfer.
+    /// or by the gateway, `InvalidState` for an unknown call or one that is not
+    /// active yet (still ringing), or a gateway without the transfer route,
+    /// `CallFailed` when the PBX refused the transfer, `Timeout` when the PBX
+    /// did not answer it. The call can block for up to about 8 s.
     [Throws=MobileError]
     void transfer_call(string call_id, string target);
 
