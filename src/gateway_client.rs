@@ -155,6 +155,12 @@ struct TransferCallRequest<'a> {
     target: &'a str,
 }
 
+/// The body of an attended transfer: the token of the other call.
+#[derive(Serialize)]
+struct AttendedTransferRequest<'a> {
+    replaces: &'a str,
+}
+
 #[derive(Deserialize)]
 struct MakeCallResponse {
     call_token: String,
@@ -822,6 +828,58 @@ impl GatewayClient {
             _ => MobileError::GatewayError,
         })
     }
+
+    /// Attended-transfer: join the far ends of two of the user's calls and
+    /// drop this phone from both. The gateway sends a REFER with `Replaces`
+    /// on whichever of the two the phone received, so the token order does
+    /// not matter; both calls must be on this route's gateway instance.
+    ///
+    /// Status mapping, in line with [`transfer_call`](Self::transfer_call):
+    /// 202 (or any 2xx) is success; 400 (`same_call`, or a body the gateway
+    /// could not read), 404 (either call unknown here) and 409
+    /// `call_not_established` mean the calls cannot be transferred as they
+    /// are (`InvalidState`); 409 `unsupported_by_pbx` means both calls go
+    /// the same way (`TransferUnsupported`); any other 409 (a transfer of
+    /// either call already in progress) is a `GatewayError`; 502 and 504 are
+    /// as for a blind transfer.
+    pub async fn transfer_attended(
+        &self,
+        route: &Route,
+        token: &str,
+        call_token: &str,
+        replaces_token: &str,
+    ) -> Result<(), MobileError> {
+        let resp = route
+            .client
+            .post(route.url(&format!("/v1/calls/{call_token}/transfer")))
+            .bearer_auth(token)
+            .json(&AttendedTransferRequest {
+                replaces: replaces_token,
+            })
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        log::error!("Attended transfer failed: {}", status);
+        Err(match status.as_u16() {
+            400 | 404 => MobileError::InvalidState,
+            401 | 403 => MobileError::AuthenticationError,
+            409 => {
+                let body: Option<ErrorBody> = read_json_capped(resp).await.ok();
+                match body.as_ref().map(|b| b.error.as_str()) {
+                    Some("call_not_established") => MobileError::InvalidState,
+                    Some("unsupported_by_pbx") => MobileError::TransferUnsupported,
+                    _ => MobileError::GatewayError,
+                }
+            }
+            502 => MobileError::CallFailed("the PBX refused the transfer".into()),
+            504 => MobileError::Timeout,
+            _ => MobileError::GatewayError,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -975,6 +1033,60 @@ mod transfer_tests {
                 other => panic!("unexpected error for {status}: {other:?}"),
             };
             assert_eq!(got, expected, "HTTP {status}");
+        }
+    }
+
+    #[test]
+    fn attended_transfer_posts_the_other_calls_token_as_replaces() {
+        let gw = MockGateway::start(|_| (202, "{}".into()));
+        let client = GatewayClient::new(gw.base_url.clone());
+
+        block_on(client.transfer_attended(&client.primary_route(), "jwt", "tok-1", "tok-2"))
+            .unwrap();
+
+        let reqs = gw.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/v1/calls/tok-1/transfer");
+        assert_eq!(reqs[0].authorization.as_deref(), Some("Bearer jwt"));
+        let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+        assert_eq!(body, serde_json::json!({ "replaces": "tok-2" }));
+    }
+
+    #[test]
+    fn attended_transfer_maps_gateway_statuses_to_errors() {
+        let cases = [
+            (400, r#"{"error":"same_call"}"#, "InvalidState"),
+            (401, "{}", "AuthenticationError"),
+            (404, "{}", "InvalidState"),
+            (409, r#"{"error":"call_not_established"}"#, "InvalidState"),
+            (
+                409,
+                r#"{"error":"unsupported_by_pbx"}"#,
+                "TransferUnsupported",
+            ),
+            // No body: a transfer of either call is already in progress.
+            (409, "", "GatewayError"),
+            (502, "{}", "CallFailed"),
+            (504, "{}", "Timeout"),
+            (500, "{}", "GatewayError"),
+        ];
+        for (status, body, expected) in cases {
+            let gw = MockGateway::start(move |_| (status, body.into()));
+            let client = GatewayClient::new(gw.base_url.clone());
+            let err =
+                block_on(client.transfer_attended(&client.primary_route(), "jwt", "tok", "tok-2"))
+                    .unwrap_err();
+            let got = match err {
+                MobileError::AuthenticationError => "AuthenticationError",
+                MobileError::InvalidState => "InvalidState",
+                MobileError::TransferUnsupported => "TransferUnsupported",
+                MobileError::CallFailed(_) => "CallFailed",
+                MobileError::GatewayError => "GatewayError",
+                MobileError::Timeout => "Timeout",
+                other => panic!("unexpected error for {status}: {other:?}"),
+            };
+            assert_eq!(got, expected, "HTTP {status} {body}");
         }
     }
 

@@ -317,6 +317,34 @@ interface AriaMobileEngine {
     [Throws=MobileError]
     void transfer_call(string call_id, string target);
 
+    /// Attended (consultative) transfer: join the far ends of `call_id` and
+    /// `consult_call_id` (typically a call the user placed to the transfer
+    /// target while `call_id` was on hold) and drop this phone from both,
+    /// then wait for the outcome as `transfer_call` does. Either call may be
+    /// on hold here; the PBX bridges the far ends itself.
+    ///
+    /// On success both calls end: `on_call_state_changed` reports `Ended`
+    /// with reason `Transferred` exactly once for each.
+    ///
+    /// Checked before anything is sent: `InvalidState` unless the two are
+    /// distinct connected calls (not ringing, not ended);
+    /// `TransferUnsupported` unless one is incoming and the other outgoing
+    /// (the PBX can only join a call this phone received with one it
+    /// placed). From the gateway: `InvalidState` when it does not know
+    /// either call or one is not established; `TransferUnsupported` as
+    /// above; `GatewayError` when a transfer of either call is already in
+    /// progress; `CallFailed` when the PBX refused the REFER or reported the
+    /// transfer failed (the message carries the SIP status, such as 503);
+    /// `Timeout` as for `transfer_call`; `AuthenticationError` for a
+    /// rejected token. All of these leave both calls up, as they were.
+    ///
+    /// `InvalidState` after the REFER was accepted means one of the calls
+    /// ended for another reason meanwhile; that call has been reported
+    /// `Ended` and the other stays up. Blocks for up to about 45 s; call it
+    /// off the UI thread.
+    [Throws=MobileError]
+    void transfer_attended(string call_id, string consult_call_id);
+
     /// Set mute state.
     [Throws=MobileError]
     void set_mute(string call_id, boolean muted);
@@ -539,4 +567,8 @@ enum MobileError {
     /// `make_call` was cancelled by `hangup` before it returned. `Ended` has
     /// already been reported for the call.
     "Cancelled",
+    /// `transfer_attended` was asked to join two calls the PBX cannot join:
+    /// both incoming or both outgoing. It needs one call this phone received
+    /// and one it placed. Both calls stay up.
+    "TransferUnsupported",
 };

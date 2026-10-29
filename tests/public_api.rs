@@ -23,6 +23,20 @@ fn public_types_are_reachable() {
         Err(MobileError::InvalidState)
     ));
 
+    // Attended transfer: refused locally, without a gateway, for calls that
+    // do not exist; both calls named the same way is refused too.
+    assert!(matches!(
+        engine.transfer_attended("incoming-a".into(), "outgoing-b".into()),
+        Err(MobileError::InvalidState)
+    ));
+    assert!(matches!(
+        engine.transfer_attended("incoming-a".into(), "incoming-a".into()),
+        Err(MobileError::InvalidState)
+    ));
+    assert!(MobileError::TransferUnsupported
+        .to_string()
+        .contains("incoming"));
+
     let info = CallInfo {
         call_id: "outgoing-x".into(),
         remote_uri: "sip:1002@pbx.example.com".into(),

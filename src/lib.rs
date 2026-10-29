@@ -115,6 +115,17 @@ const TRANSFER_POLL_INTERVAL: Duration = Duration::from_millis(300);
 /// normally arrives first; this only covers a gateway that stops answering.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(35);
 
+/// Once one call of an attended transfer is reported transferred, how long
+/// the other has to be reported ended too before it is ended here.
+const TRANSFER_SETTLE: Duration = Duration::from_secs(5);
+
+/// One call of a transfer whose outcome is awaited.
+struct TransferLeg<'a> {
+    call_id: &'a str,
+    call_token: &'a str,
+    route: &'a Route,
+}
+
 /// How often a call's status is polled at the gateway.
 const CALL_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -1661,50 +1672,151 @@ impl AriaMobileEngine {
                 "Transfer of {} accepted by the PBX; waiting for the outcome",
                 call_id
             );
-            self.await_transfer_outcome(&call_id, &call_token, &route)
-                .await
+            let leg = TransferLeg {
+                call_id: &call_id,
+                call_token: &call_token,
+                route: &route,
+            };
+            self.await_transfer_outcome(&[leg]).await
         })
     }
 
-    /// Poll a call after its transfer was accepted until the outcome is
-    /// known. See `transfer_call`.
-    async fn await_transfer_outcome(
+    /// Attended-transfer: join the far ends of `call_id` and
+    /// `consult_call_id` (typically a call to the transfer target the user
+    /// placed while `call_id` was on hold) and drop this phone from both,
+    /// then wait for the outcome. See `transfer_call` for how the outcome is
+    /// followed; here it is followed on both calls.
+    ///
+    /// - Success: both calls end, each reported `Ended` once with reason
+    ///   `Transferred`.
+    /// - `transfer: failed`: `CallFailed` (or `Timeout` for 408), and both
+    ///   calls stay up, as they were (either may be on hold here).
+    /// - Either call ended for another reason meanwhile: `InvalidState`; that
+    ///   call is reported `Ended`, and the other stays up.
+    ///
+    /// Checked here before anything is sent, leaving both calls as they
+    /// were: `InvalidState` unless both are distinct connected
+    /// gateway-routed calls, and `TransferUnsupported` unless one is
+    /// incoming and the other outgoing (the PBX accepts the REFER only on a
+    /// call the phone received, with `Replaces` naming one it placed). Any
+    /// error from the REFER itself also leaves both calls as they were.
+    pub fn transfer_attended(
         &self,
-        call_id: &str,
-        call_token: &str,
-        route: &Route,
+        call_id: String,
+        consult_call_id: String,
     ) -> Result<(), MobileError> {
+        if call_id == consult_call_id {
+            return Err(MobileError::InvalidState);
+        }
+        let (call_token, route, consult_token, consult_route) = {
+            let calls = self
+                .calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let call = calls.get(&call_id).ok_or(MobileError::InvalidState)?;
+            let consult = calls
+                .get(&consult_call_id)
+                .ok_or(MobileError::InvalidState)?;
+            let call_token = call.call_token.clone().ok_or(MobileError::InvalidState)?;
+            let consult_token = consult
+                .call_token
+                .clone()
+                .ok_or(MobileError::InvalidState)?;
+            if call.info.direction == consult.info.direction {
+                log::warn!(
+                    "Attended transfer of {call_id} with {consult_call_id}: both are {:?}",
+                    call.info.direction
+                );
+                return Err(MobileError::TransferUnsupported);
+            }
+            (
+                call_token,
+                call.route.clone(),
+                consult_token,
+                consult.route.clone(),
+            )
+        };
+
+        let rt = runtime();
+        rt.block_on(async {
+            let token = self.auth.token()?;
+            self.gateway
+                .transfer_attended(&route, &token, &call_token, &consult_token)
+                .await?;
+            log::info!(
+                "Attended transfer of {call_id} with {consult_call_id} accepted by the PBX; \
+                 waiting for the outcome"
+            );
+            let legs = [
+                TransferLeg {
+                    call_id: &call_id,
+                    call_token: &call_token,
+                    route: &route,
+                },
+                TransferLeg {
+                    call_id: &consult_call_id,
+                    call_token: &consult_token,
+                    route: &consult_route,
+                },
+            ];
+            self.await_transfer_outcome(&legs).await
+        })
+    }
+
+    /// Poll the calls of a transfer after the PBX accepted it until the
+    /// outcome is known. See `transfer_call` and `transfer_attended`.
+    ///
+    /// The gateway reports an attended transfer's outcome on both calls, so
+    /// the first verdict on either decides. On success each call ends with
+    /// its own `Ended`; once one has, the others get
+    /// [`TRANSFER_SETTLE`] to follow before they are ended here (and hung up
+    /// at the gateway, in case they are somehow still up there).
+    async fn await_transfer_outcome(&self, legs: &[TransferLeg<'_>]) -> Result<(), MobileError> {
         let deadline = Instant::now() + self.transfer_timeout;
-        let mut gone = GoneDetector::default();
+        let mut gone: Vec<GoneDetector> = legs.iter().map(|_| GoneDetector::default()).collect();
+        let mut transferred = vec![false; legs.len()];
+        // Set once the first call is reported transferred.
+        let mut settle_by: Option<Instant> = None;
         loop {
             tokio::time::sleep(self.transfer_poll_interval).await;
             let token = self.auth.token()?;
-            let status = match self
-                .gateway
-                .get_call_status(route, &token, call_token)
-                .await
-            {
-                Ok(status) => Some(status),
-                // The call is still up; the app must fetch a new token.
-                Err(MobileError::AuthenticationError) => {
-                    return Err(MobileError::AuthenticationError)
+            for (i, leg) in legs.iter().enumerate() {
+                if transferred[i] {
+                    continue;
                 }
-                Err(e) => {
-                    log::warn!("Transfer status poll for {call_id} failed: {e}");
-                    None
-                }
-            };
-            if let Some(status) = status {
-                if gone.is_gone(&status.status) {
+                let call_id = leg.call_id;
+                let status = match self
+                    .gateway
+                    .get_call_status(leg.route, &token, leg.call_token)
+                    .await
+                {
+                    Ok(status) => status,
+                    // The calls are still up; the app must fetch a new token.
+                    Err(MobileError::AuthenticationError) => {
+                        return Err(MobileError::AuthenticationError)
+                    }
+                    Err(e) => {
+                        log::warn!("Transfer status poll for {call_id} failed: {e}");
+                        continue;
+                    }
+                };
+                let succeeded = transferred.iter().any(|t| *t);
+                if gone[i].is_gone(&status.status) {
                     // The call is over at the gateway. Whoever removes it
                     // from the map (this, the status poll, or a hangup)
-                    // reports `Ended`, once.
-                    let reason =
-                        EndReason::from_gateway(status.reason.as_deref(), EndReason::RemoteHangup);
+                    // reports `Ended`, once. After another call of the
+                    // transfer was transferred, this one ending is the
+                    // transfer completing, whatever the gateway calls it.
+                    let reason = if succeeded {
+                        EndReason::Transferred
+                    } else {
+                        EndReason::from_gateway(status.reason.as_deref(), EndReason::RemoteHangup)
+                    };
                     end_call_locally(&self.calls, &self.events, call_id, reason);
                     if reason == EndReason::Transferred {
                         log::info!("Call {call_id} transferred");
-                        return Ok(());
+                        transferred[i] = true;
+                        continue;
                     }
                     log::info!(
                         "Call {call_id} ended during its transfer (reason: {:?})",
@@ -1712,45 +1824,87 @@ impl AriaMobileEngine {
                     );
                     return Err(MobileError::InvalidState);
                 }
-                if status.status == "active" {
-                    match status.transfer.as_deref() {
-                        None => {
-                            // A gateway that does not report outcomes: the
-                            // 202 is all there is.
-                            log::info!("Gateway reports no transfer outcome; ending {call_id}");
+                // Once a call has been transferred, the transfer succeeded;
+                // the others are only waited on to end.
+                if status.status != "active" || succeeded {
+                    continue;
+                }
+                match status.transfer.as_deref() {
+                    None => {
+                        // A gateway that does not report outcomes: the 202
+                        // is all there is.
+                        log::info!("Gateway reports no transfer outcome; ending the call");
+                        for leg in legs {
                             end_call_locally(
                                 &self.calls,
                                 &self.events,
-                                call_id,
+                                leg.call_id,
                                 EndReason::Transferred,
                             );
-                            return Ok(());
                         }
-                        // 408 means no outcome: the gateway's NOTIFY
-                        // watchdog gave up, or the PBX itself timed out. The
-                        // transfer did not happen, and the call is still up.
-                        Some("failed") if status.transfer_code == Some(408) => {
-                            log::warn!("Transfer of {call_id} timed out (SIP 408)");
-                            return Err(MobileError::Timeout);
-                        }
-                        Some("failed") => {
-                            let code = status
-                                .transfer_code
-                                .map_or_else(|| "unknown".to_string(), |c| c.to_string());
-                            log::warn!("Transfer of {call_id} failed: SIP {code}");
-                            return Err(MobileError::CallFailed(format!(
-                                "the transfer failed (SIP {code}); the call is still up"
-                            )));
-                        }
-                        _ => {}
+                        return Ok(());
                     }
+                    // 408 means no outcome: the gateway's NOTIFY watchdog
+                    // gave up, or the PBX itself timed out. The transfer did
+                    // not happen, and the calls are still up.
+                    Some("failed") if status.transfer_code == Some(408) => {
+                        log::warn!("Transfer of {call_id} timed out (SIP 408)");
+                        return Err(MobileError::Timeout);
+                    }
+                    Some("failed") => {
+                        let code = status
+                            .transfer_code
+                            .map_or_else(|| "unknown".to_string(), |c| c.to_string());
+                        log::warn!("Transfer of {call_id} failed: SIP {code}");
+                        let still_up = if legs.len() > 1 {
+                            "the calls are still up"
+                        } else {
+                            "the call is still up"
+                        };
+                        return Err(MobileError::CallFailed(format!(
+                            "the transfer failed (SIP {code}); {still_up}"
+                        )));
+                    }
+                    _ => {}
                 }
             }
-            if Instant::now() >= deadline {
-                log::warn!("No transfer outcome for {call_id}; the call is still up");
+            if transferred.iter().all(|t| *t) {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if transferred.iter().any(|t| *t) {
+                let settle_by =
+                    *settle_by.get_or_insert(now + TRANSFER_SETTLE.min(self.transfer_timeout));
+                if now >= settle_by {
+                    for (leg, _) in legs.iter().zip(&transferred).filter(|(_, t)| !**t) {
+                        self.end_transferred_leg(leg);
+                    }
+                    return Ok(());
+                }
+            } else if now >= deadline {
+                log::warn!("No transfer outcome; the call is still up");
                 return Err(MobileError::Timeout);
             }
         }
+    }
+
+    /// End a call of a transfer that succeeded but which the gateway still
+    /// reports up: here at once, and at the gateway in the background.
+    fn end_transferred_leg(&self, leg: &TransferLeg<'_>) {
+        let call_id = leg.call_id.to_string();
+        log::warn!("{call_id} is still up after its transfer succeeded; hanging it up");
+        if !end_call_locally(&self.calls, &self.events, &call_id, EndReason::Transferred) {
+            return;
+        }
+        let (gateway, auth, events) = (
+            Arc::clone(&self.gateway),
+            Arc::clone(&self.auth),
+            Arc::clone(&self.events),
+        );
+        let (route, call_token) = (leg.route.clone(), leg.call_token.to_string());
+        runtime().spawn(async move {
+            hang_up_at_gateway(&gateway, &auth, &events, &route, &call_id, &call_token).await;
+        });
     }
 
     pub fn set_mute(&self, call_id: String, muted: bool) -> Result<(), MobileError> {
@@ -2660,6 +2814,332 @@ mod tests {
         call.info.direction = direction;
         call.route = route;
         stop
+    }
+
+    /// An incoming call `incoming-tok-in` and an outgoing consultation call
+    /// `outgoing-c` (token `tok-out`), as after placing a call to the
+    /// transfer target from a call on hold. Returns their poll stop flags.
+    fn insert_attended_pair(engine: &AriaMobileEngine) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+        let route = engine.gateway.primary_route();
+        let incoming = insert_call_on(
+            engine,
+            "incoming-tok-in",
+            "tok-in",
+            CallDirection::Inbound,
+            route.clone(),
+        );
+        let consult = insert_call_on(
+            engine,
+            "outgoing-c",
+            "tok-out",
+            CallDirection::Outbound,
+            route,
+        );
+        (incoming, consult)
+    }
+
+    /// A gateway that accepts a transfer with 202 and answers each call's
+    /// status polls with that call's script in turn, repeating the last
+    /// answer: `scripts` maps a call token to its script.
+    fn attended_gateway(scripts: &[(&'static str, &[&'static str])]) -> MockGateway {
+        let scripts: HashMap<String, (Vec<&'static str>, usize)> = scripts
+            .iter()
+            .map(|(token, script)| (token.to_string(), (script.to_vec(), 0)))
+            .collect();
+        let scripts = Mutex::new(scripts);
+        MockGateway::start(move |req| {
+            if req.path.ends_with("/transfer") {
+                return (202, "{}".into());
+            }
+            let token = req
+                .path
+                .strip_prefix("/v1/calls/")
+                .and_then(|p| p.strip_suffix("/status"));
+            let mut scripts = scripts.lock().unwrap();
+            match token.and_then(|t| scripts.get_mut(t)) {
+                Some((script, n)) => {
+                    let body = script[(*n).min(script.len() - 1)];
+                    *n += 1;
+                    (200, body.into())
+                }
+                None => (200, "{}".into()),
+            }
+        })
+    }
+
+    const PENDING: &str = r#"{"status":"active","transfer":"pending"}"#;
+    const TRANSFERRED: &str = r#"{"status":"ended","reason":"transferred"}"#;
+
+    fn ended_reasons(recorder: &Recorder, call_id: &str) -> Vec<Option<EndReason>> {
+        recorder
+            .states()
+            .iter()
+            .filter(|i| i.call_id == call_id && i.state == CallState::Ended)
+            .map(|i| i.end_reason)
+            .collect()
+    }
+
+    #[test]
+    fn attended_transfer_sends_replaces_and_ends_both_calls_once() {
+        let gw = attended_gateway(&[
+            ("tok-in", &[PENDING, PENDING, TRANSFERRED]),
+            ("tok-out", &[PENDING, TRANSFERRED]),
+        ]);
+        let (engine, recorder) = engine(&gw.base_url);
+        let (in_stop, out_stop) = insert_attended_pair(&engine);
+        // The regular remote-hangup polls run too, and also see the calls
+        // end; between them and the transfer, one Ended each.
+        let route = engine.gateway.primary_route();
+        engine.start_call_status_poll(
+            "incoming-tok-in".into(),
+            "tok-in".into(),
+            route.clone(),
+            Arc::clone(&in_stop),
+        );
+        engine.start_call_status_poll(
+            "outgoing-c".into(),
+            "tok-out".into(),
+            route,
+            Arc::clone(&out_stop),
+        );
+
+        engine
+            .transfer_attended("outgoing-c".into(), "incoming-tok-in".into())
+            .unwrap();
+
+        let transfers: Vec<_> = gw
+            .requests()
+            .into_iter()
+            .filter(|r| r.path.ends_with("/transfer"))
+            .collect();
+        assert_eq!(transfers.len(), 1);
+        assert_eq!(transfers[0].method, "POST");
+        assert_eq!(transfers[0].path, "/v1/calls/tok-out/transfer");
+        assert_eq!(transfers[0].body, r#"{"replaces":"tok-in"}"#);
+
+        assert!(engine.get_calls().is_empty());
+        assert!(in_stop.load(Ordering::Relaxed) && out_stop.load(Ordering::Relaxed));
+        std::thread::sleep(Duration::from_millis(100));
+        for id in ["incoming-tok-in", "outgoing-c"] {
+            assert_eq!(
+                ended_reasons(&recorder, id),
+                [Some(EndReason::Transferred)],
+                "{id}"
+            );
+        }
+        assert_eq!(recorder.states().len(), 2);
+        // Nothing was hung up: the gateway ended both calls itself.
+        assert!(gw.requests().iter().all(|r| !r.path.ends_with("/hangup")));
+    }
+
+    #[test]
+    fn a_failed_attended_transfer_keeps_both_calls_up() {
+        let failed = r#"{"status":"active","transfer":"failed","transfer_code":503}"#;
+        let gw = attended_gateway(&[
+            ("tok-in", &[PENDING, failed]),
+            ("tok-out", &[PENDING, failed]),
+        ]);
+        let (engine, recorder) = engine(&gw.base_url);
+        let (in_stop, out_stop) = insert_attended_pair(&engine);
+
+        let err = engine
+            .transfer_attended("incoming-tok-in".into(), "outgoing-c".into())
+            .unwrap_err();
+
+        match &err {
+            MobileError::CallFailed(message) => {
+                assert!(message.contains("SIP 503"), "{message}");
+                assert!(message.contains("still up"), "{message}");
+            }
+            other => panic!("expected CallFailed, got {other:?}"),
+        }
+        assert_eq!(engine.get_calls().len(), 2);
+        assert!(!in_stop.load(Ordering::Relaxed) && !out_stop.load(Ordering::Relaxed));
+        assert!(recorder.states().is_empty());
+    }
+
+    #[test]
+    fn an_attended_transfer_failed_with_408_is_a_timeout() {
+        let failed = r#"{"status":"active","transfer":"failed","transfer_code":408}"#;
+        let gw = attended_gateway(&[("tok-in", &[PENDING, failed]), ("tok-out", &[failed])]);
+        let (engine, recorder) = engine(&gw.base_url);
+        insert_attended_pair(&engine);
+
+        let err = engine
+            .transfer_attended("incoming-tok-in".into(), "outgoing-c".into())
+            .unwrap_err();
+
+        assert!(matches!(err, MobileError::Timeout), "{err:?}");
+        assert_eq!(engine.get_calls().len(), 2);
+        assert!(recorder.states().is_empty());
+    }
+
+    /// The incoming call hangs up mid-transfer: it is reported ended, and
+    /// the consultation call (released by the gateway with 487) stays up.
+    #[test]
+    fn a_call_that_ends_otherwise_during_an_attended_transfer_leaves_the_other_up() {
+        let gw = attended_gateway(&[
+            ("tok-in", &[PENDING, r#"{"status":"ended","reason":"bye"}"#]),
+            (
+                "tok-out",
+                &[
+                    PENDING,
+                    r#"{"status":"active","transfer":"failed","transfer_code":487}"#,
+                ],
+            ),
+        ]);
+        let (engine, recorder) = engine(&gw.base_url);
+        insert_attended_pair(&engine);
+
+        let err = engine
+            .transfer_attended("incoming-tok-in".into(), "outgoing-c".into())
+            .unwrap_err();
+
+        assert!(matches!(err, MobileError::InvalidState), "{err:?}");
+        assert_eq!(
+            ended_reasons(&recorder, "incoming-tok-in"),
+            [Some(EndReason::RemoteHangup)]
+        );
+        assert_eq!(ids(&engine.get_calls()), ["outgoing-c"]);
+    }
+
+    /// A call the gateway still reports up after the other was transferred
+    /// is ended here after a short wait, and hung up at the gateway.
+    #[test]
+    fn a_call_left_up_after_a_successful_attended_transfer_is_ended() {
+        let gw = attended_gateway(&[("tok-in", &[PENDING, TRANSFERRED]), ("tok-out", &[PENDING])]);
+        let (engine, recorder) = engine(&gw.base_url);
+        insert_attended_pair(&engine);
+
+        engine
+            .transfer_attended("incoming-tok-in".into(), "outgoing-c".into())
+            .unwrap();
+
+        assert!(engine.get_calls().is_empty());
+        for id in ["incoming-tok-in", "outgoing-c"] {
+            assert_eq!(
+                ended_reasons(&recorder, id),
+                [Some(EndReason::Transferred)],
+                "{id}"
+            );
+        }
+        assert!(eventually(|| count(&gw, "/v1/calls/tok-out/hangup") == 1));
+        assert_eq!(count(&gw, "/v1/calls/tok-in/hangup"), 0);
+    }
+
+    #[test]
+    fn attended_transfer_is_checked_before_anything_is_sent() {
+        let (engine, recorder) = engine(NO_GATEWAY);
+        let route = engine.gateway.primary_route();
+        insert_call_on(
+            &engine,
+            "incoming-a",
+            "a",
+            CallDirection::Inbound,
+            route.clone(),
+        );
+        insert_call_on(
+            &engine,
+            "incoming-b",
+            "b",
+            CallDirection::Inbound,
+            route.clone(),
+        );
+        insert_call_on(
+            &engine,
+            "outgoing-c",
+            "c",
+            CallDirection::Outbound,
+            route.clone(),
+        );
+        insert_call_on(&engine, "outgoing-d", "d", CallDirection::Outbound, route);
+
+        let invalid = [
+            ("incoming-a", "incoming-a"),
+            ("incoming-a", "nope"),
+            ("nope", "outgoing-c"),
+        ];
+        for (a, b) in invalid {
+            let err = engine.transfer_attended(a.into(), b.into()).unwrap_err();
+            assert!(matches!(err, MobileError::InvalidState), "{a} {b}: {err:?}");
+        }
+        for (a, b) in [("incoming-a", "incoming-b"), ("outgoing-c", "outgoing-d")] {
+            let err = engine.transfer_attended(a.into(), b.into()).unwrap_err();
+            assert!(
+                matches!(err, MobileError::TransferUnsupported),
+                "{a} {b}: {err:?}"
+            );
+        }
+        assert_eq!(engine.get_calls().len(), 4);
+        assert!(recorder.states().is_empty());
+    }
+
+    /// A ringing outgoing call is not connected, so it cannot be one side.
+    #[test]
+    fn a_ringing_call_cannot_be_attended_transferred() {
+        let gate = Gate::default();
+        let opened = gate.clone();
+        let gw = MockGateway::start(move |req| match req.path.as_str() {
+            "/v1/calls" => {
+                opened.wait();
+                answer("ct-out")
+            }
+            _ => (200, r#"{"status":"active"}"#.into()),
+        });
+        let (engine, _) = engine(&gw.base_url);
+        let engine = Arc::new(engine);
+        answer_here(&engine, "tok-1").unwrap();
+        let ringing = dial_in_background(&engine);
+        assert!(eventually(|| engine.get_calls().len() == 2));
+        let out_id = engine.get_calls()[1].call_id.clone();
+
+        let err = engine
+            .transfer_attended("incoming-tok-1".into(), out_id)
+            .unwrap_err();
+
+        assert!(matches!(err, MobileError::InvalidState), "{err:?}");
+        assert!(gw.requests().iter().all(|r| !r.path.ends_with("/transfer")));
+        gate.open();
+        ringing.recv().unwrap().unwrap();
+    }
+
+    #[test]
+    fn attended_transfer_refusals_leave_both_calls_up() {
+        // The gateway client's mapping is tested there; this checks that
+        // every refusal leaves both calls alone.
+        let cases = [
+            (
+                409,
+                r#"{"error":"unsupported_by_pbx"}"#,
+                "TransferUnsupported",
+            ),
+            (409, r#"{"error":"call_not_established"}"#, "InvalidState"),
+            (409, "", "GatewayError"),
+            (400, r#"{"error":"same_call"}"#, "InvalidState"),
+            (404, "{}", "InvalidState"),
+            (502, "{}", "CallFailed"),
+        ];
+        for (status, body, expected) in cases {
+            let gw = MockGateway::start(move |_| (status, body.to_string()));
+            let (engine, recorder) = engine(&gw.base_url);
+            insert_attended_pair(&engine);
+
+            let err = engine
+                .transfer_attended("incoming-tok-in".into(), "outgoing-c".into())
+                .unwrap_err();
+
+            let got = match err {
+                MobileError::TransferUnsupported => "TransferUnsupported",
+                MobileError::InvalidState => "InvalidState",
+                MobileError::GatewayError => "GatewayError",
+                MobileError::CallFailed(_) => "CallFailed",
+                other => panic!("HTTP {status} {body}: {other:?}"),
+            };
+            assert_eq!(got, expected, "HTTP {status} {body}");
+            assert_eq!(engine.get_calls().len(), 2, "HTTP {status} {body}");
+            assert!(recorder.states().is_empty(), "HTTP {status} {body}");
+            assert_eq!(gw.requests().len(), 1, "HTTP {status} {body}");
+        }
     }
 
     #[test]

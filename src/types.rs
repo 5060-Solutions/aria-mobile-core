@@ -224,6 +224,10 @@ pub enum MobileError {
     InvalidTarget,
     #[error("Cancelled")]
     Cancelled,
+    /// An attended transfer between two calls the PBX cannot join: it needs
+    /// one call this phone received and one it placed.
+    #[error("Transfer unsupported: one call must be incoming and the other outgoing")]
+    TransferUnsupported,
 }
 
 impl From<reqwest::Error> for MobileError {
