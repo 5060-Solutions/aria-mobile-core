@@ -1035,7 +1035,17 @@ impl AriaMobileEngine {
             },
         ) = self.reserve_outgoing(&call_id, &uri)?;
 
-        let (media, sdp_offer) = match offer.await {
+        // Opening media includes STUN, which can take a while. A hangup
+        // meanwhile returns at once; dropping the unfinished offer drops any
+        // session it had opened, which was never started.
+        let offer = tokio::select! {
+            offer = offer => offer,
+            _ = &mut cancel_rx => {
+                log::info!("Outgoing call {} hung up while setting up media", call_id);
+                return Err(MobileError::Cancelled);
+            }
+        };
+        let (media, sdp_offer) = match offer {
             Ok(offer) => offer,
             Err(e) => {
                 // `Ringing` has been reported, so close the call, unless a
@@ -4234,6 +4244,69 @@ mod tests {
             Err(MobileError::InvalidState)
         ));
         assert!(matches!(engine.hangup(id), Err(MobileError::InvalidState)));
+    }
+
+    /// A hangup while media is being set up (STUN can take a long time)
+    /// returns from make_call at once, without dialing.
+    #[test]
+    fn hangup_during_media_setup_returns_at_once() {
+        let gw = MockGateway::start(|_| answer("ct-m"));
+        let (engine, recorder) = engine(&gw.base_url);
+        let engine = Arc::new(engine);
+        let id = new_outgoing_call_id();
+        let (tx, result) = std::sync::mpsc::channel();
+        let (e, i) = (Arc::clone(&engine), id.clone());
+        std::thread::spawn(move || {
+            let r = runtime().block_on(e.dial(
+                i,
+                "1002".into(),
+                registration().sip,
+                // An offer that never finishes, like STUN that never answers.
+                std::future::pending(),
+            ));
+            let _ = tx.send(r);
+        });
+
+        assert_eq!(recorder.wait_for(1)[0].state, CallState::Ringing);
+        let started = Instant::now();
+        engine.hangup(id).unwrap();
+        let r = result.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        assert!(matches!(r, Err(MobileError::Cancelled)), "{r:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        let states: Vec<_> = recorder.states().iter().map(|i| i.state).collect();
+        assert_eq!(states, [CallState::Ringing, CallState::Ended]);
+        assert!(gw.requests().is_empty());
+    }
+
+    /// STUN that never answers is cut off at the budget, and the SDP gets the
+    /// local interface address instead.
+    #[test]
+    fn stun_that_never_answers_falls_back_to_the_interface_address() {
+        let started = Instant::now();
+        let ip = runtime().block_on(media::advertised_ip(
+            std::future::pending(),
+            Duration::from_millis(100),
+        ));
+        assert!(started.elapsed() < Duration::from_millis(1000));
+        assert!(ip.parse::<std::net::IpAddr>().is_ok(), "{ip}");
+
+        // A failed STUN falls back too, and a working one wins.
+        let ip = runtime().block_on(media::advertised_ip(
+            async { None },
+            Duration::from_millis(100),
+        ));
+        assert!(ip.parse::<std::net::IpAddr>().is_ok(), "{ip}");
+        let ip = runtime().block_on(media::advertised_ip(
+            async { Some("203.0.113.7".to_string()) },
+            Duration::from_millis(100),
+        ));
+        assert_eq!(ip, "203.0.113.7");
+        assert!(media::STUN_BUDGET <= Duration::from_secs(4));
     }
 
     #[test]

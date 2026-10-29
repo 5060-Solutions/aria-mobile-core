@@ -790,17 +790,7 @@ pub async fn create_answer_session(
     let session = MobileMediaSession::new(remote_addr, chosen).await?;
 
     // Use the actual RTP socket for STUN so NAT mapping matches
-    let local_ip = match rtp_engine::discover_public_address(session.rtp_socket_ref()).await {
-        Ok(result) => {
-            log::info!(
-                "STUN on RTP socket (answer): public {}:{}",
-                result.public_ip,
-                result.public_port
-            );
-            result.public_ip.to_string()
-        }
-        Err(_) => discover_local_ip().await,
-    };
+    let local_ip = advertised_ip(stun_on(session.rtp_socket_ref(), "answer"), STUN_BUDGET).await;
     let answer_sdp = build_sdp_answer(session.local_port(), &local_ip, chosen);
 
     Ok((session, answer_sdp))
@@ -820,18 +810,7 @@ pub async fn create_offer_session(
 
     // Discover public IP using the ACTUAL RTP socket so the NAT mapping matches.
     // If we use a different socket, the NAT mapping won't match and RTP won't flow.
-    let local_ip = match rtp_engine::discover_public_address(session.rtp_socket_ref()).await {
-        Ok(result) => {
-            log::info!(
-                "STUN on RTP socket: public {}:{}, local port {}",
-                result.public_ip,
-                result.public_port,
-                session.local_port()
-            );
-            result.public_ip.to_string()
-        }
-        Err(_) => discover_local_ip().await,
-    };
+    let local_ip = advertised_ip(stun_on(session.rtp_socket_ref(), "offer"), STUN_BUDGET).await;
 
     let codecs = if preferred_codecs.is_empty() {
         vec![AudioCodec::Pcmu, AudioCodec::Pcma, AudioCodec::Opus]
@@ -865,21 +844,63 @@ pub async fn create_offer_session(
     Ok((session, offer_sdp))
 }
 
-/// Best-effort local IP discovery via STUN.
-async fn discover_local_ip() -> String {
-    match rtp_engine::stun_discover(0).await {
-        Ok(result) => result.public_ip.to_string(),
+/// How long STUN discovery may take in all, for one SDP offer or answer.
+///
+/// rtp-engine's STUN resolves the server with no timeout and, on failure, a
+/// second discovery runs; unbounded, that could hold up a call for 30 s or
+/// more. Past this budget the SDP carries the local interface address.
+pub(crate) const STUN_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// The public address of `socket` by STUN, so the NAT mapping matches the
+/// RTP socket, then by a plain STUN query if that fails. `None` if neither
+/// answers.
+async fn stun_on(socket: &UdpSocket, label: &'static str) -> Option<String> {
+    match rtp_engine::discover_public_address(socket).await {
+        Ok(result) => {
+            log::info!(
+                "STUN on RTP socket ({label}): public {}:{}",
+                result.public_ip,
+                result.public_port
+            );
+            Some(result.public_ip.to_string())
+        }
+        Err(_) => rtp_engine::stun_discover(0)
+            .await
+            .ok()
+            .map(|result| result.public_ip.to_string()),
+    }
+}
+
+/// The address to advertise in SDP: what `discovery` finds within `budget`,
+/// otherwise the local interface address.
+pub(crate) async fn advertised_ip(
+    discovery: impl std::future::Future<Output = Option<String>>,
+    budget: std::time::Duration,
+) -> String {
+    match tokio::time::timeout(budget, discovery).await {
+        Ok(Some(ip)) => ip,
+        Ok(None) => {
+            log::warn!("STUN failed; advertising the local interface address");
+            local_interface_ip().await
+        }
         Err(_) => {
-            if let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await {
-                if sock.connect("8.8.8.8:80").await.is_ok() {
-                    if let Ok(addr) = sock.local_addr() {
-                        return addr.ip().to_string();
-                    }
-                }
-            }
-            "0.0.0.0".to_string()
+            log::warn!("STUN took over {budget:?}; advertising the local interface address");
+            local_interface_ip().await
         }
     }
+}
+
+/// The address of the interface that routes to the internet. Connecting a
+/// UDP socket only consults the routing table; nothing is sent.
+async fn local_interface_ip() -> String {
+    if let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await {
+        if sock.connect("8.8.8.8:80").await.is_ok() {
+            if let Ok(addr) = sock.local_addr() {
+                return addr.ip().to_string();
+            }
+        }
+    }
+    "0.0.0.0".to_string()
 }
 
 /// End-to-end proof that call audio reaches the on-device AI without crossing

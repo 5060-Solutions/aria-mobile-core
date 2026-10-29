@@ -113,6 +113,8 @@ The app picks the call's id before dialing: `id = new_outgoing_call_id()`, then 
 | While `make_call_with_id` sets up media or the `POST /v1/calls` is in flight | `Ended` is reported, `make_call_with_id` throws `Cancelled` at once, and if the call was sent, it is cancelled at the gateway in the background, as described below. |
 | After the far end answered | An ordinary hangup of an active call. |
 
+Media setup includes STUN discovery of the public address. It is bounded to 4 s in all. Past that, the SDP carries the local interface address, so setup never holds a call up for long. A hangup during setup does not wait for it.
+
 `make_call(uri, ...)` is kept and works as before, with a core-chosen id. With it, the app learns the id only from the `Ringing` event, which is delivered asynchronously on the event thread, so it cannot reliably hang up before then. Prefer `make_call_with_id`.
 
 The gateway assigns a call token only when the far end answers, so a ringing call is cancelled by the call's own reference:
