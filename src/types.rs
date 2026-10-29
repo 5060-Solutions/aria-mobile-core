@@ -172,6 +172,8 @@ pub enum MobileError {
     Timeout,
     #[error("Invalid target")]
     InvalidTarget,
+    #[error("Cancelled")]
+    Cancelled,
 }
 
 impl From<reqwest::Error> for MobileError {

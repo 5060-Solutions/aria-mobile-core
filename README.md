@@ -99,6 +99,12 @@ An engine constructed with an empty `api_key` has no token: methods that need th
 5. Engine updates media session with remote RTP address
 6. RTP flows directly between app and PBX
 
+### Hanging up while an outgoing call rings
+
+`make_call` blocks until the far end answers, but the call can be hung up before then: `hangup(call_id)` with the `call_id` from the `Ringing` event returns at once, `Ended` is reported, and `make_call` throws `Cancelled`. A hangup issued from inside the `Ringing` callback stops the call before anything is sent to the gateway.
+
+The gateway assigns a call token only when the far end answers (`POST /v1/calls` returns it with the SDP answer), and it has no route for cancelling an INVITE that has not been answered yet. So the far end keeps ringing until it answers or the INVITE times out. If it answers, the core immediately sends `POST /v1/calls/{token}/hangup` in the background. If the token is rejected at that point, `on_auth_required` fires. A hangup that lands just after the answer works the same way: the core hangs up the leg it has just been handed. Each of these sends exactly one hangup to the gateway, and the app sees exactly one `Ended`.
+
 ### Blind transfer
 
 1. App calls `transfer_call(call_id, target)`; `target` is a dial string (`"1002"`) or a `sip:` URI
@@ -122,6 +128,7 @@ Apps can be fully event-driven: install a `MobileEventHandler` with `set_event_h
 | Flow | Events |
 |------|--------|
 | Outgoing | `Ringing` (emitted by `make_call` before the gateway is contacted, which is how the app first learns the `call_id`), then `Connected` when the far end answers. If `make_call` fails after `Ringing`, `Ended` follows and the method throws. |
+| Outgoing, hung up while ringing | `Ringing`, then `Ended` from `hangup(call_id)`. The blocked `make_call` then throws `Cancelled`. |
 | Incoming | `on_incoming_call(offer)` from `handle_push_notification`, then `Connected` from `accept_incoming_call`. `reject_incoming_call` emits nothing. |
 | Caller cancels before answer | `Ended` for `incoming-<call_token>`, detected within about 2 s while the call is unanswered (watched for up to 10 minutes). |
 | Mute / hold | `set_mute` re-emits the current state with `muted` updated; `set_hold` emits `OnHold` or `Connected`. |
@@ -135,7 +142,7 @@ Apps can be fully event-driven: install a `MobileEventHandler` with `set_event_h
 
 **Other callbacks.** `on_registration_changed` reports `"registered"` after `register_device` or `update_push_token` succeeds and `"unregistered"` after `unregister_device`. `on_auth_required` is described below. `on_media_stats` and `on_error` are not currently emitted; read `get_media_stats` when stats are needed.
 
-**Token expiry (`on_auth_required`).** A gateway 401 means the gateway token is missing, expired or revoked. Engine methods report it by throwing `AuthenticationError`; `hangup` still ends the call locally and emits `Ended` before throwing it, since the user wants the call gone, but the far end may stay up until the PBX times it out. Background work cannot throw, so it calls `on_auth_required()` instead. That covers the call-status polls, the caller-cancel watch on an offered incoming call, and the network-change heartbeat. `on_auth_required` fires at most once per token. It fires again only after `set_gateway_token` has been called and the new token is rejected as well, and a 401 for a token that has already been replaced is ignored. The app should fetch a new token from the PBX (`POST /api/v1/devices/{id}/gateway-token`) and call `set_gateway_token`. A rejected poll never ends a call: the call stays up, polling continues, and it uses the new token once one is set. Until then a remote hangup cannot be detected.
+**Token expiry (`on_auth_required`).** A gateway 401 means the gateway token is missing, expired or revoked. Engine methods report it by throwing `AuthenticationError`; `hangup` still ends the call locally and emits `Ended` before throwing it, since the user wants the call gone, but the far end may stay up until the PBX times it out. Background work cannot throw, so it calls `on_auth_required()` instead. That covers the call-status polls, the caller-cancel watch on an offered incoming call, the network-change heartbeat, and hanging up an outgoing call that was answered after it was cancelled. `on_auth_required` fires at most once per token. It fires again only after `set_gateway_token` has been called and the new token is rejected as well, and a 401 for a token that has already been replaced is ignored. The app should fetch a new token from the PBX (`POST /api/v1/devices/{id}/gateway-token`) and call `set_gateway_token`. A rejected poll never ends a call: the call stays up, polling continues, and it uses the new token once one is set. Until then a remote hangup cannot be detected.
 
 **Polling APIs.** `get_active_call` remains a valid snapshot. `check_remote_hangup` still works for apps that poll it, but the `Ended` event has already been delivered by the time an ID appears there, and only the most recent 16 IDs are kept.
 

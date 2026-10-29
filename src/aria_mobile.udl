@@ -142,7 +142,8 @@ callback interface MobileEventHandler {
     void on_error(string context, string message);
 
     /// Called when background work (call-status polls, the caller-cancel
-    /// watch, the network-change heartbeat) had the gateway token rejected
+    /// watch, the network-change heartbeat, hanging up an outgoing call that
+    /// was answered after it was cancelled) had the gateway token rejected
     /// with 401. Fetch a new token from
     /// the PBX (`POST /api/v1/devices/{id}/gateway-token`) and pass it to
     /// `set_gateway_token`. Emitted at most once per token: it fires again
@@ -200,13 +201,24 @@ interface AriaMobileEngine {
 
     // ── Outgoing Calls (direct SIP) ────────────────────────────────
 
-    /// Make an outgoing call directly via SIP.
+    /// Make an outgoing call through the gateway. Blocks until the far end
+    /// answers or the call fails, after reporting `Ringing` with the call's
+    /// `outgoing-<uuid>` id.
+    ///
+    /// `hangup(call_id)` may be called while this is blocked: `Ended` is
+    /// reported for the call and this throws `Cancelled`. The gateway only
+    /// assigns a call token when the far end answers and cannot cancel an
+    /// unanswered INVITE, so if the call is answered later the core hangs it
+    /// up at once in the background. Any other failure reports `Ended` and
+    /// throws (`AuthenticationError` on a 401).
     [Throws=MobileError]
     CallInfo make_call(string uri, SipCredentials credentials, sequence<AudioCodec> preferred_codecs);
 
     // ── Mid-call Controls ──────────────────────────────────────────
 
-    /// Hang up an active call.
+    /// Hang up a call, including an outgoing call that is still ringing
+    /// (see `make_call`). Throws `InvalidState` for an unknown or already
+    /// ended call_id.
     ///
     /// The local call always ends and `Ended` is emitted. Throws
     /// `AuthenticationError` if the gateway rejected the token (401), in
@@ -423,4 +435,7 @@ enum MobileError {
     /// A transfer target was empty, contained characters that are not allowed
     /// in a SIP URI header (CR, LF, '<', '>'), or was refused by the gateway.
     "InvalidTarget",
+    /// `make_call` was cancelled by `hangup` before it returned. `Ended` has
+    /// already been reported for the call.
+    "Cancelled",
 };
