@@ -12,7 +12,16 @@ fn public_types_are_reachable() {
         base_url: "https://gw.example.com".into(),
         api_key: String::new(),
     };
-    let _engine = AriaMobileEngine::new(config);
+    let engine = AriaMobileEngine::new(config);
+
+    // Call waiting: listing calls and swapping between two of them.
+    let calls: Vec<CallInfo> = engine.get_calls();
+    assert!(calls.is_empty());
+    assert!(engine.get_active_call().is_none());
+    assert!(matches!(
+        engine.swap_calls("incoming-a".into(), "outgoing-b".into()),
+        Err(MobileError::InvalidState)
+    ));
 
     let info = CallInfo {
         call_id: "outgoing-x".into(),

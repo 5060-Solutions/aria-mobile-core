@@ -14,7 +14,7 @@ mod media;
 mod types;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -286,6 +286,53 @@ fn end_call_locally(
     }
 }
 
+/// Put a connected call on or off hold here (no re-INVITE): its media and its
+/// reported state. Returns whether its hold state changed; the caller queues
+/// the event.
+fn apply_hold(call: &mut ActiveCallState, on_hold: bool) -> bool {
+    if let Some(media) = &call.media {
+        media.set_hold(on_hold);
+    }
+    let changed = call.info.on_hold != on_hold;
+    call.info.on_hold = on_hold;
+    call.info.state = if on_hold {
+        CallState::OnHold
+    } else {
+        CallState::Connected
+    };
+    changed
+}
+
+/// Hold every connected call except `keep` that is not held already, and
+/// report each one that changed.
+///
+/// Called under the call-map lock just before `keep` becomes the un-held
+/// call, which keeps the invariant that at most one connected call is off
+/// hold: only that call plays to the speaker and reads the microphone.
+fn hold_others(calls: &mut HashMap<String, ActiveCallState>, keep: &str, events: &Dispatcher) {
+    for (call_id, call) in calls.iter_mut() {
+        if call_id != keep && apply_hold(call, true) {
+            log::info!("Holding {call_id}: {keep} is now the active call");
+            call.events.emit(events, call.info.clone());
+        }
+    }
+}
+
+/// Every live call with its creation order: connected calls and ringing
+/// outgoing ones.
+fn live_calls(
+    calls: &HashMap<String, ActiveCallState>,
+    outgoing: &OutgoingCalls,
+) -> Vec<(u64, CallInfo)> {
+    let mut live: Vec<(u64, CallInfo)> = calls
+        .values()
+        .map(|c| (c.seq, c.info.clone()))
+        .chain(outgoing.ringing.values().map(|p| (p.seq, p.info.clone())))
+        .collect();
+    live.sort_by_key(|(seq, _)| *seq);
+    live
+}
+
 /// How many consecutive `unknown` statuses count as the gateway having lost
 /// a call. A single one can be a transient answer (a gateway instance
 /// restarting, or briefly between states) and must not drop a live call.
@@ -348,6 +395,8 @@ pub struct AriaMobileEngine {
     /// here to `calls` when it is answered. When both locks are held, `calls`
     /// is taken first.
     pending_outgoing: Mutex<OutgoingCalls>,
+    /// Creation order of calls, for `get_calls`.
+    next_seq: AtomicU64,
     /// The PBX-issued gateway token. Shared with the status-poll threads so
     /// they pick up a token replaced by `set_gateway_token`.
     auth: Arc<auth::GatewayAuth>,
@@ -471,6 +520,8 @@ fn new_outgoing_call_id() -> String {
 /// An outgoing call that has been reported `Ringing` and not answered yet.
 struct PendingOutgoing {
     info: CallInfo,
+    /// Creation order, carried over to the call once it is answered.
+    seq: u64,
     events: Arc<CallEvents>,
     /// Sent with `POST /v1/calls` so the gateway can cancel the call by it
     /// before it has assigned a call token.
@@ -520,6 +571,8 @@ struct ReservedOutgoing {
 
 struct ActiveCallState {
     info: CallInfo,
+    /// Creation order, for `get_calls`.
+    seq: u64,
     media: Option<media::MobileMediaSession>,
     /// For gateway-routed calls
     call_token: Option<String>,
@@ -540,6 +593,7 @@ impl AriaMobileEngine {
             calls: Arc::new(Mutex::new(HashMap::new())),
             pending_incoming: Arc::new(Mutex::new(HashMap::new())),
             pending_outgoing: Mutex::new(OutgoingCalls::default()),
+            next_seq: AtomicU64::new(0),
             auth: Arc::new(auth::GatewayAuth::new(gateway_config.api_key)),
             device_id: Arc::new(RwLock::new(None)),
             heartbeat: Arc::default(),
@@ -712,6 +766,24 @@ impl AriaMobileEngine {
         })
     }
 
+    /// Start a call's RTP loops with the platform audio bridge. Without this
+    /// the media session exists but has no audio in either direction.
+    fn start_media(&self, media: Option<&media::MobileMediaSession>, call_id: &str) {
+        let Some(media) = media else { return };
+        match self
+            .audio_bridge
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            Some(bridge) => {
+                media.start_with_bridge(bridge);
+                log::info!("Started RTP media for {call_id} with the audio bridge");
+            }
+            None => log::warn!("No audio bridge set; {call_id} will have no audio"),
+        }
+    }
+
     /// Send the answer for an offered call and make it the active call.
     ///
     /// If the accept fails with a timeout or a transport error, the gateway
@@ -791,26 +863,6 @@ impl AriaMobileEngine {
         }
         self.clear_pending_incoming(&call_token);
 
-        // Start RTP processing with the platform audio bridge. Without this
-        // the media session is created and stored but its RX/TX threads
-        // never run, so an ANSWERED INBOUND CALL HAS NO AUDIO in either
-        // direction. (The remote RTP address is already set by
-        // `create_answer_session` from the caller's SDP offer, so unlike the
-        // outbound path there is no separate `update_remote` step here.)
-        if let Some(media_session) = &media {
-            if let Some(bridge) = self
-                .audio_bridge
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-            {
-                media_session.start_with_bridge(bridge);
-                log::info!("Started RTP media session with audio bridge (inbound)");
-            } else {
-                log::warn!("No audio bridge set — inbound call will have no audio");
-            }
-        }
-
         let poll_stop = Arc::new(AtomicBool::new(false));
         let connected = {
             let mut calls = self
@@ -820,13 +872,22 @@ impl AriaMobileEngine {
             // Queued while the call-map lock is held, so nothing done to the
             // call afterwards can be delivered ahead of it. Refused when the
             // offer was already reported ended (the caller hung up as it
-            // was answered).
-            let connected = events.emit(&self.events, info.clone());
+            // was answered). Any other connected call is put on hold, and
+            // reported, first.
+            let connected = events.emit_after(&self.events, info.clone(), || {
+                hold_others(&mut calls, &call_id, &self.events);
+            });
             if connected {
+                // Started only now that the other calls are held, so two
+                // calls never share the speaker and microphone. (The remote
+                // RTP address was set by `create_answer_session` from the
+                // caller's SDP offer.)
+                self.start_media(media.as_ref(), &call_id);
                 calls.insert(
                     call_id.clone(),
                     ActiveCallState {
                         info: info.clone(),
+                        seq: self.next_seq.fetch_add(1, Ordering::Relaxed),
                         media,
                         call_token: Some(call_token.clone()),
                         route: route.clone(),
@@ -979,6 +1040,7 @@ impl AriaMobileEngine {
             call_id.to_string(),
             PendingOutgoing {
                 info: info.clone(),
+                seq: self.next_seq.fetch_add(1, Ordering::Relaxed),
                 events: Arc::clone(&events),
                 client_ref: client_ref.clone(),
                 dialing: false,
@@ -1159,14 +1221,6 @@ impl AriaMobileEngine {
             if let Err(e) = media_session.apply_remote_sdp(&sdp_answer) {
                 log::warn!("SRTP negotiation failed, continuing without it: {e:?}");
             }
-
-            // Start RTP processing with platform audio bridge
-            if let Some(bridge) = self.audio_bridge.read().unwrap().clone() {
-                media_session.start_with_bridge(bridge);
-                log::info!("Started RTP media session with audio bridge");
-            } else {
-                log::warn!("No audio bridge set — call will have no audio");
-            }
         }
 
         // Transition to connected
@@ -1185,11 +1239,17 @@ impl AriaMobileEngine {
                 .pending_outgoing
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if pending.ringing.remove(&call_id).is_some() {
+            if let Some(ringing) = pending.ringing.remove(&call_id) {
+                // Any other connected call goes on hold, and is reported,
+                // before this one connects and its media starts, so two
+                // calls never share the speaker and microphone.
+                hold_others(&mut calls, &call_id, &self.events);
+                self.start_media(media.as_ref(), &call_id);
                 calls.insert(
                     call_id.clone(),
                     ActiveCallState {
                         info: info.clone(),
+                        seq: ringing.seq,
                         media,
                         call_token: Some(call_token.clone()),
                         route: route.clone(),
@@ -1556,21 +1616,57 @@ impl AriaMobileEngine {
         Ok(())
     }
 
+    /// Hold or resume a call, locally (no re-INVITE).
+    ///
+    /// Resuming a call first holds every other connected call, so at most
+    /// one is ever off hold; each call whose hold state changed is reported.
     pub fn set_hold(&self, call_id: String, on_hold: bool) -> Result<(), MobileError> {
         let mut calls = self.calls.lock().unwrap();
-        let call = calls.get_mut(&call_id).ok_or(MobileError::InvalidState)?;
-
-        if let Some(media) = &call.media {
-            media.set_hold(on_hold);
+        if !calls.contains_key(&call_id) {
+            return Err(MobileError::InvalidState);
         }
-
-        call.info.on_hold = on_hold;
-        call.info.state = if on_hold {
-            CallState::OnHold
-        } else {
-            CallState::Connected
-        };
+        if !on_hold {
+            hold_others(&mut calls, &call_id, &self.events);
+        }
+        let call = calls.get_mut(&call_id).expect("checked above");
+        apply_hold(call, on_hold);
+        // Queued under the call-map lock, so concurrent changes are
+        // delivered in the order they were applied.
         call.events.emit(&self.events, call.info.clone());
+        Ok(())
+    }
+
+    /// Put `active_call_id` on hold and resume `held_call_id`, in one step
+    /// with respect to every other call control.
+    ///
+    /// Throws `InvalidState` unless both are distinct connected calls. Each
+    /// call whose hold state changed is reported, the one going on hold
+    /// first.
+    pub fn swap_calls(
+        &self,
+        active_call_id: String,
+        held_call_id: String,
+    ) -> Result<(), MobileError> {
+        if active_call_id == held_call_id {
+            return Err(MobileError::InvalidState);
+        }
+        let mut calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !calls.contains_key(&active_call_id) || !calls.contains_key(&held_call_id) {
+            return Err(MobileError::InvalidState);
+        }
+        let active = calls.get_mut(&active_call_id).expect("checked above");
+        if apply_hold(active, true) {
+            active.events.emit(&self.events, active.info.clone());
+        }
+        hold_others(&mut calls, &held_call_id, &self.events);
+        let held = calls.get_mut(&held_call_id).expect("checked above");
+        if apply_hold(held, false) {
+            held.events.emit(&self.events, held.info.clone());
+        }
+        log::info!("Swapped calls: {active_call_id} held, {held_call_id} active");
         Ok(())
     }
 
@@ -2024,12 +2120,40 @@ impl AriaMobileEngine {
 
     // ── State Queries ───────────────────────────────────────────────
 
+    /// The connected call that is off hold, if there is one; otherwise the
+    /// most recently created live call (held, or outgoing and ringing).
     pub fn get_active_call(&self) -> Option<CallInfo> {
-        let calls = self.calls.lock().unwrap();
-        calls
-            .values()
-            .find(|c| !matches!(c.info.state, CallState::Ended | CallState::Idle))
-            .map(|c| c.info.clone())
+        // Lock order: calls, then pending_outgoing.
+        let calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(call) = calls.values().find(|c| !c.info.on_hold) {
+            return Some(call.info.clone());
+        }
+        let outgoing = self
+            .pending_outgoing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        live_calls(&calls, &outgoing).pop().map(|(_, info)| info)
+    }
+
+    /// Every live call (connected, held, or outgoing and ringing), oldest
+    /// first. Offered incoming calls are not included until accepted.
+    pub fn get_calls(&self) -> Vec<CallInfo> {
+        // Lock order: calls, then pending_outgoing.
+        let calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outgoing = self
+            .pending_outgoing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        live_calls(&calls, &outgoing)
+            .into_iter()
+            .map(|(_, info)| info)
+            .collect()
     }
 
     pub fn get_media_stats(&self, call_id: String) -> Option<MediaStats> {
@@ -2355,6 +2479,7 @@ mod tests {
                     duration_secs: 0,
                     end_reason: None,
                 },
+                seq: engine.next_seq.fetch_add(1, Ordering::Relaxed),
                 media: None,
                 call_token: Some(call_token.to_string()),
                 route: engine.gateway.primary_route(),
@@ -4541,5 +4666,193 @@ mod tests {
         assert!(fired.load(Ordering::Relaxed));
         // Break the Arc cycle (engine -> handler -> engine).
         engine.events.set_handler(None);
+    }
+
+    // ── Call waiting ────────────────────────────────────────────────
+
+    /// A gateway on which every call is up and every request succeeds, and
+    /// an outgoing call is answered with `ct-out`.
+    fn call_waiting_gateway() -> MockGateway {
+        MockGateway::start(|req| match req.path.as_str() {
+            "/v1/calls" => answer("ct-out"),
+            p if p.ends_with("/status") => (200, r#"{"status":"active"}"#.into()),
+            _ => (200, "{}".into()),
+        })
+    }
+
+    /// (call_id, state, on_hold) of each call-state event, in order.
+    fn holds(recorder: &Recorder) -> Vec<(String, CallState, bool)> {
+        recorder
+            .states()
+            .into_iter()
+            .map(|i| (i.call_id, i.state, i.on_hold))
+            .collect()
+    }
+
+    fn ids(calls: &[CallInfo]) -> Vec<&str> {
+        calls.iter().map(|c| c.call_id.as_str()).collect()
+    }
+
+    #[test]
+    fn two_calls_can_be_up_at_once() {
+        let gw = call_waiting_gateway();
+        let (engine, _recorder) = engine(&gw.base_url);
+        answer_here(&engine, "tok-1").unwrap();
+        let out = dial(&engine).unwrap();
+
+        let calls = engine.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.contains_key("incoming-tok-1"));
+        assert!(calls.contains_key(&out.call_id));
+    }
+
+    #[test]
+    fn an_answered_outgoing_call_holds_the_connected_one_first() {
+        let gw = call_waiting_gateway();
+        let (engine, recorder) = engine(&gw.base_url);
+        answer_here(&engine, "tok-1").unwrap();
+        let out = dial(&engine).unwrap();
+        assert!(!out.on_hold);
+
+        assert_eq!(
+            holds(&recorder),
+            [
+                ("incoming-tok-1".to_string(), CallState::Connected, false),
+                (out.call_id.clone(), CallState::Ringing, false),
+                ("incoming-tok-1".to_string(), CallState::OnHold, true),
+                (out.call_id.clone(), CallState::Connected, false),
+            ]
+        );
+        assert_eq!(engine.get_active_call().unwrap().call_id, out.call_id);
+    }
+
+    #[test]
+    fn an_accepted_call_holds_the_connected_one_first() {
+        let gw = call_waiting_gateway();
+        let (engine, recorder) = engine(&gw.base_url);
+        let out = dial(&engine).unwrap();
+        answer_here(&engine, "tok-2").unwrap();
+
+        assert_eq!(
+            holds(&recorder)[2..],
+            [
+                (out.call_id.clone(), CallState::OnHold, true),
+                ("incoming-tok-2".to_string(), CallState::Connected, false),
+            ]
+        );
+        let calls = engine.get_calls();
+        assert_eq!(ids(&calls), [out.call_id.as_str(), "incoming-tok-2"]);
+        assert!(calls[0].on_hold && !calls[1].on_hold);
+        assert_eq!(engine.get_active_call().unwrap().call_id, "incoming-tok-2");
+    }
+
+    #[test]
+    fn an_accept_of_a_call_that_already_ended_holds_nothing() {
+        let gw = call_waiting_gateway();
+        let (engine, recorder) = engine(&gw.base_url);
+        insert_call(&engine, "c1", "tok-c1");
+        // The offer is reported ended (the caller hung up) as it is answered.
+        let entry_events =
+            engine.watch_incoming(&offer("tok-x"), engine.gateway.primary_route(), false);
+        let info = engine.pending_incoming.lock().unwrap()["tok-x"]
+            .info
+            .clone();
+        entry_events.emit_ended(&engine.events, &info, EndReason::CallerCancelled);
+
+        assert!(matches!(
+            answer_here(&engine, "tok-x"),
+            Err(MobileError::InvalidState)
+        ));
+        assert!(!engine.calls.lock().unwrap()["c1"].info.on_hold);
+        assert_eq!(holds(&recorder).len(), 1, "only the offer's Ended");
+    }
+
+    #[test]
+    fn get_calls_lists_live_calls_oldest_first() {
+        let (engine, _recorder) = engine(NO_GATEWAY);
+        assert!(engine.get_calls().is_empty());
+        assert!(engine.get_active_call().is_none());
+
+        insert_call(&engine, "c1", "tok-1");
+        let ringing = "outgoing-ringing".to_string();
+        engine.reserve_outgoing(&ringing, "1003").unwrap();
+        assert_eq!(ids(&engine.get_calls()), ["c1", ringing.as_str()]);
+        // The un-held connected call wins over a newer ringing one...
+        assert_eq!(engine.get_active_call().unwrap().call_id, "c1");
+        // ...and with every connected call held, the newest live call.
+        engine.set_hold("c1".into(), true).unwrap();
+        assert_eq!(engine.get_active_call().unwrap().call_id, ringing);
+
+        // Order is by creation, not by map order or id.
+        let (engine, _recorder) = self::engine(NO_GATEWAY);
+        for id in ["z", "a", "m"] {
+            insert_call(&engine, id, id);
+        }
+        engine.calls.lock().unwrap().remove("a");
+        insert_call(&engine, "a", "a");
+        assert_eq!(ids(&engine.get_calls()), ["z", "m", "a"]);
+    }
+
+    #[test]
+    fn resuming_a_call_holds_the_other_first() {
+        let (engine, recorder) = engine(NO_GATEWAY);
+        insert_call(&engine, "c1", "tok-1");
+        insert_call(&engine, "c2", "tok-2");
+        engine.set_hold("c1".into(), true).unwrap();
+        engine.set_hold("c1".into(), false).unwrap();
+
+        assert_eq!(
+            holds(&recorder),
+            [
+                ("c1".to_string(), CallState::OnHold, true),
+                ("c2".to_string(), CallState::OnHold, true),
+                ("c1".to_string(), CallState::Connected, false),
+            ]
+        );
+        // A call that is already held is not reported again.
+        engine.set_hold("c1".into(), false).unwrap();
+        assert_eq!(holds(&recorder).len(), 4);
+        assert_eq!(engine.get_active_call().unwrap().call_id, "c1");
+    }
+
+    #[test]
+    fn swap_holds_one_call_and_resumes_the_other() {
+        let gw = call_waiting_gateway();
+        let (engine, recorder) = engine(&gw.base_url);
+        insert_call(&engine, "c1", "tok-1");
+        insert_call(&engine, "c2", "tok-2");
+        engine.set_hold("c1".into(), true).unwrap();
+        let skip = holds(&recorder).len();
+
+        engine.swap_calls("c2".into(), "c1".into()).unwrap();
+        assert_eq!(
+            holds(&recorder)[skip..],
+            [
+                ("c2".to_string(), CallState::OnHold, true),
+                ("c1".to_string(), CallState::Connected, false),
+            ]
+        );
+        let calls = engine.get_calls();
+        assert!(!calls[0].on_hold && calls[1].on_hold);
+        assert_eq!(engine.get_active_call().unwrap().call_id, "c1");
+
+        for (a, b) in [("c1", "c1"), ("c1", "nope"), ("nope", "c1")] {
+            assert!(matches!(
+                engine.swap_calls(a.into(), b.into()),
+                Err(MobileError::InvalidState)
+            ));
+        }
+        assert_eq!(
+            holds(&recorder).len(),
+            skip + 2,
+            "a refused swap reports nothing"
+        );
+
+        // Both hang up cleanly, with one Ended each.
+        engine.hangup("c1".into()).unwrap();
+        engine.hangup("c2".into()).unwrap();
+        assert_eq!(ended_count(&recorder, "c1"), 1);
+        assert_eq!(ended_count(&recorder, "c2"), 1);
+        assert!(engine.get_calls().is_empty());
     }
 }

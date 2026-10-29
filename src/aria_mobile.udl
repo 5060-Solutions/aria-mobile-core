@@ -317,9 +317,20 @@ interface AriaMobileEngine {
     [Throws=MobileError]
     void set_mute(string call_id, boolean muted);
 
-    /// Set hold state.
+    /// Hold or resume a call. Local only: media to and from the far end
+    /// stops (the RTP stream keeps running), but no re-INVITE is sent.
+    /// Resuming a call first holds every other connected call, so at most one
+    /// call is ever off hold; each call whose hold state changed is reported
+    /// through `on_call_state_changed`. A call that connects (answered, or an
+    /// outgoing call that is answered) likewise holds the others first.
     [Throws=MobileError]
     void set_hold(string call_id, boolean on_hold);
+
+    /// Put `active_call_id` on hold and resume `held_call_id` in one step.
+    /// Each call whose hold state changed is reported, the one going on hold
+    /// first. Throws `InvalidState` unless both are distinct connected calls.
+    [Throws=MobileError]
+    void swap_calls(string active_call_id, string held_call_id);
 
     /// Send a DTMF digit.
     [Throws=MobileError]
@@ -327,8 +338,13 @@ interface AriaMobileEngine {
 
     // ── State Queries ──────────────────────────────────────────────
 
-    /// Get current call info, if any.
+    /// The connected call that is off hold, if any; otherwise the most
+    /// recently created live call (held, or outgoing and ringing).
     CallInfo? get_active_call();
+
+    /// Every live call (connected, held, or outgoing and ringing), oldest
+    /// first.
+    sequence<CallInfo> get_calls();
 
     /// Get media statistics for a call.
     MediaStats? get_media_stats(string call_id);
