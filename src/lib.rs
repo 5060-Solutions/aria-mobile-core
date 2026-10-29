@@ -23,7 +23,10 @@ pub mod ai;
 use events::{CallEvents, Dispatcher};
 use gateway_client::Route;
 pub use media::PlatformAudioBridge;
-use types::*;
+/// The API's public types (`CallInfo`, `MobileError`, `SipCredentials`, ...),
+/// re-exported so Rust crates can use the engine directly, not only through
+/// the generated bindings.
+pub use types::*;
 
 // The UniFFI-generated scaffolding leaves a blank line after a doc comment,
 // which clippy flags. That file is regenerated on every build, so the lint is
