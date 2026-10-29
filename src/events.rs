@@ -13,7 +13,7 @@
 
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 
-use crate::types::{CallInfo, CallOffer, CallState};
+use crate::types::{CallInfo, CallOffer, CallState, EndReason};
 use crate::MobileEventHandler;
 
 /// The installed event handler.
@@ -183,14 +183,25 @@ impl CallEvents {
             return false;
         }
         *ended = info.state == CallState::Ended;
+        let mut info = info;
+        if !*ended {
+            info.end_reason = None;
+        }
         dispatcher.call_state(info);
         true
     }
 
-    /// Queue `info` as `Ended`, unless the call has already ended.
-    pub(crate) fn emit_ended(&self, dispatcher: &Dispatcher, info: &CallInfo) -> bool {
+    /// Queue `info` as `Ended` for `reason`, unless the call has already
+    /// ended.
+    pub(crate) fn emit_ended(
+        &self,
+        dispatcher: &Dispatcher,
+        info: &CallInfo,
+        reason: EndReason,
+    ) -> bool {
         let mut info = info.clone();
         info.state = CallState::Ended;
+        info.end_reason = Some(reason);
         self.emit(dispatcher, info)
     }
 }

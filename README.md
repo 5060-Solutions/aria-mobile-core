@@ -150,22 +150,25 @@ Apps can be fully event-driven: install a `MobileEventHandler` with `set_event_h
 
 **`on_call_state_changed` sequences**
 
-| Flow | Events |
-|------|--------|
-| Outgoing | `Ringing` (queued by `make_call_with_id` before media is set up or the gateway is contacted), then `Connected` when the far end answers. If the call fails after `Ringing`, `Ended` follows and the method throws. |
-| Outgoing, hung up before it is answered | `Ringing` then `Ended`, or only `Ended` if `hangup(id)` came before `make_call_with_id(id, ...)`. `make_call_with_id` throws `Cancelled`. |
-| Incoming | `on_incoming_call(offer)` from `handle_push_notification`, then `Connected` from `accept_incoming_call`. `reject_incoming_call` emits nothing. |
-| Caller cancels before answer | `Ended` for `incoming-<call_token>`, detected within about 2 s while the call is unanswered (watched for up to 10 minutes). |
-| Answered on another device | `Ended` for `incoming-<call_token>`, once the gateway reports the call active while this handset is not accepting it. |
-| Accept with an unknown outcome | `accept_incoming_call` throws `Timeout` or `NetworkError`, and `Ended` is reported for `incoming-<call_token>`. The gateway may have accepted the call anyway, so the core keeps watching it. If it shows up active, the core hangs it up. If it is still ringing, the core rejects it. It is never left connected with nobody on this end. If the gateway refused the accept (an HTTP error), nothing is reported, and the call stays offered. |
-| Mute / hold | `set_mute` re-emits the current state with `muted` updated; `set_hold` emits `OnHold` or `Connected`. |
-| Local hangup | `Ended` from `hangup`. |
-| Remote hangup (BYE) | `Ended`, emitted by the core within about 2 s of the gateway seeing the BYE. No app polling is needed. |
-| Blind transfer | `Ended` once the gateway reports the call transferred. A failed or timed-out transfer emits nothing; the call stays up. |
+| Flow | Events | `end_reason` on `Ended` |
+|------|--------|------|
+| Outgoing | `Ringing` (queued by `make_call_with_id` before media is set up or the gateway is contacted), then `Connected` when the far end answers. If the call fails after `Ringing`, `Ended` follows and the method throws. | `Failed` |
+| Outgoing, hung up before it is answered | `Ringing` then `Ended`, or only `Ended` if `hangup(id)` came before `make_call_with_id(id, ...)`. `make_call_with_id` throws `Cancelled`. | `Cancelled` |
+| Incoming | `on_incoming_call(offer)` from `handle_push_notification`, then `Connected` from `accept_incoming_call`. | |
+| Rejected | `Ended` for `incoming-<call_token>` once `reject_incoming_call` succeeds, for a call offered through `handle_push_notification`. Nothing is reported if the caller had already hung up and that was reported. | `Rejected` |
+| Caller cancels before answer | `Ended` for `incoming-<call_token>`, detected within about 2 s while the call is unanswered (watched for up to 10 minutes). | `CallerCancelled` |
+| Answered on another device | `Ended` for `incoming-<call_token>`, once the gateway reports the call active while this handset is not accepting it. | `AnsweredElsewhere` |
+| Accept with an unknown outcome | `accept_incoming_call` throws `Timeout` or `NetworkError`, and `Ended` is reported for `incoming-<call_token>`. The gateway may have accepted the call anyway, so the core keeps watching it. If it shows up active, the core hangs it up. If it is still ringing, the core rejects it. It is never left connected with nobody on this end. If the gateway refused the accept (an HTTP error), nothing is reported, and the call stays offered. | `Failed` |
+| Mute / hold | `set_mute` re-emits the current state with `muted` updated; `set_hold` emits `OnHold` or `Connected`. | |
+| Local hangup | `Ended` from `hangup`. | `LocalHangup` |
+| Remote hangup (BYE) | `Ended`, emitted by the core within about 2 s of the gateway seeing the BYE. No app polling is needed. | From the gateway's `/status` `reason` (see below); `RemoteHangup` by default |
+| Blind transfer | `Ended` once the gateway reports the call transferred. A failed or timed-out transfer emits nothing; the call stays up. | `Transferred` |
+
+**End reasons.** `CallInfo.end_reason` is set only on the `Ended` event, and is null on every other event. When a call ends at the gateway, the core maps the `reason` from `GET /v1/calls/{token}/status` as follows: `bye_from_remote` -> `RemoteHangup`, `transferred` -> `Transferred`, `cancelled` -> `CallerCancelled`, `rejected` -> `Rejected`, and `no_ack` (the PBX never acknowledged the answer) -> `Failed`. A missing or unrecognised reason, or a call that just disappeared (`unknown` three times in a row), falls back to `RemoteHangup` for an active call and `CallerCancelled` for an offered one. For CallKit: `RemoteHangup`, `Transferred` and `CallerCancelled` -> `.remoteEnded`; `AnsweredElsewhere` -> `.answeredElsewhere`; `Failed` -> `.failed`; `LocalHangup`, `Cancelled` and `Rejected` follow the app's own `hangup` or `reject_incoming_call`, so the app has already reported the end itself. The gateway does not send `rejected` today. The mapping is there so that a decline elsewhere would arrive as `Rejected`. Android's `DisconnectCause` values map the same way (`REMOTE`, `ANSWERED_ELSEWHERE`, `ERROR`, `LOCAL`, `REJECTED`, `CANCELED`).
 
 **Guarantees.** Each `call_id` that has been reported receives exactly one `Ended`, and nothing after it, whichever of the causes above wins a race. A call's events are delivered in the order its state changed, even when the changes come from different threads (for example concurrent `set_hold` and `set_mute`). Delivery is asynchronous: an engine method queues its events before it returns, but the callback may run before or after the method returns, so do not rely on either. Treat the events as the source of truth for call state and the method's return value as the outcome of that request.
 
-**Not carried by events.** `CallInfo` has no end reason; the app knows when it hung up or transferred, and any other `Ended` came from the far side. `duration_secs` is not maintained by the core, so time calls from the `Connected` event.
+**Not carried by events.** `duration_secs` is not maintained by the core, so time calls from the `Connected` event.
 
 **Other callbacks.** `on_registration_changed` reports `"registered"` after `register_device` or `update_push_token` succeeds and `"unregistered"` after `unregister_device`. `on_auth_required` is described below. `on_error` fires with context `"hangup"` when a call has ended locally but the gateway did not confirm hanging it up, even after one retry on the call's own gateway instance. A 404 is the usual cause: the gateway does not know the call, because it lost it or was asked with the wrong token. The message names the call_id, and the other party may still be connected. `on_media_stats` is not currently emitted; read `get_media_stats` when stats are needed.
 

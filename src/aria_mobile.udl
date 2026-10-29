@@ -70,6 +70,28 @@ enum CallDirection {
     "Outbound",
 };
 
+/// Why a call ended. Set only on the `Ended` event.
+enum EndReason {
+    /// This handset hung up.
+    "LocalHangup",
+    /// The far end hung up (BYE).
+    "RemoteHangup",
+    /// The caller hung up an incoming call before it was answered.
+    "CallerCancelled",
+    /// An incoming call was answered on another device.
+    "AnsweredElsewhere",
+    /// An incoming call was rejected with `reject_incoming_call`, or
+    /// declined according to the gateway.
+    "Rejected",
+    /// The call was blind-transferred away from this handset.
+    "Transferred",
+    /// The call could not be set up: an outgoing call failed, or an accept
+    /// had an unknown outcome.
+    "Failed",
+    /// An outgoing call was hung up before it was answered.
+    "Cancelled",
+};
+
 /// Information about an active call.
 dictionary CallInfo {
     string call_id;
@@ -80,6 +102,8 @@ dictionary CallInfo {
     boolean muted;
     boolean on_hold;
     u64 duration_secs;
+    /// Why the call ended; set only when `state` is `Ended`.
+    EndReason? end_reason;
 };
 
 /// Audio codec selection.
@@ -138,6 +162,7 @@ callback interface MobileEventHandler {
     /// Called when call state changes. Every call_id that has been reported
     /// gets exactly one final `Ended`, whoever ended the call (local hangup,
     /// remote hangup, transfer, caller cancel, or a failed outgoing call).
+    /// The `Ended` event carries `end_reason`.
     void on_call_state_changed(CallInfo info);
 
     /// Called when media statistics are updated.
@@ -210,7 +235,10 @@ interface AriaMobileEngine {
     [Throws=MobileError]
     CallInfo accept_incoming_call(string call_token, sequence<AudioCodec> preferred_codecs);
 
-    /// Reject an incoming call.
+    /// Reject an incoming call. Once the gateway accepts the reject, `Ended`
+    /// with `end_reason` `Rejected` is reported for `incoming-<call_token>`,
+    /// if the call was offered through `handle_push_notification` and had
+    /// not already ended.
     [Throws=MobileError]
     void reject_incoming_call(string call_token);
 

@@ -261,16 +261,21 @@ async fn cancel_at_gateway(
 }
 
 /// Report a call that has been taken out of the map as ended.
-fn emit_ended(events: &Dispatcher, call: &ActiveCallState) {
-    call.events.emit_ended(events, &call.info);
+fn emit_ended(events: &Dispatcher, call: &ActiveCallState, reason: EndReason) {
+    call.events.emit_ended(events, &call.info, reason);
 }
 
 /// Tear a call down locally and emit `Ended`, unless it was already gone.
 /// Returns whether this call did the teardown.
-fn end_call_locally(calls: &CallMap, events: &Dispatcher, call_id: &str) -> bool {
+fn end_call_locally(
+    calls: &CallMap,
+    events: &Dispatcher,
+    call_id: &str,
+    reason: EndReason,
+) -> bool {
     match take_call(calls, call_id) {
         Some(call) => {
-            emit_ended(events, &call);
+            emit_ended(events, &call, reason);
             true
         }
         None => false,
@@ -731,6 +736,7 @@ impl AriaMobileEngine {
             muted: false,
             on_hold: false,
             duration_secs: 0,
+            end_reason: None,
         };
 
         // From here an `active` status is this handset answering.
@@ -760,7 +766,7 @@ impl AriaMobileEngine {
                     media.stop();
                 }
                 self.watch_incoming(&offer, route, true);
-                events.emit_ended(&self.events, &info);
+                events.emit_ended(&self.events, &info, EndReason::Failed);
                 return Err(e);
             }
             Err(e) => {
@@ -862,7 +868,13 @@ impl AriaMobileEngine {
             self.gateway
                 .reject_call(&route, &token, &call_token)
                 .await?;
-            self.clear_pending_incoming(&call_token);
+            // The app learned the call's id from the offer, so it gets the
+            // call's one `Ended`, unless the caller had already hung up.
+            if let Some(entry) = self.take_pending_incoming(&call_token) {
+                entry
+                    .events
+                    .emit_ended(&self.events, &entry.info, EndReason::Rejected);
+            }
             Ok(())
         })
     }
@@ -952,6 +964,7 @@ impl AriaMobileEngine {
             muted: false,
             on_hold: false,
             duration_secs: 0,
+            end_reason: None,
         };
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         let (outcome_tx, outcome_rx) = tokio::sync::watch::channel(None);
@@ -1025,7 +1038,9 @@ impl AriaMobileEngine {
                 // hangup already has.
                 return match self.take_ringing(&call_id) {
                     Some(pending) => {
-                        pending.events.emit_ended(&self.events, &pending.info);
+                        pending
+                            .events
+                            .emit_ended(&self.events, &pending.info, EndReason::Failed);
                         Err(e)
                     }
                     None => Err(MobileError::Cancelled),
@@ -1108,7 +1123,9 @@ impl AriaMobileEngine {
                 // call with `Ended`, unless a hangup already has.
                 return match self.take_ringing(&call_id) {
                     Some(pending) => {
-                        pending.events.emit_ended(&self.events, &pending.info);
+                        pending
+                            .events
+                            .emit_ended(&self.events, &pending.info, EndReason::Failed);
                         Err(e)
                     }
                     None => Err(MobileError::Cancelled),
@@ -1262,13 +1279,15 @@ impl AriaMobileEngine {
                         muted: false,
                         on_hold: false,
                         duration_secs: 0,
+                        end_reason: None,
                     },
+                    EndReason::Cancelled,
                 );
                 return Ok(());
             }
             TakenCall::Missing => return Err(MobileError::InvalidState),
         };
-        emit_ended(&self.events, &call);
+        emit_ended(&self.events, &call, EndReason::LocalHangup);
 
         let Some(call_token) = call.call_token.clone() else {
             return Ok(());
@@ -1297,7 +1316,9 @@ impl AriaMobileEngine {
     /// or a gateway without the route), `make_call`'s background task hangs
     /// the call up once its token arrives.
     fn cancel_ringing(&self, pending: PendingOutgoing) -> Result<(), MobileError> {
-        pending.events.emit_ended(&self.events, &pending.info);
+        pending
+            .events
+            .emit_ended(&self.events, &pending.info, EndReason::Cancelled);
         let _ = pending.cancel.send(());
         if !pending.dialing {
             return Ok(());
@@ -1452,8 +1473,10 @@ impl AriaMobileEngine {
                     // The call is over at the gateway. Whoever removes it
                     // from the map (this, the status poll, or a hangup)
                     // reports `Ended`, once.
-                    end_call_locally(&self.calls, &self.events, call_id);
-                    if status.reason.as_deref() == Some("transferred") {
+                    let reason =
+                        EndReason::from_gateway(status.reason.as_deref(), EndReason::RemoteHangup);
+                    end_call_locally(&self.calls, &self.events, call_id, reason);
+                    if reason == EndReason::Transferred {
                         log::info!("Call {call_id} transferred");
                         return Ok(());
                     }
@@ -1469,7 +1492,12 @@ impl AriaMobileEngine {
                             // A gateway that does not report outcomes: the
                             // 202 is all there is.
                             log::info!("Gateway reports no transfer outcome; ending {call_id}");
-                            end_call_locally(&self.calls, &self.events, call_id);
+                            end_call_locally(
+                                &self.calls,
+                                &self.events,
+                                call_id,
+                                EndReason::Transferred,
+                            );
                             return Ok(());
                         }
                         Some("failed") => {
@@ -1646,7 +1674,8 @@ impl AriaMobileEngine {
                 call_id,
                 status.reason,
             );
-            if end_call_locally(&calls, &handler, &call_id) {
+            let reason = EndReason::from_gateway(status.reason.as_deref(), EndReason::RemoteHangup);
+            if end_call_locally(&calls, &handler, &call_id, reason) {
                 let mut ended = remote_ended
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1709,6 +1738,7 @@ impl AriaMobileEngine {
                         muted: false,
                         on_hold: false,
                         duration_secs: 0,
+                        end_reason: None,
                     },
                     events: Arc::clone(&events),
                     accepting: false,
@@ -1750,7 +1780,9 @@ impl AriaMobileEngine {
                     return PollAction::HangUp;
                 }
                 log::info!("Incoming call {} answered elsewhere", token);
-                entry.events.emit(&handler, entry.info.clone());
+                entry
+                    .events
+                    .emit_ended(&handler, &entry.info, EndReason::AnsweredElsewhere);
                 return PollAction::Stop;
             }
             if gone.is_gone(&status.status) {
@@ -1761,7 +1793,11 @@ impl AriaMobileEngine {
                         token,
                         status.reason,
                     );
-                    entry.events.emit(&handler, entry.info.clone());
+                    let reason = EndReason::from_gateway(
+                        status.reason.as_deref(),
+                        EndReason::CallerCancelled,
+                    );
+                    entry.events.emit_ended(&handler, &entry.info, reason);
                 }
                 return PollAction::Stop;
             }
@@ -1776,14 +1812,20 @@ impl AriaMobileEngine {
 
     /// Stop watching an offered incoming call; it has been accepted or rejected.
     fn clear_pending_incoming(&self, call_token: &str) {
+        self.take_pending_incoming(call_token);
+    }
+
+    /// Stop watching an offered incoming call and return its entry.
+    fn take_pending_incoming(&self, call_token: &str) -> Option<PendingIncoming> {
         let removed = self
             .pending_incoming
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(call_token);
-        if let Some(pending) = removed {
+        if let Some(pending) = &removed {
             pending.stop.store(true, Ordering::Relaxed);
         }
+        removed
     }
 
     // ── On-device AI ────────────────────────────────────────────────
@@ -1953,7 +1995,7 @@ impl AriaMobileEngine {
         // The poll thread has normally torn the call down and emitted `Ended`
         // already; this only acts if it somehow has not.
         if let Some(call_id) = &ended_id {
-            end_call_locally(&self.calls, &self.events, call_id);
+            end_call_locally(&self.calls, &self.events, call_id, EndReason::RemoteHangup);
         }
 
         ended_id
@@ -2290,6 +2332,7 @@ mod tests {
                     muted: false,
                     on_hold: false,
                     duration_secs: 0,
+                    end_reason: None,
                 },
                 media: None,
                 call_token: Some(call_token.to_string()),
@@ -2382,6 +2425,7 @@ mod tests {
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].call_id, "c1");
         assert_eq!(states[0].state, CallState::Ended);
+        assert_eq!(states[0].end_reason, Some(EndReason::Transferred));
     }
 
     /// A gateway that accepts a REFER with 202 and then answers status polls
@@ -2452,6 +2496,7 @@ mod tests {
         let states = recorder.states();
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].state, CallState::Ended);
+        assert_eq!(states[0].end_reason, Some(EndReason::Transferred));
     }
 
     #[test]
@@ -2479,6 +2524,7 @@ mod tests {
         let states = recorder.states();
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].state, CallState::Ended);
+        assert_eq!(states[0].end_reason, Some(EndReason::RemoteHangup));
     }
 
     #[test]
@@ -2533,6 +2579,7 @@ mod tests {
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].call_id, "c1");
         assert_eq!(states[0].state, CallState::Ended);
+        assert_eq!(states[0].end_reason, Some(EndReason::RemoteHangup));
         assert!(engine.get_active_call().is_none());
 
         // Apps that still poll keep working, and see no second event.
@@ -2615,6 +2662,7 @@ mod tests {
         let states = recorder.states();
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].state, CallState::Ended);
+        assert_eq!(states[0].end_reason, Some(EndReason::LocalHangup));
     }
 
     /// hangup does not wait on the gateway: Ended is reported at once even
@@ -2737,6 +2785,7 @@ mod tests {
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].call_id, "incoming-tok-9");
         assert_eq!(states[0].state, CallState::Ended);
+        assert_eq!(states[0].end_reason, Some(EndReason::CallerCancelled));
         assert_eq!(states[0].direction, CallDirection::Inbound);
         assert_eq!(states[0].remote_name.as_deref(), Some("Alice"));
         assert!(engine.pending_incoming.lock().unwrap().is_empty());
@@ -2798,6 +2847,7 @@ mod tests {
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].call_id, "incoming-tok-o");
         assert_eq!(states[0].state, CallState::Ended);
+        assert_eq!(states[0].end_reason, Some(EndReason::AnsweredElsewhere));
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(recorder.states().len(), 1);
         assert!(gw.requests().iter().all(|r| r.path.ends_with("/status")));
@@ -2857,6 +2907,7 @@ mod tests {
         assert_eq!(states.len(), 1, "{states:?}");
         assert_eq!(states[0].call_id, "incoming-tok-a");
         assert_eq!(states[0].state, CallState::Ended);
+        assert_eq!(states[0].end_reason, Some(EndReason::Failed));
         assert!(engine.get_active_call().is_none());
         assert_eq!(count(&gw, "/v1/calls/tok-a/reject"), 0);
     }
@@ -2927,6 +2978,96 @@ mod tests {
 
         let states: Vec<_> = recorder.states().iter().map(|i| i.state).collect();
         assert_eq!(states, [CallState::Connected, CallState::Ended]);
+    }
+
+    #[test]
+    fn rejecting_an_offered_call_reports_ended_rejected() {
+        let gw = MockGateway::start(|req| match req.path.as_str() {
+            "/v1/calls/tok-r/reject" => (200, "{}".into()),
+            _ => (200, r#"{"status":"pending"}"#.into()),
+        });
+        let (engine, recorder) = engine(&gw.base_url);
+        engine.start_pending_incoming_poll(&offer("tok-r"), engine.gateway.primary_route());
+
+        engine.reject_incoming_call("tok-r".into()).unwrap();
+
+        let states = recorder.states();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].call_id, "incoming-tok-r");
+        assert_eq!(states[0].state, CallState::Ended);
+        assert_eq!(states[0].end_reason, Some(EndReason::Rejected));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(recorder.states().len(), 1);
+    }
+
+    /// A remote hangup takes its reason from the gateway's `/status`.
+    #[test]
+    fn a_remote_end_takes_its_reason_from_the_gateway() {
+        for (reason, expected) in [
+            ("bye_from_remote", EndReason::RemoteHangup),
+            ("transferred", EndReason::Transferred),
+            ("no_ack", EndReason::Failed),
+        ] {
+            let gw = MockGateway::start(move |_| {
+                (200, format!(r#"{{"status":"ended","reason":"{reason}"}}"#))
+            });
+            let (engine, recorder) = engine(&gw.base_url);
+            let stop = insert_call(&engine, "c1", "tok");
+            engine.start_call_status_poll(
+                "c1".into(),
+                "tok".into(),
+                engine.gateway.primary_route(),
+                stop,
+            );
+            let states = recorder.wait_for(1);
+            assert_eq!(states[0].end_reason, Some(expected), "{reason}");
+        }
+    }
+
+    #[test]
+    fn gateway_reasons_map_to_end_reasons() {
+        use EndReason::*;
+        for (reason, fallback, expected) in [
+            (Some("transferred"), RemoteHangup, Transferred),
+            (Some("bye_from_remote"), CallerCancelled, RemoteHangup),
+            (Some("bye"), CallerCancelled, RemoteHangup),
+            (Some("cancelled"), RemoteHangup, CallerCancelled),
+            (Some("rejected"), RemoteHangup, Rejected),
+            (
+                Some("answered_elsewhere"),
+                CallerCancelled,
+                AnsweredElsewhere,
+            ),
+            (Some("no_ack"), RemoteHangup, Failed),
+            (Some("something_new"), RemoteHangup, RemoteHangup),
+            (None, CallerCancelled, CallerCancelled),
+        ] {
+            assert_eq!(
+                EndReason::from_gateway(reason, fallback),
+                expected,
+                "{reason:?}"
+            );
+        }
+    }
+
+    /// Only Ended carries a reason, even if one is set on a non-final event.
+    #[test]
+    fn only_ended_events_carry_a_reason() {
+        let (engine, recorder) = engine(NO_GATEWAY);
+        insert_call(&engine, "c1", "tok");
+        engine
+            .calls
+            .lock()
+            .unwrap()
+            .get_mut("c1")
+            .unwrap()
+            .info
+            .end_reason = Some(EndReason::Failed);
+        engine.set_hold("c1".into(), true).unwrap();
+        engine.hangup("c1".into()).unwrap_or(());
+        let states = recorder.states();
+        assert_eq!(states[0].end_reason, None);
+        assert_eq!(states[1].end_reason, Some(EndReason::LocalHangup));
     }
 
     #[test]
@@ -3179,6 +3320,7 @@ mod tests {
             muted: false,
             on_hold: false,
             duration_secs: 0,
+            end_reason: None,
         };
         assert!(events.emit(&engine.events, info(CallState::Ringing)));
         assert!(events.emit(&engine.events, info(CallState::Ended)));
@@ -3403,6 +3545,7 @@ mod tests {
         assert!(matches!(result, Err(MobileError::Cancelled)), "{result:?}");
         let states: Vec<_> = recorder.states().iter().map(|i| i.state).collect();
         assert_eq!(states, [CallState::Ringing, CallState::Ended]);
+        assert_eq!(recorder.states()[1].end_reason, Some(EndReason::Cancelled));
 
         // The call was placed and cancelled by the uuid part of its call_id.
         let client_ref = call_id.strip_prefix("outgoing-").unwrap();
@@ -3650,6 +3793,9 @@ mod tests {
                 [CallState::Ringing, CallState::Ended],
                 "HTTP {status}"
             );
+            let states = recorder.states();
+            assert_eq!(states[0].end_reason, None, "Ringing has no reason");
+            assert_eq!(states[1].end_reason, Some(EndReason::Failed));
             assert!(engine.pending_outgoing.lock().unwrap().ringing.is_empty());
         }
     }
@@ -4064,6 +4210,7 @@ mod tests {
             (states[0].call_id.as_str(), states[0].state),
             (id.as_str(), CallState::Ended)
         );
+        assert_eq!(states[0].end_reason, Some(EndReason::Cancelled));
 
         assert!(matches!(
             dial_with_id(&engine, id.clone()),
@@ -4276,7 +4423,7 @@ mod tests {
         }));
         insert_call(&engine, "c1", "tok");
 
-        end_call_locally(&engine.calls, &engine.events, "c1");
+        end_call_locally(&engine.calls, &engine.events, "c1", EndReason::LocalHangup);
         engine.events.flush();
 
         assert!(fired.load(Ordering::Relaxed));
