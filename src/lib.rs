@@ -8,17 +8,19 @@
 
 mod auth;
 pub mod dns;
+mod events;
 mod gateway_client;
 mod media;
 mod types;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 pub mod ai;
 
+use events::{CallEvents, Dispatcher};
 pub use media::PlatformAudioBridge;
 use types::*;
 
@@ -80,10 +82,6 @@ pub trait MobileEventHandler: Send + Sync + 'static {
     fn on_auth_required(&self);
 }
 
-/// The installed event handler, shared with the background status-poll
-/// threads so they can report a remote hangup themselves.
-type HandlerSlot = Arc<RwLock<Option<Arc<dyn MobileEventHandler>>>>;
-
 /// Active calls keyed by call_id, shared with the status-poll threads.
 type CallMap = Arc<Mutex<HashMap<String, ActiveCallState>>>;
 
@@ -98,34 +96,12 @@ const PENDING_INCOMING_MAX_WATCH: Duration = Duration::from_secs(10 * 60);
 /// How often a call's status is polled at the gateway.
 const CALL_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Invoke the platform handler, if one is installed.
-///
-/// The handler is cloned out of the lock before it is called, so a callback
-/// that re-enters the engine (including `set_event_handler`) cannot deadlock,
-/// and a poisoned lock is recovered rather than panicking across the FFI
-/// boundary. The callback runs inside `catch_unwind` so a panicking host
-/// callback cannot unwind across FFI.
-fn with_handler(slot: &HandlerSlot, f: impl FnOnce(&dyn MobileEventHandler)) {
-    let handler = slot
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    if let Some(handler) = handler {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(handler.as_ref())));
-    }
-}
-
-fn emit_call_state_to(slot: &HandlerSlot, info: &CallInfo) {
-    let info = info.clone();
-    with_handler(slot, |h| h.on_call_state_changed(info));
-}
-
 /// Tell the app that background work had the gateway token of `generation`
 /// rejected, unless it has already been told about this token.
-fn report_auth_rejected(auth: &auth::GatewayAuth, slot: &HandlerSlot, generation: u64) {
+fn report_auth_rejected(auth: &auth::GatewayAuth, events: &Dispatcher, generation: u64) {
     if auth.report_rejection(generation) {
         log::warn!("Gateway rejected the token; asking the app for a new one");
-        with_handler(slot, |h| h.on_auth_required());
+        events.auth_required();
     }
 }
 
@@ -157,101 +133,28 @@ fn stop_call(call: &mut ActiveCallState) {
 async fn hang_up_abandoned(
     gateway: &gateway_client::GatewayClient,
     auth: &auth::GatewayAuth,
-    slot: &HandlerSlot,
+    events: &Dispatcher,
     call_token: &str,
 ) {
     let (token, generation) = auth.current().unwrap_or_default();
     match gateway.hangup_call(&token, call_token).await {
         Ok(()) => log::info!("Hung up an outgoing call cancelled while ringing"),
-        Err(MobileError::AuthenticationError) => report_auth_rejected(auth, slot, generation),
+        Err(MobileError::AuthenticationError) => report_auth_rejected(auth, events, generation),
         Err(e) => log::warn!("Could not hang up a cancelled outgoing call: {}", e),
     }
 }
 
-/// Delivers one call's `on_call_state_changed` events in order, and nothing
-/// after its `Ended`.
-///
-/// Events for a call can be raised on different threads at once, such as
-/// `make_call` reporting `Connected` while `hangup` reports `Ended`. Deciding
-/// who owns a transition under the call-map lock is not enough on its own:
-/// the callbacks run outside the lock, so the two could still reach the app in
-/// either order. Each event is queued here under a per-call lock, and one
-/// thread at a time delivers the queue, so the app sees events in the order
-/// they were raised. An event raised after `Ended` is dropped.
-///
-/// No lock is held while a callback runs, so a callback can call back into the
-/// engine. An event it raises for the same call is delivered as soon as the
-/// callback returns, as is one raised on another thread while a callback for
-/// that call is running.
-#[derive(Default)]
-struct CallEvents {
-    inner: Mutex<CallEventsInner>,
-}
-
-#[derive(Default)]
-struct CallEventsInner {
-    ended: bool,
-    delivering: bool,
-    queue: VecDeque<CallInfo>,
-}
-
-impl CallEvents {
-    fn lock(&self) -> std::sync::MutexGuard<'_, CallEventsInner> {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Queue `info` for delivery. Returns false, delivering nothing, when the
-    /// call has already been reported `Ended`.
-    fn emit(&self, slot: &HandlerSlot, info: CallInfo) -> bool {
-        {
-            let mut inner = self.lock();
-            if inner.ended {
-                return false;
-            }
-            inner.ended = info.state == CallState::Ended;
-            inner.queue.push_back(info);
-            if inner.delivering {
-                return true;
-            }
-            inner.delivering = true;
-        }
-        loop {
-            let next = {
-                let mut inner = self.lock();
-                match inner.queue.pop_front() {
-                    Some(next) => next,
-                    None => {
-                        inner.delivering = false;
-                        break;
-                    }
-                }
-            };
-            emit_call_state_to(slot, &next);
-        }
-        true
-    }
-
-    /// Report `info` as `Ended`.
-    fn emit_ended(&self, slot: &HandlerSlot, info: &CallInfo) -> bool {
-        let mut info = info.clone();
-        info.state = CallState::Ended;
-        self.emit(slot, info)
-    }
-}
-
 /// Report a call that has been taken out of the map as ended.
-fn emit_ended(slot: &HandlerSlot, call: &ActiveCallState) {
-    call.events.emit_ended(slot, &call.info);
+fn emit_ended(events: &Dispatcher, call: &ActiveCallState) {
+    call.events.emit_ended(events, &call.info);
 }
 
 /// Tear a call down locally and emit `Ended`, unless it was already gone.
 /// Returns whether this call did the teardown.
-fn end_call_locally(calls: &CallMap, slot: &HandlerSlot, call_id: &str) -> bool {
+fn end_call_locally(calls: &CallMap, events: &Dispatcher, call_id: &str) -> bool {
     match take_call(calls, call_id) {
         Some(call) => {
-            emit_ended(slot, &call);
+            emit_ended(events, &call);
             true
         }
         None => false,
@@ -282,7 +185,8 @@ fn validate_transfer_target(target: &str) -> Result<(), MobileError> {
 
 pub struct AriaMobileEngine {
     gateway: Arc<gateway_client::GatewayClient>,
-    event_handler: HandlerSlot,
+    /// Delivers every callback on its own thread.
+    events: Arc<Dispatcher>,
     /// Platform audio bridge for mic/speaker I/O
     audio_bridge: RwLock<Option<Arc<dyn media::PlatformAudioBridge>>>,
     /// Active calls keyed by call_id
@@ -364,7 +268,7 @@ impl AriaMobileEngine {
     pub fn new(gateway_config: GatewayConfig) -> Self {
         Self {
             gateway: Arc::new(gateway_client::GatewayClient::new(gateway_config.base_url)),
-            event_handler: Arc::new(RwLock::new(None)),
+            events: Arc::new(Dispatcher::new()),
             audio_bridge: RwLock::new(None),
             calls: Arc::new(Mutex::new(HashMap::new())),
             pending_incoming: Arc::new(Mutex::new(HashMap::new())),
@@ -380,11 +284,7 @@ impl AriaMobileEngine {
     }
 
     pub fn set_event_handler(&self, handler: Box<dyn MobileEventHandler>) {
-        let mut eh = self
-            .event_handler
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *eh = Some(Arc::from(handler));
+        self.events.set_handler(Some(Arc::from(handler)));
     }
 
     pub fn set_audio_bridge(&self, bridge: Box<dyn media::PlatformAudioBridge>) {
@@ -395,7 +295,7 @@ impl AriaMobileEngine {
     #[allow(dead_code)]
     fn emit_error(&self, context: &str, message: &str) {
         let (context, message) = (context.to_string(), message.to_string());
-        with_handler(&self.event_handler, |h| h.on_error(context, message));
+        self.events.error(context, message);
     }
 
     /// Replace the bearer token used for every gateway request.
@@ -441,9 +341,8 @@ impl AriaMobileEngine {
             }
 
             let device_id = resp.device_id.clone();
-            with_handler(&self.event_handler, |h| {
-                h.on_registration_changed(device_id, "registered".to_string(), None);
-            });
+            self.events
+                .registration_changed(device_id, "registered".to_string(), None);
 
             Ok(resp)
         })
@@ -460,9 +359,8 @@ impl AriaMobileEngine {
                 *d = None;
             }
 
-            with_handler(&self.event_handler, |h| {
-                h.on_registration_changed(device_id, "unregistered".to_string(), None);
-            });
+            self.events
+                .registration_changed(device_id, "unregistered".to_string(), None);
 
             Ok(())
         })
@@ -509,7 +407,7 @@ impl AriaMobileEngine {
             self.start_pending_incoming_poll(&offer);
 
             let for_handler = offer.clone();
-            with_handler(&self.event_handler, |h| h.on_incoming_call(for_handler));
+            self.events.incoming_call(for_handler);
 
             Ok(offer)
         })
@@ -591,12 +489,13 @@ impl AriaMobileEngine {
                         events: Arc::clone(&events),
                     },
                 );
+                // Queued while the call-map lock is held, so nothing done to
+                // the call afterwards can be delivered ahead of it.
+                events.emit(&self.events, info.clone());
             }
 
-            // Start polling for remote hangup
-            // Report Connected before the poll starts, so a remote hangup
-            // can never be reported ahead of it.
-            events.emit(&self.event_handler, info.clone());
+            // Start polling for remote hangup only after Connected is queued,
+            // so a remote hangup can never be reported ahead of it.
             self.start_call_status_poll(call_id.clone(), call_token, poll_stop);
             Ok(info)
         })
@@ -686,7 +585,7 @@ impl AriaMobileEngine {
                     cancel_outcome: outcome_tx,
                 },
             );
-        events.emit(&self.event_handler, info.clone());
+        events.emit(&self.events, info.clone());
 
         // Mark the call as sent, unless it was hung up from inside the
         // `Ringing` callback: then nothing has been sent and there is nothing
@@ -759,9 +658,7 @@ impl AriaMobileEngine {
                     .remove(&call_id);
                 return match pending {
                     Some(pending) => {
-                        pending
-                            .events
-                            .emit_ended(&self.event_handler, &pending.info);
+                        pending.events.emit_ended(&self.events, &pending.info);
                         Err(e)
                     }
                     None => Err(MobileError::Cancelled),
@@ -818,6 +715,9 @@ impl AriaMobileEngine {
                         events: Arc::clone(&events),
                     },
                 );
+                // Queued under the lock: a hold or hangup that finds the call
+                // now is queued after this.
+                events.emit(&self.events, info.clone());
                 None
             } else {
                 Some(media)
@@ -834,12 +734,8 @@ impl AriaMobileEngine {
             return Err(MobileError::Cancelled);
         }
 
-        // Report Connected before the poll starts, so a remote hangup
-        // can never be reported ahead of it. If a hangup on another thread
-        // has already ended the call, it has also torn it down.
-        if !events.emit(&self.event_handler, info.clone()) {
-            return Err(MobileError::Cancelled);
-        }
+        // The poll starts after Connected is queued, so a remote hangup can
+        // never be reported ahead of it.
         self.start_call_status_poll(call_id.clone(), call_token, poll_stop);
         log::info!("Outgoing call to {} connected via gateway", uri);
 
@@ -860,7 +756,7 @@ impl AriaMobileEngine {
     ) {
         let gateway = Arc::clone(&self.gateway);
         let auth = Arc::clone(&self.auth);
-        let handler = Arc::clone(&self.event_handler);
+        let handler = Arc::clone(&self.events);
         tokio::spawn(async move {
             // A 409 (cancelled) or any other failure leaves nothing to hang up.
             let Some(call_token) = answered.await else {
@@ -908,7 +804,7 @@ impl AriaMobileEngine {
                 }
             }
 
-            emit_ended(&self.event_handler, &call);
+            emit_ended(&self.events, &call);
 
             result
         })
@@ -922,9 +818,7 @@ impl AriaMobileEngine {
     /// a gateway without the route), `make_call`'s background task hangs the
     /// call up once its token arrives.
     fn cancel_ringing(&self, pending: PendingOutgoing) -> Result<(), MobileError> {
-        pending
-            .events
-            .emit_ended(&self.event_handler, &pending.info);
+        pending.events.emit_ended(&self.events, &pending.info);
         let _ = pending.cancel.send(());
         if !pending.dialing {
             return Ok(());
@@ -1008,7 +902,7 @@ impl AriaMobileEngine {
             // The PBX may already have sent the BYE that ends our leg, in which
             // case the status poll has torn the call down and reported it.
             // Either way `Ended` is emitted once.
-            end_call_locally(&self.calls, &self.event_handler, &call_id);
+            end_call_locally(&self.calls, &self.events, &call_id);
             Ok(())
         })
     }
@@ -1022,9 +916,9 @@ impl AriaMobileEngine {
         }
 
         call.info.muted = muted;
-        let (info, events) = (call.info.clone(), Arc::clone(&call.events));
-        drop(calls);
-        events.emit(&self.event_handler, info);
+        // Queued under the call-map lock, so concurrent changes are
+        // delivered in the order they were applied.
+        call.events.emit(&self.events, call.info.clone());
         Ok(())
     }
 
@@ -1042,9 +936,7 @@ impl AriaMobileEngine {
         } else {
             CallState::Connected
         };
-        let (info, events) = (call.info.clone(), Arc::clone(&call.events));
-        drop(calls);
-        events.emit(&self.event_handler, info);
+        call.events.emit(&self.events, call.info.clone());
         Ok(())
     }
 
@@ -1078,7 +970,7 @@ impl AriaMobileEngine {
         let started = Instant::now();
         let base_url = self.gateway.base_url().to_string();
         let auth = Arc::clone(&self.auth);
-        let handler = Arc::clone(&self.event_handler);
+        let handler = Arc::clone(&self.events);
         let interval = self.poll_interval;
 
         std::thread::spawn(move || {
@@ -1140,7 +1032,7 @@ impl AriaMobileEngine {
     /// `on_call_state_changed` without polling `check_remote_hangup`.
     fn start_call_status_poll(&self, call_id: String, call_token: String, stop: Arc<AtomicBool>) {
         let calls = Arc::clone(&self.calls);
-        let handler = Arc::clone(&self.event_handler);
+        let handler = Arc::clone(&self.events);
         let remote_ended = Arc::clone(&self.remote_ended);
 
         self.spawn_status_poll(call_token, stop, None, move |status| {
@@ -1198,12 +1090,13 @@ impl AriaMobileEngine {
             duration_secs: 0,
         };
         let pending = Arc::clone(&self.pending_incoming);
-        let handler = Arc::clone(&self.event_handler);
+        let handler = Arc::clone(&self.events);
         let token = call_token.clone();
         // While the gateway hands a call from pending to active it can briefly
         // report "unknown", so only several in a row count as gone. "ended" is
         // definitive: the gateway records a CANCEL that way.
         let mut unknown_streak = 0u32;
+        let offer_events = CallEvents::default();
 
         let deadline = Some(PENDING_INCOMING_MAX_WATCH);
         self.spawn_status_poll(call_token, stop, deadline, move |status| {
@@ -1242,7 +1135,7 @@ impl AriaMobileEngine {
                     token,
                     status.reason,
                 );
-                emit_call_state_to(&handler, &info);
+                offer_events.emit(&handler, info.clone());
             }
             true
         });
@@ -1427,7 +1320,7 @@ impl AriaMobileEngine {
         // The poll thread has normally torn the call down and emitted `Ended`
         // already; this only acts if it somehow has not.
         if let Some(call_id) = &ended_id {
-            end_call_locally(&self.calls, &self.event_handler, call_id);
+            end_call_locally(&self.calls, &self.events, call_id);
         }
 
         ended_id
@@ -1493,7 +1386,7 @@ impl AriaMobileEngine {
             // polls: this runs in the background and must not block the caller.
             let base_url = self.gateway.base_url().to_string();
             let auth = Arc::clone(&self.auth);
-            let handler = Arc::clone(&self.event_handler);
+            let handler = Arc::clone(&self.events);
             std::thread::spawn(move || {
                 if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -1636,14 +1529,31 @@ mod tests {
     struct Recorder {
         states: Arc<Mutex<Vec<CallInfo>>>,
         auth_required: Arc<Mutex<u32>>,
+        /// Flushed before reading, since events are delivered on the
+        /// dispatch thread. Weak, so the engine's handler slot holding this
+        /// recorder does not keep the dispatcher alive.
+        dispatcher: Arc<Mutex<std::sync::Weak<Dispatcher>>>,
     }
 
     impl Recorder {
+        fn attach(&self, engine: &AriaMobileEngine) {
+            *self.dispatcher.lock().unwrap() = Arc::downgrade(&engine.events);
+        }
+
+        fn flush(&self) {
+            let dispatcher = self.dispatcher.lock().unwrap().upgrade();
+            if let Some(d) = dispatcher {
+                d.flush();
+            }
+        }
+
         fn states(&self) -> Vec<CallInfo> {
+            self.flush();
             self.states.lock().unwrap().clone()
         }
 
         fn auth_required(&self) -> u32 {
+            self.flush();
             *self.auth_required.lock().unwrap()
         }
 
@@ -1682,6 +1592,7 @@ mod tests {
         });
         engine.poll_interval = Duration::from_millis(20);
         let recorder = Recorder::default();
+        recorder.attach(&engine);
         engine.set_event_handler(Box::new(recorder.clone()));
         (engine, recorder)
     }
@@ -2170,16 +2081,17 @@ mod tests {
             on_hold: false,
             duration_secs: 0,
         };
-        assert!(events.emit(&engine.event_handler, info(CallState::Ringing)));
-        assert!(events.emit(&engine.event_handler, info(CallState::Ended)));
-        assert!(!events.emit(&engine.event_handler, info(CallState::Connected)));
-        assert!(!events.emit(&engine.event_handler, info(CallState::Ended)));
+        assert!(events.emit(&engine.events, info(CallState::Ringing)));
+        assert!(events.emit(&engine.events, info(CallState::Ended)));
+        assert!(!events.emit(&engine.events, info(CallState::Connected)));
+        assert!(!events.emit(&engine.events, info(CallState::Ended)));
         let states: Vec<_> = recorder.states().iter().map(|i| i.state).collect();
         assert_eq!(states, [CallState::Ringing, CallState::Ended]);
     }
 
     /// An event raised from inside a callback for the same call is delivered
-    /// after that callback returns, not nested inside it.
+    /// after that callback returns, not nested inside it, and the engine
+    /// method the callback calls works (it is not inside the runtime).
     #[test]
     fn call_events_raised_from_a_callback_keep_their_order() {
         struct HangUpOnConnected {
@@ -2194,7 +2106,7 @@ mod tests {
                 let nested = self.in_callback.swap(true, Ordering::SeqCst);
                 self.order.lock().unwrap().push((info.state, nested));
                 if info.state == CallState::Connected {
-                    let _ = self.engine.hangup(info.call_id);
+                    self.engine.hangup(info.call_id).unwrap();
                 }
                 self.in_callback.store(nested, Ordering::SeqCst);
             }
@@ -2214,12 +2126,15 @@ mod tests {
         }));
         insert_call(&engine, "c1", "tok");
         engine.set_hold("c1".into(), false).unwrap();
+        // Once for Connected, once more for the Ended its callback queued.
+        engine.events.flush();
+        engine.events.flush();
 
         assert_eq!(
             *order.lock().unwrap(),
             [(CallState::Connected, false), (CallState::Ended, false)]
         );
-        engine.event_handler.write().unwrap().take();
+        engine.events.set_handler(None);
     }
 
     /// Held responses for `POST /v1/calls`: the far end "answers" when the
@@ -2467,7 +2382,7 @@ mod tests {
     }
 
     #[test]
-    fn hangup_from_the_ringing_callback_never_dials() {
+    fn hangup_from_the_ringing_callback_ends_the_call_once() {
         struct HangUpOnRinging {
             engine: Mutex<Option<Arc<AriaMobileEngine>>>,
             recorder: Recorder,
@@ -2491,18 +2406,32 @@ mod tests {
         let (engine, _) = engine(&gw.base_url);
         let engine = Arc::new(engine);
         let recorder = Recorder::default();
+        recorder.attach(&engine);
         engine.set_event_handler(Box::new(HangUpOnRinging {
             engine: Mutex::new(Some(Arc::clone(&engine))),
             recorder: recorder.clone(),
         }));
 
-        assert!(matches!(dial(&engine), Err(MobileError::Cancelled)));
-
-        let states: Vec<_> = recorder.states().iter().map(|i| i.state).collect();
-        assert_eq!(states, [CallState::Ringing, CallState::Ended]);
+        // `Ringing` is delivered on the dispatch thread, so the hangup races
+        // the dial; either way the call ends exactly once.
+        let result = dial(&engine);
+        assert!(
+            matches!(result, Ok(_) | Err(MobileError::Cancelled)),
+            "{result:?}"
+        );
+        assert!(eventually(|| recorder
+            .states()
+            .last()
+            .is_some_and(|i| i.state == CallState::Ended)));
         std::thread::sleep(Duration::from_millis(100));
-        assert!(gw.requests().is_empty(), "nothing should reach the gateway");
-        engine.event_handler.write().unwrap().take();
+        let states: Vec<_> = recorder.states().iter().map(|i| i.state).collect();
+        assert_eq!(states.first(), Some(&CallState::Ringing));
+        assert_eq!(
+            states.iter().filter(|s| **s == CallState::Ended).count(),
+            1,
+            "{states:?}"
+        );
+        engine.events.set_handler(None);
     }
 
     #[test]
@@ -2628,6 +2557,182 @@ mod tests {
         }
     }
 
+    /// Every callback type, including those raised inside `block_on` and on
+    /// the status-poll tasks, can call the blocking engine methods. They used
+    /// to run inline inside the runtime, where `block_on` panics.
+    #[test]
+    fn engine_methods_work_from_every_callback() {
+        #[derive(Default)]
+        struct Reenter {
+            engine: Mutex<Option<Arc<AriaMobileEngine>>>,
+            /// Callback kind -> what each engine method returned.
+            ran: Mutex<HashMap<&'static str, Vec<String>>>,
+        }
+        impl Reenter {
+            fn battery(&self, kind: &'static str) {
+                let Some(engine) = self.engine.lock().unwrap().clone() else {
+                    return;
+                };
+                if self.ran.lock().unwrap().contains_key(kind) {
+                    return;
+                }
+                let run = |f: &dyn Fn() -> String| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+                        .unwrap_or_else(|_| "PANIC".to_string())
+                };
+                let results = vec![
+                    run(&|| format!("{:?}", engine.hangup("c-none".into()).err())),
+                    run(&|| {
+                        format!(
+                            "{:?}",
+                            engine.accept_incoming_call("t".into(), vec![]).err()
+                        )
+                    }),
+                    run(&|| format!("{:?}", engine.reject_incoming_call("t".into()).err())),
+                    run(&|| {
+                        format!(
+                            "{:?}",
+                            engine.transfer_call("c-none".into(), "1002".into()).err()
+                        )
+                    }),
+                    run(&|| {
+                        // Without a token make_call stops before opening media.
+                        engine.set_gateway_token(String::new());
+                        let r = engine.make_call("1002".into(), registration().sip, vec![]);
+                        engine.set_gateway_token("jwt".into());
+                        format!("{:?}", r.err())
+                    }),
+                ];
+                self.ran.lock().unwrap().insert(kind, results);
+            }
+        }
+        struct Handler(Arc<Reenter>);
+        impl MobileEventHandler for Handler {
+            fn on_registration_changed(&self, _: String, _: String, _: Option<String>) {
+                self.0.battery("registration");
+            }
+            fn on_incoming_call(&self, _: CallOffer) {
+                self.0.battery("incoming");
+            }
+            fn on_call_state_changed(&self, info: CallInfo) {
+                match info.state {
+                    CallState::Connected => self.0.battery("connected"),
+                    CallState::Ended => self.0.battery("ended-by-poll"),
+                    _ => {}
+                }
+            }
+            fn on_media_stats(&self, _: String, _: MediaStats) {}
+            fn on_error(&self, _: String, _: String) {}
+            fn on_auth_required(&self) {
+                self.0.battery("auth-required-by-poll");
+            }
+        }
+
+        let gw = MockGateway::start(|req| {
+            match req.path.as_str() {
+            "/v1/devices" => (200, r#"{"device_id":"d1","status":"ok"}"#.into()),
+            "/v1/calls/tok-in" => (
+                200,
+                r#"{"call_token":"tok-in","caller_uri":"sip:a@b","caller_name":null,"sdp_offer":""}"#
+                    .into(),
+            ),
+            "/v1/calls/tok-in/status" => (200, r#"{"status":"pending"}"#.into()),
+            "/v1/calls" => answer("ct-r"),
+            "/v1/calls/ct-r/status" => (200, r#"{"status":"ended"}"#.into()),
+            _ => (401, "{}".into()),
+        }
+        });
+        let (engine, _) = engine(&gw.base_url);
+        let engine = Arc::new(engine);
+        let reenter = Arc::new(Reenter::default());
+        *reenter.engine.lock().unwrap() = Some(Arc::clone(&engine));
+        engine.set_event_handler(Box::new(Handler(Arc::clone(&reenter))));
+
+        engine.register_device(registration()).unwrap();
+        engine
+            .handle_push_notification(PushCallPayload {
+                call_token: "tok-in".into(),
+                caller_uri: "sip:a@b".into(),
+                caller_name: None,
+                gateway_url: gw.base_url.clone(),
+            })
+            .unwrap();
+        dial(&engine).unwrap();
+        let stop = insert_call(&engine, "c-401", "tok-401");
+        engine.start_call_status_poll("c-401".into(), "tok-401".into(), Arc::clone(&stop));
+
+        let kinds = [
+            "registration",
+            "incoming",
+            "connected",
+            "ended-by-poll",
+            "auth-required-by-poll",
+        ];
+        assert!(
+            eventually(|| kinds
+                .iter()
+                .all(|k| reenter.ran.lock().unwrap().contains_key(k))),
+            "ran: {:?}",
+            reenter.ran.lock().unwrap().keys().collect::<Vec<_>>()
+        );
+        for (kind, results) in reenter.ran.lock().unwrap().iter() {
+            assert!(!results.iter().any(|r| r == "PANIC"), "{kind}: {results:?}");
+            // Each method reached its own logic: the unknown call is refused
+            // locally, the rest are refused by the gateway or for no token.
+            assert_eq!(
+                results,
+                &[
+                    "Some(InvalidState)",
+                    "Some(AuthenticationError)",
+                    "Some(AuthenticationError)",
+                    "Some(InvalidState)",
+                    "Some(AuthenticationError)",
+                ],
+                "{kind}"
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        engine.clear_pending_incoming("tok-in");
+        *reenter.engine.lock().unwrap() = None;
+        engine.events.set_handler(None);
+    }
+
+    /// Concurrent mute/hold changes are delivered in the order they were
+    /// applied, so the last event always matches the call's final state.
+    #[test]
+    fn concurrent_mute_and_hold_deliver_the_final_state_last() {
+        let (engine, recorder) = engine(NO_GATEWAY);
+        let engine = Arc::new(engine);
+        insert_call(&engine, "c1", "tok");
+        for round in 0..30 {
+            let threads: Vec<_> = (0..4)
+                .map(|t| {
+                    let engine = Arc::clone(&engine);
+                    std::thread::spawn(move || {
+                        for i in 0..50 {
+                            let on = (i + t + round) % 2 == 0;
+                            if t % 2 == 0 {
+                                engine.set_hold("c1".into(), on).unwrap();
+                            } else {
+                                engine.set_mute("c1".into(), on).unwrap();
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().unwrap();
+            }
+            let last = recorder.states().last().cloned().unwrap();
+            let current = engine.get_active_call().unwrap();
+            assert_eq!(
+                (last.on_hold, last.muted, last.state),
+                (current.on_hold, current.muted, current.state),
+                "round {round}"
+            );
+        }
+    }
+
     /// A callback that re-enters the engine must not deadlock: the handler is
     /// cloned out of its lock before it is invoked.
     #[test]
@@ -2657,10 +2762,11 @@ mod tests {
         }));
         insert_call(&engine, "c1", "tok");
 
-        end_call_locally(&engine.calls, &engine.event_handler, "c1");
+        end_call_locally(&engine.calls, &engine.events, "c1");
+        engine.events.flush();
 
         assert!(fired.load(Ordering::Relaxed));
         // Break the Arc cycle (engine -> handler -> engine).
-        engine.event_handler.write().unwrap().take();
+        engine.events.set_handler(None);
     }
 }

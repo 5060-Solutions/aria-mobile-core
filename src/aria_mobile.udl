@@ -120,8 +120,10 @@ callback interface PlatformAudioBridge {
 
 /// Callback interface for receiving events from the Rust core.
 ///
-/// Callbacks can arrive on any thread, including background poll threads, and
-/// must not block for long. They may call back into the engine. See the
+/// Callbacks are delivered one at a time on a dedicated core thread, never
+/// inside the core's runtime, and asynchronously with respect to the engine
+/// method that caused them. They may call any engine method, including the
+/// blocking ones, but should not block for long themselves. See the
 /// "Event contract" section of the README for the guaranteed sequence.
 callback interface MobileEventHandler {
     /// Called when registration state changes.
