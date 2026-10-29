@@ -96,20 +96,28 @@ When the gateway domain has SRV records, `register_device` resolves them into an
 
 ### Outgoing (via gateway B2BUA)
 
-1. App calls `make_call(uri, credentials, codecs)`
+1. App picks an id with `new_outgoing_call_id()` and calls `make_call_with_id(id, uri, credentials, codecs)`
 2. Engine generates SDP offer, sends to gateway `POST /v1/calls`
 3. Gateway sends SIP INVITE to destination
 4. Gateway returns SDP answer + call_token
 5. Engine updates media session with remote RTP address
 6. RTP flows directly between app and PBX
 
-### Hanging up while an outgoing call rings
+### Hanging up an outgoing call before it is answered
 
-`make_call` blocks until the far end answers, but the call can be hung up before then. Call `hangup(call_id)` with the `call_id` from the `Ringing` event. `hangup` returns at once, `Ended` is reported, `make_call` throws `Cancelled`, and the cancel is sent to the gateway in the background.
+The app picks the call's id before dialing: `id = new_outgoing_call_id()`, then `make_call_with_id(id, uri, credentials, codecs)` on a background thread. The id is `outgoing-` followed by 1-64 characters from `[A-Za-z0-9_-]`. A malformed id, or one that is in use or was used recently, throws `InvalidState`. Because the id is known up front, `hangup(id)` works at any point, and in every case the app sees exactly one `Ended` for the id:
 
-The gateway assigns a call token only when the far end answers, so a ringing call is cancelled by a reference of the core's own choosing:
+| When `hangup(id)` is called | What happens |
+|------|--------|
+| Before `make_call_with_id(id, ...)` | `Ended` is reported at once. The later `make_call_with_id` throws `Cancelled` without reporting anything or sending any request. |
+| While `make_call_with_id` sets up media or the `POST /v1/calls` is in flight | `Ended` is reported, `make_call_with_id` throws `Cancelled` at once, and if the call was sent, it is cancelled at the gateway in the background, as described below. |
+| After the far end answered | An ordinary hangup of an active call. |
 
-1. `make_call` sends `"client_ref"` with `POST /v1/calls`: the uuid part of the call's `outgoing-<uuid>` id.
+`make_call(uri, ...)` is kept and works as before, with a core-chosen id. With it, the app learns the id only from the `Ringing` event, which is delivered asynchronously on the event thread, so it cannot reliably hang up before then. Prefer `make_call_with_id`.
+
+The gateway assigns a call token only when the far end answers, so a ringing call is cancelled by the call's own reference:
+
+1. `make_call_with_id` sends `"client_ref"` with `POST /v1/calls`: the part of the call's id after `outgoing-`.
 2. `hangup` sends `POST /v1/calls/cancel` with `{"client_ref": "..."}`, in the background, to the gateway instance that `POST /v1/calls` went to.
 3. `202`: the gateway has sent a SIP CANCEL. The blocked `POST /v1/calls` fails with `409 {"error":"cancelled"}`, and there is nothing more to do. If the far end's 200 OK crossed the CANCEL, the gateway sends the BYE itself, so the core does not hang up again.
 4. `404`: the gateway has no ringing call with that ref. It may not have registered the ref yet, because the cancel overtook `POST /v1/calls`. So while that request is still in flight the cancel is retried after 100, 200, 400 and 800 ms. If no retry lands, the call was answered meanwhile or the gateway predates the route. Once `POST /v1/calls` returns a call token, the core immediately sends `POST /v1/calls/{token}/hangup`. The same happens when the cancel fails for any other reason.
@@ -131,16 +139,16 @@ A hangup that lands just after the answer works through the same fallback. In ev
 
 Apps can be fully event-driven: install a `MobileEventHandler` with `set_event_handler` and drive the call UI from it instead of polling `get_active_call` or `check_remote_hangup`.
 
-**Threading.** Every callback is delivered on one dedicated core thread (`aria-events`), one at a time, never on the thread that called an engine method and never inside the core's async runtime. Hop to the main thread before touching UI. A callback may call any engine method, including the blocking ones (`hangup`, `transfer_call`, `accept_incoming_call`, `make_call`, ...). While it does, later callbacks wait, so a callback should not block for long. A callback that throws is contained and does not affect the core.
+**Threading.** Every callback is delivered on one dedicated core thread (`aria-events`), one at a time, never on the thread that called an engine method and never inside the core's async runtime. Hop to the main thread before touching UI. A callback may call any engine method, including the blocking ones (`hangup`, `transfer_call`, `accept_incoming_call`, `make_call_with_id`, ...). While it does, later callbacks wait, so a callback should not block for long. A callback that throws is contained and does not affect the core.
 
-**Call IDs.** Every `CallInfo` carries a `call_id`. Outgoing calls are `outgoing-<uuid>`; incoming calls are `incoming-<call_token>`, so the ID of an offered call is known from the `CallOffer` before it is answered. Match events to calls by `call_id`; do not treat any `Ended` as ending whichever call is on screen.
+**Call IDs.** Every `CallInfo` carries a `call_id`. Outgoing calls are `outgoing-<id>`, chosen by the app with `new_outgoing_call_id()` and passed to `make_call_with_id`, so the ID is known before dialing. Incoming calls are `incoming-<call_token>`, so the ID of an offered call is known from the `CallOffer` before it is answered. Match events to calls by `call_id`; do not treat any `Ended` as ending whichever call is on screen.
 
 **`on_call_state_changed` sequences**
 
 | Flow | Events |
 |------|--------|
-| Outgoing | `Ringing` (emitted by `make_call` before the gateway is contacted, which is how the app first learns the `call_id`), then `Connected` when the far end answers. If `make_call` fails after `Ringing`, `Ended` follows and the method throws. |
-| Outgoing, hung up while ringing | `Ringing`, then `Ended` from `hangup(call_id)`. The blocked `make_call` then throws `Cancelled`. |
+| Outgoing | `Ringing` (queued by `make_call_with_id` before media is set up or the gateway is contacted), then `Connected` when the far end answers. If the call fails after `Ringing`, `Ended` follows and the method throws. |
+| Outgoing, hung up before it is answered | `Ringing` then `Ended`, or only `Ended` if `hangup(id)` came before `make_call_with_id(id, ...)`. `make_call_with_id` throws `Cancelled`. |
 | Incoming | `on_incoming_call(offer)` from `handle_push_notification`, then `Connected` from `accept_incoming_call`. `reject_incoming_call` emits nothing. |
 | Caller cancels before answer | `Ended` for `incoming-<call_token>`, detected within about 2 s while the call is unanswered (watched for up to 10 minutes). |
 | Mute / hold | `set_mute` re-emits the current state with `muted` updated; `set_hold` emits `OnHold` or `Connected`. |

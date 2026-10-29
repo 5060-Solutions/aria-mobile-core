@@ -4,6 +4,9 @@ namespace aria_mobile {
 
     /// Shut down the Rust runtime. Call on app termination.
     void shutdown_runtime();
+
+    /// A fresh `outgoing-<uuid>` call_id for `make_call_with_id`.
+    string new_outgoing_call_id();
 };
 
 /// Configuration for connecting to the push gateway.
@@ -207,12 +210,18 @@ interface AriaMobileEngine {
 
     // ── Outgoing Calls (direct SIP) ────────────────────────────────
 
-    /// Make an outgoing call through the gateway. Blocks until the far end
-    /// answers or the call fails, after reporting `Ringing` with the call's
-    /// `outgoing-<uuid>` id.
+    /// Make an outgoing call through the gateway under `call_id`, which the
+    /// app chose, normally with `new_outgoing_call_id()`: `outgoing-`
+    /// followed by 1-64 characters from `[A-Za-z0-9_-]`. Blocks until the far
+    /// end answers or the call fails, after reporting `Ringing`.
     ///
-    /// `hangup(call_id)` may be called while this is blocked: `Ended` is
-    /// reported for the call and this throws `Cancelled` at once. The core
+    /// Throws `InvalidState` for a malformed id, or one that is in use or
+    /// was used recently. Because the app knows the id up front,
+    /// `hangup(call_id)` works at any point:
+    /// - Before this is called: `Ended` is reported at once, and this then
+    ///   throws `Cancelled` without reporting anything or sending a request.
+    /// - While this is blocked: `Ended` is reported and this throws
+    ///   `Cancelled` at once. The core
     /// cancels the ringing call at the gateway (`POST /v1/calls/cancel` with
     /// the uuid part of the call_id as `client_ref`). If the gateway has no
     /// ringing call to cancel (answered meanwhile, or a gateway without the
@@ -220,13 +229,19 @@ interface AriaMobileEngine {
     /// background. Any other failure reports `Ended` and throws
     /// (`AuthenticationError` on a 401).
     [Throws=MobileError]
+    CallInfo make_call_with_id(string call_id, string uri, SipCredentials credentials, sequence<AudioCodec> preferred_codecs);
+
+    /// `make_call_with_id` with an id the core picks. The app learns the id
+    /// only from the `Ringing` event, which is delivered asynchronously, so
+    /// it cannot reliably hang up before then. Prefer `make_call_with_id`.
+    [Throws=MobileError]
     CallInfo make_call(string uri, SipCredentials credentials, sequence<AudioCodec> preferred_codecs);
 
     // ── Mid-call Controls ──────────────────────────────────────────
 
-    /// Hang up a call, including an outgoing call that is still ringing
-    /// (see `make_call`). Throws `InvalidState` for an unknown or already
-    /// ended call_id.
+    /// Hang up a call, including an outgoing call that is still ringing or
+    /// has not been made yet (see `make_call_with_id`). Throws `InvalidState`
+    /// for an unknown or already ended call_id.
     ///
     /// Never waits on the gateway: the call is torn down locally and `Ended`
     /// is queued at once, and the gateway hangup (or, for a ringing call, the
