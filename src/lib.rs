@@ -101,7 +101,11 @@ const PENDING_INCOMING_MAX_WATCH: Duration = Duration::from_secs(10 * 60);
 const TRANSFER_POLL_INTERVAL: Duration = Duration::from_millis(300);
 
 /// How long `transfer_call` waits for that outcome before giving up.
-const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// Longer than the gateway's own 30 s NOTIFY watchdog, which reports a
+/// transfer with no outcome as failed with 408, so the gateway's verdict
+/// normally arrives first; this only covers a gateway that stops answering.
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// How often a call's status is polled at the gateway.
 const CALL_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -1500,6 +1504,13 @@ impl AriaMobileEngine {
                             );
                             return Ok(());
                         }
+                        // 408 means no outcome: the gateway's NOTIFY
+                        // watchdog gave up, or the PBX itself timed out. The
+                        // transfer did not happen, and the call is still up.
+                        Some("failed") if status.transfer_code == Some(408) => {
+                            log::warn!("Transfer of {call_id} timed out (SIP 408)");
+                            return Err(MobileError::Timeout);
+                        }
                         Some("failed") => {
                             let code = status
                                 .transfer_code
@@ -2480,6 +2491,34 @@ mod tests {
         assert!(matches!(err, MobileError::Timeout), "{err:?}");
         assert!(engine.get_active_call().is_some());
         assert!(recorder.states().is_empty());
+    }
+
+    /// A 408 from the gateway (its NOTIFY watchdog, or a real 408 sipfrag)
+    /// means no outcome, not a refusal: Timeout, with the call still up.
+    #[test]
+    fn a_transfer_failed_with_408_is_a_timeout() {
+        let gw = transfer_gateway(&[
+            r#"{"status":"active","transfer":"pending"}"#,
+            r#"{"status":"active","transfer":"failed","transfer_code":408}"#,
+        ]);
+        let (engine, recorder) = engine(&gw.base_url);
+        let poll_stop = insert_call(&engine, "c1", "tok");
+
+        let err = engine
+            .transfer_call("c1".into(), "1002".into())
+            .unwrap_err();
+
+        assert!(matches!(err, MobileError::Timeout), "{err:?}");
+        assert!(engine.get_active_call().is_some());
+        assert!(!poll_stop.load(Ordering::Relaxed));
+        assert!(recorder.states().is_empty());
+    }
+
+    /// The core's own deadline outlasts the gateway's 30 s watchdog, so the
+    /// gateway's verdict normally wins.
+    #[test]
+    fn the_transfer_deadline_outlasts_the_gateways_watchdog() {
+        assert!(TRANSFER_TIMEOUT > Duration::from_secs(30));
     }
 
     /// A gateway that predates transfer outcomes: the active call has no

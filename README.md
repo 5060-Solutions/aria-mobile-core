@@ -131,14 +131,15 @@ A hangup that lands just after the answer works through the same fallback. In ev
 2. Engine rejects an empty target or one containing CR, LF, `<` or `>` with `InvalidTarget`, before any network request
 3. Engine sends `POST /v1/calls/{token}/transfer` with `{"target": "..."}`; the gateway sends the REFER to the PBX
 4. If the REFER is refused, the call stays up and the method throws: `400` -> `InvalidTarget`, `404` -> `InvalidState` (unknown call, a call not answered yet, or a gateway without the transfer route), `502` -> `CallFailed` (PBX refused), `504` -> `Timeout` (PBX did not answer the REFER within 8 s), anything else -> `GatewayError`
-5. A `202` only means the PBX accepted the REFER, and the transfer can still fail. The core polls `GET /v1/calls/{token}/status` every 300 ms for up to 30 s:
+5. A `202` only means the PBX accepted the REFER, and the transfer can still fail. The core polls `GET /v1/calls/{token}/status` every 300 ms for up to 35 s:
    - `{"status":"ended","reason":"transferred"}`: success. The local call and media are torn down, `Ended` is reported, and the method returns.
    - `{"status":"active","transfer":"failed","transfer_code":486}`: the PBX's NOTIFY reported a failure. The method throws `CallFailed`, whose message carries the SIP status, and the call stays fully up with media running, so the caller is not left in dead air.
-   - Still `"transfer":"pending"` after 30 s: `Timeout`, with the call still up.
+   - `"transfer":"failed"` with `"transfer_code":408`: no outcome. Either the gateway's 30 s NOTIFY watchdog gave up, or the PBX itself answered 408. The method throws `Timeout`, and the call stays up.
+   - No answer from the gateway for 35 s, longer than its watchdog, so this only happens when the gateway stops answering: `Timeout`, with the call still up.
    - Ended for any other reason meanwhile: `Ended` is reported, as for a remote hangup, and the method throws `InvalidState`.
    - An active call with no `transfer` field: a gateway that does not report outcomes. The call is ended on the `202`, as before.
 
-`transfer_call` can block for up to about 40 s (the REFER, then the outcome), so call it off the UI thread. The gateway accepts a bare target of letters, digits and `+*#.-_`, or a `sip:`/`sips:` URI. The core's local check is deliberately looser, so the gateway remains the authority and its refusal surfaces as `InvalidTarget`.
+`transfer_call` can block for up to about 45 s (the REFER, then the outcome), so call it off the UI thread. The gateway accepts a bare target of letters, digits and `+*#.-_`, or a `sip:`/`sips:` URI. The core's local check is deliberately looser, so the gateway remains the authority and its refusal surfaces as `InvalidTarget`.
 
 ## Event contract
 

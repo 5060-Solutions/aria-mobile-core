@@ -293,20 +293,23 @@ interface AriaMobileEngine {
     /// `on_call_state_changed` reports `Ended` for `call_id`.
     ///
     /// After the PBX accepts the REFER, the core polls the call's status
-    /// every 300 ms until it shows the outcome, for up to 30 s.
+    /// every 300 ms until it shows the outcome, for up to 35 s (longer than
+    /// the gateway's own 30 s NOTIFY watchdog, so its verdict normally wins).
     ///
     /// These errors leave the call fully up: `InvalidTarget` for a target
     /// rejected locally or by the gateway; `InvalidState` for an unknown call,
     /// one that is not active yet (still ringing), or a gateway without the
     /// transfer route; `CallFailed` when the PBX refused the REFER or reported
     /// the transfer failed (the message carries the SIP status, such as 486);
-    /// `Timeout` when the PBX did not answer the REFER, or no outcome arrived
-    /// within 30 s; `AuthenticationError` for a rejected token.
+    /// `Timeout` when the PBX did not answer the REFER, the transfer failed
+    /// with 408 (no outcome: the gateway's watchdog, or a 408 from the PBX),
+    /// or the gateway stopped answering for 35 s; `AuthenticationError` for
+    /// a rejected token.
     ///
     /// `InvalidState` after the REFER was accepted means the call ended for
     /// another reason meanwhile; `Ended` has been reported. A gateway that
     /// does not report transfer outcomes ends the call on acceptance, as
-    /// before. Blocks for up to about 40 s; call it off the UI thread.
+    /// before. Blocks for up to about 45 s; call it off the UI thread.
     [Throws=MobileError]
     void transfer_call(string call_id, string target);
 
