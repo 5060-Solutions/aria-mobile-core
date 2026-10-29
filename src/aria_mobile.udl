@@ -206,11 +206,13 @@ interface AriaMobileEngine {
     /// `outgoing-<uuid>` id.
     ///
     /// `hangup(call_id)` may be called while this is blocked: `Ended` is
-    /// reported for the call and this throws `Cancelled`. The gateway only
-    /// assigns a call token when the far end answers and cannot cancel an
-    /// unanswered INVITE, so if the call is answered later the core hangs it
-    /// up at once in the background. Any other failure reports `Ended` and
-    /// throws (`AuthenticationError` on a 401).
+    /// reported for the call and this throws `Cancelled` at once. The core
+    /// cancels the ringing call at the gateway (`POST /v1/calls/cancel` with
+    /// the uuid part of the call_id as `client_ref`). If the gateway has no
+    /// ringing call to cancel (answered meanwhile, or a gateway without the
+    /// route) and the call is answered, the core hangs it up in the
+    /// background. Any other failure reports `Ended` and throws
+    /// (`AuthenticationError` on a 401).
     [Throws=MobileError]
     CallInfo make_call(string uri, SipCredentials credentials, sequence<AudioCodec> preferred_codecs);
 
@@ -221,9 +223,11 @@ interface AriaMobileEngine {
     /// ended call_id.
     ///
     /// The local call always ends and `Ended` is emitted. Throws
-    /// `AuthenticationError` if the gateway rejected the token (401), in
-    /// which case the far end may stay up until the PBX times it out: fetch a
-    /// new token and call `set_gateway_token`.
+    /// `AuthenticationError` if the gateway rejected the token (401) for the
+    /// hangup or, for a ringing call, the cancel. The far end may then stay up
+    /// until the PBX times it out (a ringing call that is answered is still
+    /// hung up in the background): fetch a new token and call
+    /// `set_gateway_token`.
     [Throws=MobileError]
     void hangup(string call_id);
 

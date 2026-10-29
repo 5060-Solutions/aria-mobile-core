@@ -101,9 +101,17 @@ An engine constructed with an empty `api_key` has no token: methods that need th
 
 ### Hanging up while an outgoing call rings
 
-`make_call` blocks until the far end answers, but the call can be hung up before then: `hangup(call_id)` with the `call_id` from the `Ringing` event returns at once, `Ended` is reported, and `make_call` throws `Cancelled`. A hangup issued from inside the `Ringing` callback stops the call before anything is sent to the gateway.
+`make_call` blocks until the far end answers, but the call can be hung up before then. Call `hangup(call_id)` with the `call_id` from the `Ringing` event. `Ended` is reported, `make_call` throws `Cancelled` at once, and `hangup` returns once the gateway has answered the cancel. A hangup issued from inside the `Ringing` callback stops the call before anything is sent to the gateway.
 
-The gateway assigns a call token only when the far end answers (`POST /v1/calls` returns it with the SDP answer), and it has no route for cancelling an INVITE that has not been answered yet. So the far end keeps ringing until it answers or the INVITE times out. If it answers, the core immediately sends `POST /v1/calls/{token}/hangup` in the background. If the token is rejected at that point, `on_auth_required` fires. A hangup that lands just after the answer works the same way: the core hangs up the leg it has just been handed. Each of these sends exactly one hangup to the gateway, and the app sees exactly one `Ended`.
+The gateway assigns a call token only when the far end answers, so a ringing call is cancelled by a reference of the core's own choosing:
+
+1. `make_call` sends `"client_ref"` with `POST /v1/calls`: the uuid part of the call's `outgoing-<uuid>` id.
+2. `hangup` sends `POST /v1/calls/cancel` with `{"client_ref": "..."}`.
+3. `202`: the gateway has sent a SIP CANCEL. The blocked `POST /v1/calls` fails with `409 {"error":"cancelled"}`, and there is nothing more to do. If the far end's 200 OK crossed the CANCEL, the gateway sends the BYE itself, so the core does not hang up again.
+4. `404`: the gateway has no ringing call with that ref. Either it was answered meanwhile, or the gateway predates the route. When `POST /v1/calls` returns a call token, the core immediately sends `POST /v1/calls/{token}/hangup` in the background. The same happens when the cancel fails for any other reason.
+5. `401`: `hangup` throws `AuthenticationError`, after `Ended` has been reported. Step 4's fallback still applies, and a 401 for that background hangup fires `on_auth_required`.
+
+A hangup that lands just after the answer works through the same fallback. In every case the gateway gets exactly one accepted cancel or one hangup, and the app sees exactly one `Ended`.
 
 ### Blind transfer
 

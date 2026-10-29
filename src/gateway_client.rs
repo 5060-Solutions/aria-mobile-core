@@ -141,6 +141,14 @@ struct MakeCallRequest {
     sip_port: u16,
     sip_auth_username: Option<String>,
     sip_display_name: String,
+    /// Our reference for the call, so it can be cancelled while it rings,
+    /// before the gateway has assigned a call token.
+    client_ref: String,
+}
+
+#[derive(Serialize)]
+struct CancelCallRequest<'a> {
+    client_ref: &'a str,
 }
 
 #[derive(Serialize)]
@@ -503,6 +511,7 @@ impl GatewayClient {
         destination_uri: &str,
         sdp_offer: &str,
         credentials: &crate::types::SipCredentials,
+        client_ref: &str,
     ) -> Result<(String, String), MobileError> {
         // Let the gateway handle DNS resolution — passing pre-resolved
         // IP:port breaks the gateway's DNS parser.
@@ -517,6 +526,7 @@ impl GatewayClient {
             sip_port: credentials.port,
             sip_auth_username: credentials.auth_username.clone(),
             sip_display_name: credentials.display_name.clone(),
+            client_ref: client_ref.to_string(),
         };
 
         let target_count = self.resolved_target_count();
@@ -526,6 +536,11 @@ impl GatewayClient {
             let (client, url) = self.target_request(idx, "/v1/calls");
             match client.post(&url).bearer_auth(token).json(&req).send().await {
                 Ok(resp) => {
+                    if resp.status() == reqwest::StatusCode::CONFLICT {
+                        // Cancelled through `cancel_call` while it rang.
+                        log::info!("Outgoing call cancelled at the gateway");
+                        return Err(MobileError::Cancelled);
+                    }
                     if !resp.status().is_success() {
                         log::error!("Make call failed: {}", resp.status());
                         return Err(status_error(resp.status(), MobileError::CallFailed));
@@ -541,6 +556,33 @@ impl GatewayClient {
         }
 
         Err(last_err)
+    }
+
+    /// Cancel an outgoing call that is still ringing, by the `client_ref` it
+    /// was placed with. The gateway sends a SIP CANCEL and the blocked
+    /// `make_call` then fails with `Cancelled` (HTTP 409).
+    ///
+    /// Returns `Ok(true)` when the gateway sent the CANCEL (202) and
+    /// `Ok(false)` when it has no ringing call with that ref (404): already
+    /// answered, unknown, or a gateway that predates the route.
+    pub async fn cancel_call(&self, token: &str, client_ref: &str) -> Result<bool, MobileError> {
+        let resp = self
+            .http
+            .post(self.url("/v1/calls/cancel"))
+            .bearer_auth(token)
+            .json(&CancelCallRequest { client_ref })
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(true);
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        log::error!("Cancel call failed: {}", status);
+        Err(status_error(status, MobileError::GatewayError))
     }
 
     /// Poll the status of a call. Returns "active", "ended", "cancelled", etc.
@@ -766,6 +808,49 @@ mod transfer_tests {
                 other => panic!("unexpected error for {status}: {other:?}"),
             };
             assert_eq!(got, expected, "HTTP {status}");
+        }
+    }
+
+    #[test]
+    fn a_cancelled_outgoing_call_is_a_cancelled_error() {
+        let gw = MockGateway::start(|_| (409, r#"{"error":"cancelled"}"#.into()));
+        let client = GatewayClient::new(gw.base_url.clone());
+        let creds = crate::types::SipCredentials {
+            username: "1001".into(),
+            password: "pw".into(),
+            domain: "pbx.example.com".into(),
+            registrar: None,
+            transport: "udp".into(),
+            port: 5060,
+            auth_username: None,
+            display_name: "Alice".into(),
+        };
+        let err = block_on(client.make_call("jwt", "1002", "v=0", &creds, "ref1")).unwrap_err();
+        assert!(matches!(err, MobileError::Cancelled), "{err:?}");
+        let body: serde_json::Value = serde_json::from_str(&gw.requests()[0].body).unwrap();
+        assert_eq!(body["client_ref"], "ref1");
+    }
+
+    #[test]
+    fn cancel_posts_the_ref_and_maps_statuses() {
+        for (status, expected) in [
+            (202, Ok(true)),
+            (404, Ok(false)),
+            (401, Err("AuthenticationError")),
+            (500, Err("GatewayError")),
+        ] {
+            let gw = MockGateway::start(move |_| (status, "{}".into()));
+            let client = GatewayClient::new(gw.base_url.clone());
+            let got = block_on(client.cancel_call("jwt", "ref1")).map_err(|e| match e {
+                MobileError::AuthenticationError => "AuthenticationError",
+                MobileError::GatewayError => "GatewayError",
+                other => panic!("unexpected error for {status}: {other:?}"),
+            });
+            assert_eq!(got, expected, "HTTP {status}");
+            let reqs = gw.requests();
+            assert_eq!(reqs[0].path, "/v1/calls/cancel");
+            assert_eq!(reqs[0].body, r#"{"client_ref":"ref1"}"#);
+            assert_eq!(reqs[0].authorization.as_deref(), Some("Bearer jwt"));
         }
     }
 }

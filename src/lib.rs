@@ -321,9 +321,26 @@ pub struct AriaMobileEngine {
 struct PendingOutgoing {
     info: CallInfo,
     events: Arc<CallEvents>,
+    /// Sent with `POST /v1/calls` so the gateway can cancel the call by it
+    /// before it has assigned a call token.
+    client_ref: String,
+    /// Set by `dial`, under the pending-map lock, just before it sends the
+    /// call to the gateway. A hangup that finds it unset has nothing to
+    /// cancel at the gateway.
+    dialing: bool,
     /// Tells `dial` that `hangup` has taken the call.
     cancel: tokio::sync::oneshot::Sender<()>,
+    /// What came of `hangup`'s cancel request: `Some(true)` when the gateway
+    /// sent a CANCEL, `Some(false)` otherwise. Read before hanging up a call
+    /// that was answered anyway, because the gateway ends a call whose answer
+    /// crossed an accepted CANCEL itself.
+    cancel_outcome: tokio::sync::watch::Sender<Option<bool>>,
 }
+
+/// How long a cancelled call that was answered anyway waits for the outcome
+/// of the cancel request before hanging up. Longer than the HTTP timeout, so
+/// the outcome is always known unless something is badly wrong.
+const CANCEL_OUTCOME_WAIT: Duration = Duration::from_secs(35);
 
 /// What `hangup` found for a call_id.
 enum TakenCall {
@@ -637,7 +654,8 @@ impl AriaMobileEngine {
         sdp_offer: String,
         media: Option<media::MobileMediaSession>,
     ) -> Result<CallInfo, MobileError> {
-        let call_id = format!("outgoing-{}", uuid::Uuid::new_v4().as_simple());
+        let client_ref = uuid::Uuid::new_v4().as_simple().to_string();
+        let call_id = format!("outgoing-{client_ref}");
         let events = Arc::new(CallEvents::default());
         let mut info = CallInfo {
             call_id: call_id.clone(),
@@ -653,6 +671,7 @@ impl AriaMobileEngine {
         // Registered before `Ringing` is reported: that event is how the app
         // learns the call_id, so any hangup for it finds the call here.
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
+        let (outcome_tx, outcome_rx) = tokio::sync::watch::channel(None);
         self.pending_outgoing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -661,17 +680,33 @@ impl AriaMobileEngine {
                 PendingOutgoing {
                     info: info.clone(),
                     events: Arc::clone(&events),
+                    client_ref: client_ref.clone(),
+                    dialing: false,
                     cancel: cancel_tx,
+                    cancel_outcome: outcome_tx,
                 },
             );
         events.emit(&self.event_handler, info.clone());
 
-        // Hung up from inside the `Ringing` callback: nothing has been sent,
-        // so there is nothing to cancel at the gateway.
-        if !matches!(
-            cancel_rx.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-        ) {
+        // Mark the call as sent, unless it was hung up from inside the
+        // `Ringing` callback: then nothing has been sent and there is nothing
+        // to cancel at the gateway. Done under the lock `hangup` takes the
+        // call under, so a hangup either sees the mark and cancels at the
+        // gateway, or removed the call first and is seen here.
+        let hung_up = {
+            let mut pending = self
+                .pending_outgoing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match pending.get_mut(&call_id) {
+                Some(call) => {
+                    call.dialing = true;
+                    false
+                }
+                None => true,
+            }
+        };
+        if hung_up {
             if let Some(media) = &media {
                 media.stop();
             }
@@ -682,15 +717,15 @@ impl AriaMobileEngine {
         // INVITE on our behalf and returns the SDP answer + call_token.
         //
         // The request runs as its own task so that a hangup can unblock
-        // this method without abandoning it: the gateway only assigns the
-        // call token when the far end answers, and has no route to cancel
-        // an unanswered INVITE, so the call can only be hung up once that
-        // answer arrives.
+        // this method without abandoning it. `hangup` cancels the call by
+        // its `client_ref`, after which the gateway fails this request with
+        // 409; but a gateway without the cancel route, or a call answered
+        // first, means the call can only be hung up once its token arrives.
         let gateway = Arc::clone(&self.gateway);
         let destination = uri.clone();
         let mut request = tokio::spawn(async move {
             gateway
-                .make_call(&token, &destination, &sdp_offer, &credentials)
+                .make_call(&token, &destination, &sdp_offer, &credentials, &client_ref)
                 .await
         });
 
@@ -703,7 +738,8 @@ impl AriaMobileEngine {
                 if let Some(media) = &media {
                     media.stop();
                 }
-                self.hang_up_when_answered(request);
+                let answered = async move { request.await.ok()?.ok().map(|(t, _)| t) };
+                self.hang_up_if_answered(answered, outcome_rx);
                 return Err(MobileError::Cancelled);
             }
         };
@@ -794,7 +830,7 @@ impl AriaMobileEngine {
             if let Some(media) = media {
                 media.stop();
             }
-            hang_up_abandoned(&self.gateway, &self.auth, &self.event_handler, &call_token).await;
+            self.hang_up_if_answered(std::future::ready(Some(call_token)), outcome_rx);
             return Err(MobileError::Cancelled);
         }
 
@@ -810,20 +846,38 @@ impl AriaMobileEngine {
         Ok(info)
     }
 
-    /// Hang up a cancelled outgoing call once the gateway answers it, in the
-    /// background; `make_call` has already returned.
-    fn hang_up_when_answered(
+    /// Hang up an outgoing call cancelled by `hangup` if `answered` yields a
+    /// call token, in the background; `make_call` has already returned.
+    ///
+    /// The call is left alone when the gateway accepted the cancel, since it
+    /// ends a call whose answer crossed the CANCEL itself. Otherwise (the call
+    /// was answered first, or the gateway has no cancel route) it is hung up
+    /// here.
+    fn hang_up_if_answered(
         &self,
-        request: tokio::task::JoinHandle<Result<(String, String), MobileError>>,
+        answered: impl std::future::Future<Output = Option<String>> + Send + 'static,
+        mut cancel_outcome: tokio::sync::watch::Receiver<Option<bool>>,
     ) {
         let gateway = Arc::clone(&self.gateway);
         let auth = Arc::clone(&self.auth);
         let handler = Arc::clone(&self.event_handler);
         tokio::spawn(async move {
-            if let Ok(Ok((call_token, _))) = request.await {
-                log::info!("Cancelled outgoing call was answered; hanging it up");
-                hang_up_abandoned(&gateway, &auth, &handler, &call_token).await;
+            // A 409 (cancelled) or any other failure leaves nothing to hang up.
+            let Some(call_token) = answered.await else {
+                return;
+            };
+            let accepted = tokio::time::timeout(
+                CANCEL_OUTCOME_WAIT,
+                cancel_outcome.wait_for(Option::is_some),
+            )
+            .await
+            .is_ok_and(|outcome| outcome.is_ok_and(|o| *o == Some(true)));
+            if accepted {
+                log::info!("Cancelled call was answered; the gateway ends it");
+                return;
             }
+            log::info!("Cancelled outgoing call was answered; hanging it up");
+            hang_up_abandoned(&gateway, &auth, &handler, &call_token).await;
         });
     }
 
@@ -832,16 +886,7 @@ impl AriaMobileEngine {
     pub fn hangup(&self, call_id: String) -> Result<(), MobileError> {
         let call = match self.take_for_hangup(&call_id) {
             TakenCall::Active(call) => call,
-            TakenCall::Ringing(pending) => {
-                // Not answered yet, so there is no call token to hang up.
-                // `make_call` returns `Cancelled` once this is sent, and hangs
-                // the call up at the gateway if it is answered after all.
-                pending
-                    .events
-                    .emit_ended(&self.event_handler, &pending.info);
-                let _ = pending.cancel.send(());
-                return Ok(());
-            }
+            TakenCall::Ringing(pending) => return self.cancel_ringing(pending),
             TakenCall::Missing => return Err(MobileError::InvalidState),
         };
 
@@ -867,6 +912,43 @@ impl AriaMobileEngine {
 
             result
         })
+    }
+
+    /// Hang up an outgoing call that is still ringing.
+    ///
+    /// `Ended` is reported and `make_call` is released with `Cancelled` at
+    /// once. Then the call is cancelled at the gateway by its `client_ref`.
+    /// If the gateway has no ringing call by that ref (answered meanwhile, or
+    /// a gateway without the route), `make_call`'s background task hangs the
+    /// call up once its token arrives.
+    fn cancel_ringing(&self, pending: PendingOutgoing) -> Result<(), MobileError> {
+        pending
+            .events
+            .emit_ended(&self.event_handler, &pending.info);
+        let _ = pending.cancel.send(());
+        if !pending.dialing {
+            return Ok(());
+        }
+
+        let result = runtime().block_on(async {
+            let token = self.auth.token()?;
+            self.gateway.cancel_call(&token, &pending.client_ref).await
+        });
+        let _ = pending
+            .cancel_outcome
+            .send(Some(matches!(result, Ok(true))));
+        match result {
+            Ok(true) => log::info!(
+                "Outgoing call {} cancelled at the gateway",
+                pending.info.call_id
+            ),
+            Ok(false) => log::info!("Gateway had no ringing call to cancel; hanging up on answer"),
+            Err(ref e) => log::warn!("Cancel failed ({e}); hanging up on answer"),
+        }
+        match result {
+            Err(MobileError::AuthenticationError) => Err(MobileError::AuthenticationError),
+            _ => Ok(()),
+        }
     }
 
     /// Take a call out of the engine for `hangup`: an active call (with its
@@ -1456,6 +1538,8 @@ pub(crate) mod mock_gateway {
         pub path: String,
         pub authorization: Option<String>,
         pub body: String,
+        /// The status the mock answered with.
+        pub status: u16,
     }
 
     pub struct MockGateway {
@@ -1481,10 +1565,11 @@ pub(crate) mod mock_gateway {
                     let respond = Arc::clone(&respond);
                     let seen = Arc::clone(&seen);
                     std::thread::spawn(move || {
-                        let Some(req) = read_request(&mut stream) else {
+                        let Some(mut req) = read_request(&mut stream) else {
                             return;
                         };
                         let (status, body) = respond(&req);
+                        req.status = status;
                         seen.lock().unwrap().push(req);
                         let resp = format!(
                             "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
@@ -1536,6 +1621,7 @@ pub(crate) mod mock_gateway {
             path,
             authorization,
             body: String::from_utf8_lossy(&body).into_owned(),
+            status: 0,
         })
     }
 }
@@ -2191,7 +2277,7 @@ mod tests {
     }
 
     #[test]
-    fn hangup_while_ringing_cancels_and_hangs_up_once_answered() {
+    fn without_a_cancel_route_a_ringing_hangup_hangs_up_once_answered() {
         let gate = Gate::default();
         let held = gate.clone();
         let gw = MockGateway::start(move |req| match req.path.as_str() {
@@ -2199,6 +2285,8 @@ mod tests {
                 held.wait();
                 answer("ct-1")
             }
+            // A gateway that predates the cancel route.
+            "/v1/calls/cancel" => (404, "{}".into()),
             // The token has expired by the time the call is answered.
             _ => (401, "{}".into()),
         });
@@ -2220,6 +2308,7 @@ mod tests {
         assert_eq!(states, [CallState::Ringing, CallState::Ended]);
         assert!(recorder.states().iter().all(|i| i.call_id == call_id));
         assert_eq!(count(&gw, "/v1/calls/ct-1/hangup"), 0);
+        assert_eq!(count(&gw, "/v1/calls/cancel"), 1);
 
         // Once answered, the call is hung up at the gateway, and the 401 for
         // that background request asks the app for a token.
@@ -2234,6 +2323,147 @@ mod tests {
             engine.hangup(call_id),
             Err(MobileError::InvalidState)
         ));
+    }
+
+    /// A gateway's view of one outgoing call: it rings until it is answered
+    /// or cancelled, whichever comes first.
+    #[derive(Clone, Default)]
+    struct RingingCall(Arc<(Mutex<Option<bool>>, std::sync::Condvar)>);
+
+    impl RingingCall {
+        /// Ring for up to `ring`, then answer. Returns false if the call was
+        /// cancelled first.
+        fn answer_after(&self, ring: Duration) -> bool {
+            let (state, cv) = &*self.0;
+            let state = state.lock().unwrap();
+            let (mut state, _) = cv.wait_timeout_while(state, ring, |s| s.is_none()).unwrap();
+            *state.get_or_insert(true)
+        }
+
+        /// Cancel the call if it is still ringing.
+        fn cancel(&self) -> bool {
+            let (state, cv) = &*self.0;
+            let mut state = state.lock().unwrap();
+            if state.is_some() {
+                return false;
+            }
+            *state = Some(false);
+            cv.notify_all();
+            true
+        }
+    }
+
+    /// A gateway with the cancel route, ringing for `ring` before answering.
+    fn cancelling_gateway(call_token: &str, ring: Duration) -> MockGateway {
+        let call = RingingCall::default();
+        let token = call_token.to_string();
+        MockGateway::start(move |req| match req.path.as_str() {
+            "/v1/calls" => {
+                if call.answer_after(ring) {
+                    answer(&token)
+                } else {
+                    (409, r#"{"error":"cancelled"}"#.into())
+                }
+            }
+            "/v1/calls/cancel" if call.cancel() => (202, "{}".into()),
+            "/v1/calls/cancel" => (404, "{}".into()),
+            p if p.ends_with("/status") => (200, r#"{"status":"active"}"#.into()),
+            _ => (200, "{}".into()),
+        })
+    }
+
+    #[test]
+    fn hangup_while_ringing_cancels_at_the_gateway() {
+        let gw = cancelling_gateway("ct-c", Duration::from_secs(30));
+        let (engine, recorder) = engine(&gw.base_url);
+        let engine = Arc::new(engine);
+        let result = dial_in_background(&engine);
+
+        let call_id = recorder.wait_for(1)[0].call_id.clone();
+        engine.hangup(call_id.clone()).unwrap();
+
+        let result = result.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(result, Err(MobileError::Cancelled)), "{result:?}");
+        let states: Vec<_> = recorder.states().iter().map(|i| i.state).collect();
+        assert_eq!(states, [CallState::Ringing, CallState::Ended]);
+
+        // The call was placed and cancelled by the uuid part of its call_id.
+        let client_ref = call_id.strip_prefix("outgoing-").unwrap();
+        assert!(eventually(|| count(&gw, "/v1/calls") == 1));
+        let reqs = gw.requests();
+        let placed = reqs.iter().find(|r| r.path == "/v1/calls").unwrap();
+        let placed: serde_json::Value = serde_json::from_str(&placed.body).unwrap();
+        assert_eq!(placed["client_ref"], client_ref);
+        let cancel = reqs.iter().find(|r| r.path == "/v1/calls/cancel").unwrap();
+        assert_eq!(cancel.body, format!(r#"{{"client_ref":"{client_ref}"}}"#));
+        assert_eq!(cancel.authorization.as_deref(), Some("Bearer jwt"));
+
+        // The 409 leaves nothing to hang up.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(count(&gw, "/v1/calls/ct-c/hangup"), 0);
+        assert_eq!(recorder.states().len(), 2);
+    }
+
+    /// The gateway ends a call whose answer crossed an accepted CANCEL, so
+    /// the core must not hang it up a second time.
+    #[test]
+    fn an_answer_that_crosses_an_accepted_cancel_is_left_to_the_gateway() {
+        let gate = Gate::default();
+        let held = gate.clone();
+        let gw = MockGateway::start(move |req| match req.path.as_str() {
+            "/v1/calls" => {
+                held.wait();
+                answer("ct-x")
+            }
+            "/v1/calls/cancel" => (202, "{}".into()),
+            _ => (200, "{}".into()),
+        });
+        let (engine, recorder) = engine(&gw.base_url);
+        let engine = Arc::new(engine);
+        let result = dial_in_background(&engine);
+
+        let call_id = recorder.wait_for(1)[0].call_id.clone();
+        engine.hangup(call_id).unwrap();
+        assert!(matches!(
+            result.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Err(MobileError::Cancelled)
+        ));
+
+        gate.open();
+        assert!(eventually(|| count(&gw, "/v1/calls") == 1));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(count(&gw, "/v1/calls/ct-x/hangup"), 0);
+        assert_eq!(recorder.states().len(), 2);
+    }
+
+    #[test]
+    fn a_rejected_cancel_still_ends_the_call_and_hangs_up_on_answer() {
+        let gate = Gate::default();
+        let held = gate.clone();
+        let gw = MockGateway::start(move |req| match req.path.as_str() {
+            "/v1/calls" => {
+                held.wait();
+                answer("ct-r")
+            }
+            "/v1/calls/cancel" => (401, "{}".into()),
+            _ => (200, "{}".into()),
+        });
+        let (engine, recorder) = engine(&gw.base_url);
+        let engine = Arc::new(engine);
+        let result = dial_in_background(&engine);
+
+        let call_id = recorder.wait_for(1)[0].call_id.clone();
+        assert!(is_auth_error(engine.hangup(call_id)));
+        assert!(matches!(
+            result.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Err(MobileError::Cancelled)
+        ));
+        let states: Vec<_> = recorder.states().iter().map(|i| i.state).collect();
+        assert_eq!(states, [CallState::Ringing, CallState::Ended]);
+
+        gate.open();
+        assert!(eventually(|| count(&gw, "/v1/calls/ct-r/hangup") == 1));
+        assert_eq!(recorder.states().len(), 2);
     }
 
     #[test]
@@ -2329,19 +2559,18 @@ mod tests {
     fn hangup_racing_the_answer_ends_the_call_exactly_once() {
         use rand::Rng;
 
+        // A cancel the gateway accepted; it then fails the call with 409.
+        fn cancels_accepted(gw: &MockGateway) -> bool {
+            gw.requests()
+                .iter()
+                .any(|r| r.path == "/v1/calls/cancel" && r.status == 202)
+        }
+
         for round in 0..60 {
             let call_token = format!("ct-race-{round}");
             let hangup_path = format!("/v1/calls/{call_token}/hangup");
-            let answer_delay = Duration::from_micros(rand::rng().random_range(0..4000));
-            let token = call_token.clone();
-            let gw = MockGateway::start(move |req| match req.path.as_str() {
-                "/v1/calls" => {
-                    std::thread::sleep(answer_delay);
-                    answer(&token)
-                }
-                p if p.ends_with("/status") => (200, r#"{"status":"active"}"#.into()),
-                _ => (200, "{}".into()),
-            });
+            let ring = Duration::from_micros(rand::rng().random_range(0..4000));
+            let gw = cancelling_gateway(&call_token, ring);
             let (engine, recorder) = engine(&gw.base_url);
             let engine = Arc::new(engine);
             let result = dial_in_background(&engine);
@@ -2362,12 +2591,20 @@ mod tests {
                 "round {round}: {result:?}"
             );
 
+            // Exactly one of: a CANCEL the gateway accepted, or a hangup.
+            let ended_at_gateway = || {
+                gw.requests()
+                    .iter()
+                    .filter(|r| r.path == hangup_path)
+                    .count()
+                    + usize::from(cancels_accepted(&gw))
+            };
             assert!(
-                eventually(|| count(&gw, &hangup_path) == 1),
-                "round {round}: no hangup reached the gateway"
+                eventually(|| ended_at_gateway() == 1),
+                "round {round}: the call was never ended at the gateway"
             );
             std::thread::sleep(Duration::from_millis(50));
-            assert_eq!(count(&gw, &hangup_path), 1, "round {round}");
+            assert_eq!(ended_at_gateway(), 1, "round {round}");
 
             let states: Vec<_> = recorder.states().iter().map(|i| i.state).collect();
             assert!(recorder.states().iter().all(|i| i.call_id == call_id));
