@@ -340,7 +340,9 @@ pub struct AriaMobileEngine {
     /// they pick up a token replaced by `set_gateway_token`.
     auth: Arc<auth::GatewayAuth>,
     /// Registered device ID
-    device_id: RwLock<Option<String>>,
+    device_id: Arc<RwLock<Option<String>>>,
+    /// Network-change heartbeats: at most one in flight, latest wins.
+    heartbeat: Arc<Mutex<HeartbeatState>>,
     /// On-device AI, created by `ai_init`. `None` until a host asks for it, so
     /// a build with the feature on still costs nothing until it is used.
     ai: RwLock<Option<Arc<ai::AiState>>>,
@@ -383,6 +385,16 @@ struct PendingIncoming {
     abandoned: bool,
     /// The watch has already rejected the abandoned call.
     rejected: bool,
+}
+
+/// Coalesces network-change heartbeats.
+#[derive(Default)]
+struct HeartbeatState {
+    /// A heartbeat task is running.
+    running: bool,
+    /// Another network change arrived since the running task last started a
+    /// heartbeat; it sends one more, with the state current at that time.
+    requested: bool,
 }
 
 /// What a status poll does after a status answer.
@@ -517,7 +529,8 @@ impl AriaMobileEngine {
             pending_incoming: Arc::new(Mutex::new(HashMap::new())),
             pending_outgoing: Mutex::new(OutgoingCalls::default()),
             auth: Arc::new(auth::GatewayAuth::new(gateway_config.api_key)),
-            device_id: RwLock::new(None),
+            device_id: Arc::new(RwLock::new(None)),
+            heartbeat: Arc::default(),
             ai: RwLock::new(None),
             codec_prefs: RwLock::new(vec![AudioCodec::Opus, AudioCodec::Pcmu, AudioCodec::Pcma]),
             last_registration: RwLock::new(None),
@@ -1994,25 +2007,22 @@ impl AriaMobileEngine {
     pub fn notify_network_change(&self) {
         log::info!("Network change detected by platform");
 
-        // Send heartbeat to push gateway — re-registers SIP with fresh socket
-        let device_id = self.device_id.read().unwrap().clone();
-        let current = self.auth.current();
-        if let (Some(did), Some((tok, generation))) = (device_id, current) {
-            log::info!("Sending heartbeat for device {} after network change", did);
-            // In the background on the shared runtime: this must not block
-            // the caller.
-            let gateway = Arc::clone(&self.gateway);
-            let auth = Arc::clone(&self.auth);
-            let handler = Arc::clone(&self.events);
-            runtime().spawn(async move {
-                match gateway.device_heartbeat(&tok, &did).await {
-                    Ok(()) => log::info!("Gateway heartbeat successful after network change"),
-                    Err(MobileError::AuthenticationError) => {
-                        report_auth_rejected(&auth, &handler, generation);
-                    }
-                    Err(e) => log::warn!("Gateway heartbeat failed: {}", e),
-                }
-            });
+        // Send a heartbeat to the push gateway, which re-registers SIP with a
+        // fresh socket. Network changes come in bursts, so heartbeats are
+        // coalesced: at most one is in flight, and changes during it lead to
+        // one more afterwards, using the device and token current then.
+        {
+            let mut heartbeat = self
+                .heartbeat
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            heartbeat.requested = true;
+            if heartbeat.running {
+                log::debug!("Heartbeat already in flight; coalescing");
+            } else {
+                heartbeat.running = true;
+                self.spawn_heartbeats();
+            }
         }
 
         let active_count = self.calls.lock().unwrap().len();
@@ -2022,6 +2032,45 @@ impl AriaMobileEngine {
                 active_count
             );
         }
+    }
+}
+
+impl AriaMobileEngine {
+    /// Send heartbeats until no network change is waiting for one.
+    fn spawn_heartbeats(&self) {
+        let state = Arc::clone(&self.heartbeat);
+        let device_id = Arc::clone(&self.device_id);
+        let gateway = Arc::clone(&self.gateway);
+        let auth = Arc::clone(&self.auth);
+        let handler = Arc::clone(&self.events);
+        runtime().spawn(async move {
+            loop {
+                {
+                    let mut state = state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !state.requested {
+                        state.running = false;
+                        return;
+                    }
+                    state.requested = false;
+                }
+                let did = device_id
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let Some(did) = did else { continue };
+                let (tok, generation) = auth.snapshot();
+                log::info!("Sending heartbeat for device {} after network change", did);
+                match gateway.device_heartbeat(&tok, &did).await {
+                    Ok(()) => log::info!("Gateway heartbeat successful after network change"),
+                    Err(MobileError::AuthenticationError) => {
+                        report_auth_rejected(&auth, &handler, generation);
+                    }
+                    Err(e) => log::warn!("Gateway heartbeat failed: {}", e),
+                }
+            }
+        });
     }
 }
 
@@ -4165,6 +4214,34 @@ mod tests {
             assert!(engine.get_active_call().is_none(), "round {round}");
             assert!(engine.pending_outgoing.lock().unwrap().ringing.is_empty());
         }
+    }
+
+    /// A burst of network changes sends at most one heartbeat at a time,
+    /// plus one more for the changes during it, not one per change.
+    #[test]
+    fn network_change_heartbeats_are_coalesced() {
+        let gw = MockGateway::start(|req| match req.path.as_str() {
+            "/v1/devices" => (200, r#"{"device_id":"d1","status":"ok"}"#.into()),
+            _ => {
+                std::thread::sleep(Duration::from_millis(200));
+                (200, "{}".into())
+            }
+        });
+        let (engine, _) = engine(&gw.base_url);
+        engine.register_device(registration()).unwrap();
+
+        for _ in 0..50 {
+            engine.notify_network_change();
+        }
+        assert!(eventually(|| !engine.heartbeat.lock().unwrap().running));
+        let sent = count(&gw, "/v1/devices/d1/heartbeat");
+        assert!((1..=2).contains(&sent), "{sent} heartbeats for one burst");
+
+        // A later change sends a fresh one.
+        engine.notify_network_change();
+        assert!(eventually(
+            || count(&gw, "/v1/devices/d1/heartbeat") == sent + 1
+        ));
     }
 
     /// A callback that re-enters the engine must not deadlock: the handler is

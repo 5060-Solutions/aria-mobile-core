@@ -315,6 +315,9 @@ interface AriaMobileEngine {
 
     /// Notify the core of a network connectivity change.
     /// Call this from the platform when WiFi/cellular changes, or after reconnect.
+    /// Returns at once. The gateway heartbeat it triggers runs in the
+    /// background, and a burst of changes is coalesced: at most one heartbeat
+    /// is in flight, followed by one more if changes arrived meanwhile.
     void notify_network_change();
 
     // ── On-device AI ────────────────────────────────────────────────────────
