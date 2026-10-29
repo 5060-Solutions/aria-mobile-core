@@ -13,7 +13,7 @@ mod gateway_client;
 mod media;
 mod types;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -88,6 +88,14 @@ pub trait MobileEventHandler: Send + Sync + 'static {
 
 /// Active calls keyed by call_id, shared with the status-poll threads.
 type CallMap = Arc<Mutex<HashMap<String, ActiveCallState>>>;
+
+/// How many calls can be live at once: connected (held or not), outgoing and
+/// ringing, or incoming and being accepted. One call plus one waiting call.
+///
+/// Offered incoming calls are not counted. They have not been answered, so
+/// they cost no media, and the app must still be able to show (and decline)
+/// a call that arrives while two are up; only accepting it is refused.
+const MAX_LIVE_CALLS: usize = 2;
 
 /// How many remotely ended call IDs `check_remote_hangup` keeps for apps that
 /// still poll it. An event-driven app never drains the queue, so it is capped.
@@ -318,6 +326,15 @@ fn hold_others(calls: &mut HashMap<String, ActiveCallState>, keep: &str, events:
     }
 }
 
+/// How many calls count against [`MAX_LIVE_CALLS`].
+fn live_call_count(
+    calls: &HashMap<String, ActiveCallState>,
+    outgoing: &OutgoingCalls,
+    accepting: &HashSet<String>,
+) -> usize {
+    calls.len() + outgoing.ringing.len() + accepting.len()
+}
+
 /// Every live call with its creation order: connected calls and ringing
 /// outgoing ones.
 fn live_calls(
@@ -395,6 +412,10 @@ pub struct AriaMobileEngine {
     /// here to `calls` when it is answered. When both locks are held, `calls`
     /// is taken first.
     pending_outgoing: Mutex<OutgoingCalls>,
+    /// Call tokens `accept_incoming_call` is accepting, counted against
+    /// [`MAX_LIVE_CALLS`] until the call is in `calls` or the accept failed.
+    /// Lock order: `calls`, then `pending_outgoing`, then this.
+    accepting: Mutex<HashSet<String>>,
     /// Creation order of calls, for `get_calls`.
     next_seq: AtomicU64,
     /// The PBX-issued gateway token. Shared with the status-poll threads so
@@ -446,6 +467,22 @@ struct PendingIncoming {
     abandoned: bool,
     /// The watch has already rejected the abandoned call.
     rejected: bool,
+}
+
+/// A slot under [`MAX_LIVE_CALLS`] held by `accept_incoming_call` for one
+/// call token, released when dropped.
+struct AcceptReservation<'a> {
+    accepting: &'a Mutex<HashSet<String>>,
+    call_token: String,
+}
+
+impl Drop for AcceptReservation<'_> {
+    fn drop(&mut self) {
+        self.accepting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.call_token);
+    }
 }
 
 /// Coalesces network-change heartbeats.
@@ -593,6 +630,7 @@ impl AriaMobileEngine {
             calls: Arc::new(Mutex::new(HashMap::new())),
             pending_incoming: Arc::new(Mutex::new(HashMap::new())),
             pending_outgoing: Mutex::new(OutgoingCalls::default()),
+            accepting: Mutex::new(HashSet::new()),
             next_seq: AtomicU64::new(0),
             auth: Arc::new(auth::GatewayAuth::new(gateway_config.api_key)),
             device_id: Arc::new(RwLock::new(None)),
@@ -742,6 +780,8 @@ impl AriaMobileEngine {
         call_token: String,
         preferred_codecs: Vec<AudioCodec>,
     ) -> Result<CallInfo, MobileError> {
+        // Before anything else, so a refused accept has no side effects.
+        let _reservation = self.reserve_accept(&call_token)?;
         let rt = runtime();
         rt.block_on(async {
             let token = self.auth.token()?;
@@ -763,6 +803,41 @@ impl AriaMobileEngine {
 
             self.answer_offer(&token, offer, route, Some(media_session), sdp_answer)
                 .await
+        })
+    }
+
+    /// Count an accept of `call_token` against [`MAX_LIVE_CALLS`].
+    ///
+    /// Refuses (`InvalidState`) when two calls are already live, and an
+    /// accept of a call that is already being accepted or is connected.
+    /// Offered calls are not counted (see [`MAX_LIVE_CALLS`]), so the app
+    /// can still show and decline a third call; it cannot answer it until
+    /// one of the others ends.
+    fn reserve_accept(&self, call_token: &str) -> Result<AcceptReservation<'_>, MobileError> {
+        // Lock order: calls, then pending_outgoing, then accepting.
+        let calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outgoing = self
+            .pending_outgoing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut accepting = self
+            .accepting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if accepting.contains(call_token) || calls.contains_key(&format!("incoming-{call_token}")) {
+            return Err(MobileError::InvalidState);
+        }
+        if live_call_count(&calls, &outgoing, &accepting) >= MAX_LIVE_CALLS {
+            log::warn!("Refusing to accept {call_token}: {MAX_LIVE_CALLS} calls are live");
+            return Err(MobileError::InvalidState);
+        }
+        accepting.insert(call_token.to_string());
+        Ok(AcceptReservation {
+            accepting: &self.accepting,
+            call_token: call_token.to_string(),
         })
     }
 
@@ -869,6 +944,11 @@ impl AriaMobileEngine {
                 .calls
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The call now counts as connected rather than being accepted.
+            self.accepting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&call_token);
             // Queued while the call-map lock is held, so nothing done to the
             // call afterwards can be delivered ahead of it. Refused when the
             // offer was already reported ended (the caller hung up as it
@@ -989,7 +1069,9 @@ impl AriaMobileEngine {
     ///
     /// Refuses an id that is malformed, in use or used recently
     /// (`InvalidState`), and one that was hung up before the call was made
-    /// (`Cancelled`; its `Ended` has already been reported).
+    /// (`Cancelled`; its `Ended` has already been reported). Also refuses,
+    /// with `InvalidState` and without using up the id, a call that would
+    /// exceed [`MAX_LIVE_CALLS`].
     fn reserve_outgoing(
         &self,
         call_id: &str,
@@ -1015,6 +1097,17 @@ impl AriaMobileEngine {
             return Err(MobileError::InvalidState);
         }
         if calls.contains_key(call_id) || outgoing.ringing.contains_key(call_id) {
+            return Err(MobileError::InvalidState);
+        }
+        let live = {
+            let accepting = self
+                .accepting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            live_call_count(&calls, &outgoing, &accepting)
+        };
+        if live >= MAX_LIVE_CALLS {
+            log::warn!("Refusing to dial {call_id}: {MAX_LIVE_CALLS} calls are live");
             return Err(MobileError::InvalidState);
         }
         let token = self.auth.token()?;
@@ -4173,6 +4266,10 @@ mod tests {
             })
             .unwrap();
         dial(&engine).unwrap();
+        // Let the poll end that call first, so the call below is the only
+        // one up and the accept in its callback is not refused by the
+        // two-call limit before it reaches the gateway.
+        assert!(eventually(|| engine.get_calls().is_empty()));
         let stop = insert_call(&engine, "c-401", "tok-401");
         engine.start_call_status_poll(
             "c-401".into(),
@@ -4791,6 +4888,91 @@ mod tests {
         engine.calls.lock().unwrap().remove("a");
         insert_call(&engine, "a", "a");
         assert_eq!(ids(&engine.get_calls()), ["z", "m", "a"]);
+    }
+
+    #[test]
+    fn a_third_call_is_refused_without_side_effects() {
+        let gw = call_waiting_gateway();
+        let (engine, recorder) = engine(&gw.base_url);
+        insert_call(&engine, "c1", "tok-1");
+        insert_call(&engine, "c2", "tok-2");
+        let before = gw.requests().len();
+
+        let id = new_outgoing_call_id();
+        assert!(matches!(
+            dial_with_id(&engine, id.clone()),
+            Err(MobileError::InvalidState)
+        ));
+        assert!(matches!(
+            engine.accept_incoming_call("tok-3".into(), vec![]),
+            Err(MobileError::InvalidState)
+        ));
+        assert_eq!(gw.requests().len(), before, "nothing sent");
+        assert!(recorder.states().is_empty(), "nothing reported");
+        assert!(engine.accepting.lock().unwrap().is_empty());
+        assert_eq!(engine.get_calls().len(), 2);
+
+        // The refused id was not used up: once a call ends it can be dialed.
+        engine.hangup("c2".into()).unwrap();
+        assert_eq!(
+            dial_with_id(&engine, id).unwrap().state,
+            CallState::Connected
+        );
+    }
+
+    #[test]
+    fn ringing_and_accepting_calls_count_against_the_cap() {
+        let (engine, _recorder) = engine(NO_GATEWAY);
+        insert_call(&engine, "c1", "tok-1");
+        engine.reserve_outgoing("outgoing-ring", "1003").unwrap();
+        assert!(matches!(
+            engine.reserve_accept("tok-3"),
+            Err(MobileError::InvalidState)
+        ));
+        assert!(matches!(
+            engine.reserve_outgoing("outgoing-third", "1004"),
+            Err(MobileError::InvalidState)
+        ));
+
+        let (engine, _recorder) = self::engine(NO_GATEWAY);
+        insert_call(&engine, "c1", "tok-1");
+        let reservation = engine.reserve_accept("tok-2").unwrap();
+        // The same call cannot be accepted twice at once.
+        assert!(engine.reserve_accept("tok-2").is_err());
+        assert!(matches!(
+            engine.reserve_outgoing("outgoing-third", "1004"),
+            Err(MobileError::InvalidState)
+        ));
+        // A failed accept gives its slot back.
+        drop(reservation);
+        assert!(engine.reserve_outgoing("outgoing-third", "1004").is_ok());
+    }
+
+    #[test]
+    fn a_third_call_can_still_be_offered() {
+        let gw = MockGateway::start(|req| {
+            match req.path.as_str() {
+            "/v1/calls/tok-3" => (
+                200,
+                r#"{"call_token":"tok-3","caller_uri":"sip:1003@pbx","caller_name":null,"sdp_offer":"v=0"}"#
+                    .into(),
+            ),
+            _ => (200, r#"{"status":"pending"}"#.into()),
+        }
+        });
+        let (engine, _recorder) = engine(&gw.base_url);
+        insert_call(&engine, "c1", "tok-1");
+        insert_call(&engine, "c2", "tok-2");
+        let offer = engine
+            .handle_push_notification(PushCallPayload {
+                call_token: "tok-3".into(),
+                caller_uri: "sip:1003@pbx".into(),
+                caller_name: None,
+                gateway_url: gw.base_url.clone(),
+            })
+            .unwrap();
+        assert_eq!(offer.call_token, "tok-3");
+        engine.clear_pending_incoming("tok-3");
     }
 
     #[test]

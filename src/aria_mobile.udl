@@ -232,6 +232,9 @@ interface AriaMobileEngine {
     /// `NetworkError`: the gateway may have accepted it anyway), `Ended` is
     /// reported for `incoming-<call_token>`, and the core hangs the call up
     /// if it was accepted or rejects it if it still rings.
+    ///
+    /// Throws `InvalidState`, without contacting the gateway, when two calls
+    /// are already live (see `get_calls`); the call stays offered.
     [Throws=MobileError]
     CallInfo accept_incoming_call(string call_token, sequence<AudioCodec> preferred_codecs);
 
@@ -250,7 +253,8 @@ interface AriaMobileEngine {
     /// end answers or the call fails, after reporting `Ringing`.
     ///
     /// Throws `InvalidState` for a malformed id, or one that is in use or
-    /// was used recently. Because the app knows the id up front,
+    /// was used recently, and, without using the id up or reporting
+    /// anything, when two calls are already live (see `get_calls`). Because the app knows the id up front,
     /// `hangup(call_id)` works at any point:
     /// - Before this is called: `Ended` is reported at once, and this then
     ///   throws `Cancelled` without reporting anything or sending a request.
@@ -343,7 +347,10 @@ interface AriaMobileEngine {
     CallInfo? get_active_call();
 
     /// Every live call (connected, held, or outgoing and ringing), oldest
-    /// first.
+    /// first. At most two calls are live at once: a third `make_call`,
+    /// `make_call_with_id` or `accept_incoming_call` throws `InvalidState`
+    /// without side effects. Incoming calls are still offered
+    /// (`handle_push_notification`), so the app can show and reject them.
     sequence<CallInfo> get_calls();
 
     /// Get media statistics for a call.
