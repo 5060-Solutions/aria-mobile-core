@@ -12,7 +12,7 @@ mod gateway_client;
 mod media;
 mod types;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -146,11 +146,82 @@ fn take_call(calls: &CallMap, call_id: &str) -> Option<ActiveCallState> {
     Some(call)
 }
 
+/// Delivers one call's `on_call_state_changed` events in order, and nothing
+/// after its `Ended`.
+///
+/// Events for a call can be raised on different threads at once, such as
+/// `make_call` reporting `Connected` while `hangup` reports `Ended`. Deciding
+/// who owns a transition under the call-map lock is not enough on its own:
+/// the callbacks run outside the lock, so the two could still reach the app in
+/// either order. Each event is queued here under a per-call lock, and one
+/// thread at a time delivers the queue, so the app sees events in the order
+/// they were raised. An event raised after `Ended` is dropped.
+///
+/// No lock is held while a callback runs, so a callback can call back into the
+/// engine. An event it raises for the same call is delivered as soon as the
+/// callback returns, as is one raised on another thread while a callback for
+/// that call is running.
+#[derive(Default)]
+struct CallEvents {
+    inner: Mutex<CallEventsInner>,
+}
+
+#[derive(Default)]
+struct CallEventsInner {
+    ended: bool,
+    delivering: bool,
+    queue: VecDeque<CallInfo>,
+}
+
+impl CallEvents {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CallEventsInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Queue `info` for delivery. Returns false, delivering nothing, when the
+    /// call has already been reported `Ended`.
+    fn emit(&self, slot: &HandlerSlot, info: CallInfo) -> bool {
+        {
+            let mut inner = self.lock();
+            if inner.ended {
+                return false;
+            }
+            inner.ended = info.state == CallState::Ended;
+            inner.queue.push_back(info);
+            if inner.delivering {
+                return true;
+            }
+            inner.delivering = true;
+        }
+        loop {
+            let next = {
+                let mut inner = self.lock();
+                match inner.queue.pop_front() {
+                    Some(next) => next,
+                    None => {
+                        inner.delivering = false;
+                        break;
+                    }
+                }
+            };
+            emit_call_state_to(slot, &next);
+        }
+        true
+    }
+
+    /// Report `info` as `Ended`.
+    fn emit_ended(&self, slot: &HandlerSlot, info: &CallInfo) -> bool {
+        let mut info = info.clone();
+        info.state = CallState::Ended;
+        self.emit(slot, info)
+    }
+}
+
 /// Report a call that has been taken out of the map as ended.
 fn emit_ended(slot: &HandlerSlot, call: &ActiveCallState) {
-    let mut info = call.info.clone();
-    info.state = CallState::Ended;
-    emit_call_state_to(slot, &info);
+    call.events.emit_ended(slot, &call.info);
 }
 
 /// Tear a call down locally and emit `Ended`, unless it was already gone.
@@ -227,6 +298,8 @@ struct ActiveCallState {
     call_token: Option<String>,
     /// Set to true to stop the status polling loop
     poll_stop: Arc<AtomicBool>,
+    /// Orders this call's events and stops anything after `Ended`.
+    events: Arc<CallEvents>,
 }
 
 impl AriaMobileEngine {
@@ -258,10 +331,6 @@ impl AriaMobileEngine {
     pub fn set_audio_bridge(&self, bridge: Box<dyn media::PlatformAudioBridge>) {
         let mut ab = self.audio_bridge.write().unwrap();
         *ab = Some(Arc::from(bridge));
-    }
-
-    fn emit_call_state(&self, info: &CallInfo) {
-        emit_call_state_to(&self.event_handler, info);
     }
 
     #[allow(dead_code)]
@@ -449,6 +518,7 @@ impl AriaMobileEngine {
             }
 
             let poll_stop = Arc::new(AtomicBool::new(false));
+            let events = Arc::new(CallEvents::default());
 
             {
                 let mut calls = self.calls.lock().unwrap();
@@ -459,6 +529,7 @@ impl AriaMobileEngine {
                         media: Some(media_session),
                         call_token: Some(call_token.clone()),
                         poll_stop: poll_stop.clone(),
+                        events: Arc::clone(&events),
                     },
                 );
             }
@@ -466,7 +537,7 @@ impl AriaMobileEngine {
             // Start polling for remote hangup
             // Report Connected before the poll starts, so a remote hangup
             // can never be reported ahead of it.
-            self.emit_call_state(&info);
+            events.emit(&self.event_handler, info.clone());
             self.start_call_status_poll(call_id.clone(), call_token, poll_stop);
             Ok(info)
         })
@@ -506,6 +577,7 @@ impl AriaMobileEngine {
             let call_id = format!("outgoing-{}", uuid::Uuid::new_v4().as_simple());
 
             // Emit ringing state so UI updates immediately
+            let events = Arc::new(CallEvents::default());
             let mut info = CallInfo {
                 call_id: call_id.clone(),
                 remote_uri: uri.clone(),
@@ -516,7 +588,7 @@ impl AriaMobileEngine {
                 on_hold: false,
                 duration_secs: 0,
             };
-            self.emit_call_state(&info);
+            events.emit(&self.event_handler, info.clone());
 
             // Route the call through the gateway B2BUA — it sends the SIP
             // INVITE on our behalf and returns the SDP answer + call_token.
@@ -531,8 +603,7 @@ impl AriaMobileEngine {
             {
                 Ok(answer) => answer,
                 Err(e) => {
-                    info.state = CallState::Ended;
-                    self.emit_call_state(&info);
+                    events.emit_ended(&self.event_handler, &info);
                     return Err(e);
                 }
             };
@@ -571,6 +642,7 @@ impl AriaMobileEngine {
                         media: Some(media_session),
                         call_token: Some(call_token.clone()),
                         poll_stop: poll_stop.clone(),
+                        events: Arc::clone(&events),
                     },
                 );
             }
@@ -578,7 +650,7 @@ impl AriaMobileEngine {
             // Start polling for remote hangup
             // Report Connected before the poll starts, so a remote hangup
             // can never be reported ahead of it.
-            self.emit_call_state(&info);
+            events.emit(&self.event_handler, info.clone());
             self.start_call_status_poll(call_id.clone(), call_token, poll_stop);
             log::info!("Outgoing call to {} connected via gateway", uri);
 
@@ -663,9 +735,9 @@ impl AriaMobileEngine {
         }
 
         call.info.muted = muted;
-        let info = call.info.clone();
+        let (info, events) = (call.info.clone(), Arc::clone(&call.events));
         drop(calls);
-        self.emit_call_state(&info);
+        events.emit(&self.event_handler, info);
         Ok(())
     }
 
@@ -683,9 +755,9 @@ impl AriaMobileEngine {
         } else {
             CallState::Connected
         };
-        let info = call.info.clone();
+        let (info, events) = (call.info.clone(), Arc::clone(&call.events));
         drop(calls);
-        self.emit_call_state(&info);
+        events.emit(&self.event_handler, info);
         Ok(())
     }
 
@@ -1334,6 +1406,7 @@ mod tests {
                 media: None,
                 call_token: Some(call_token.to_string()),
                 poll_stop: Arc::clone(&poll_stop),
+                events: Arc::default(),
             },
         );
         poll_stop
@@ -1782,6 +1855,72 @@ mod tests {
         assert_eq!(recorder.auth_required(), 1);
         assert!(recorder.states().is_empty());
         engine.clear_pending_incoming("tok-5");
+    }
+
+    #[test]
+    fn call_events_stop_after_ended() {
+        let (engine, recorder) = engine(NO_GATEWAY);
+        let events = CallEvents::default();
+        let info = |state| CallInfo {
+            call_id: "c1".into(),
+            remote_uri: String::new(),
+            remote_name: None,
+            state,
+            direction: CallDirection::Outbound,
+            muted: false,
+            on_hold: false,
+            duration_secs: 0,
+        };
+        assert!(events.emit(&engine.event_handler, info(CallState::Ringing)));
+        assert!(events.emit(&engine.event_handler, info(CallState::Ended)));
+        assert!(!events.emit(&engine.event_handler, info(CallState::Connected)));
+        assert!(!events.emit(&engine.event_handler, info(CallState::Ended)));
+        let states: Vec<_> = recorder.states().iter().map(|i| i.state).collect();
+        assert_eq!(states, [CallState::Ringing, CallState::Ended]);
+    }
+
+    /// An event raised from inside a callback for the same call is delivered
+    /// after that callback returns, not nested inside it.
+    #[test]
+    fn call_events_raised_from_a_callback_keep_their_order() {
+        struct HangUpOnConnected {
+            engine: Arc<AriaMobileEngine>,
+            order: Arc<Mutex<Vec<(CallState, bool)>>>,
+            in_callback: AtomicBool,
+        }
+        impl MobileEventHandler for HangUpOnConnected {
+            fn on_registration_changed(&self, _: String, _: String, _: Option<String>) {}
+            fn on_incoming_call(&self, _: CallOffer) {}
+            fn on_call_state_changed(&self, info: CallInfo) {
+                let nested = self.in_callback.swap(true, Ordering::SeqCst);
+                self.order.lock().unwrap().push((info.state, nested));
+                if info.state == CallState::Connected {
+                    let _ = self.engine.hangup(info.call_id);
+                }
+                self.in_callback.store(nested, Ordering::SeqCst);
+            }
+            fn on_media_stats(&self, _: String, _: MediaStats) {}
+            fn on_error(&self, _: String, _: String) {}
+            fn on_auth_required(&self) {}
+        }
+
+        let gw = MockGateway::start(|_| (200, "{}".into()));
+        let (engine, _) = engine(&gw.base_url);
+        let engine = Arc::new(engine);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        engine.set_event_handler(Box::new(HangUpOnConnected {
+            engine: Arc::clone(&engine),
+            order: Arc::clone(&order),
+            in_callback: AtomicBool::new(false),
+        }));
+        insert_call(&engine, "c1", "tok");
+        engine.set_hold("c1".into(), false).unwrap();
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            [(CallState::Connected, false), (CallState::Ended, false)]
+        );
+        engine.event_handler.write().unwrap().take();
     }
 
     /// A callback that re-enters the engine must not deadlock: the handler is

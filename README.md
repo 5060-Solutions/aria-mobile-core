@@ -129,7 +129,7 @@ Apps can be fully event-driven: install a `MobileEventHandler` with `set_event_h
 | Remote hangup (BYE) | `Ended`, emitted by the core within about 2 s of the gateway seeing the BYE. No app polling is needed. |
 | Blind transfer | `Ended` once the gateway accepts `transfer_call`. |
 
-**Guarantees.** Each `call_id` that has been reported receives exactly one `Ended`, and nothing after it, whichever of the causes above wins a race. Events triggered by an engine method are emitted before that method returns; remote hangup and caller cancel arrive asynchronously.
+**Guarantees.** Each `call_id` that has been reported receives exactly one `Ended`, and nothing after it, whichever of the causes above wins a race. A call's events are delivered one at a time and in the order the core raised them, even when they are raised on different threads. Events triggered by an engine method are emitted before that method returns, with two exceptions: an event raised from inside a callback for the same call (for example `hangup` called from the `Connected` callback) is delivered right after that callback returns, and an event raised while another thread is delivering one for the same call is delivered by that thread right after it. Remote hangup and caller cancel arrive asynchronously.
 
 **Not carried by events.** `CallInfo` has no end reason; the app knows when it hung up or transferred, and any other `Ended` came from the far side. `duration_secs` is not maintained by the core, so time calls from the `Connected` event.
 
