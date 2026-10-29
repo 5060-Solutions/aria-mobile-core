@@ -145,6 +145,11 @@ struct MakeCallRequest {
     sip_display_name: String,
 }
 
+#[derive(Serialize)]
+struct TransferCallRequest<'a> {
+    target: &'a str,
+}
+
 #[derive(Deserialize)]
 struct MakeCallResponse {
     call_token: String,
@@ -625,6 +630,41 @@ impl GatewayClient {
 
         Ok(())
     }
+
+    /// Blind-transfer an active call via the gateway, which sends a SIP REFER
+    /// to the PBX.
+    ///
+    /// Status mapping: 202 (or any 2xx) is success; 400 means the gateway
+    /// refused the target; 404 means the gateway does not know the call token
+    /// (or, on a gateway that predates the route, the route itself); 502 means
+    /// the PBX rejected the REFER.
+    pub async fn transfer_call(
+        &self,
+        token: &str,
+        call_token: &str,
+        target: &str,
+    ) -> Result<(), MobileError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/v1/calls/{}/transfer", call_token)))
+            .bearer_auth(token)
+            .json(&TransferCallRequest { target })
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        log::error!("Transfer call failed: {}", status);
+        Err(match status.as_u16() {
+            400 => MobileError::InvalidTarget,
+            401 | 403 => MobileError::AuthenticationError,
+            404 => MobileError::InvalidState,
+            502 => MobileError::CallFailed,
+            _ => MobileError::GatewayError,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -711,5 +751,64 @@ mod enforce_https_tests {
             enforce_https("https://gw.example.com/v1".to_string()),
             "https://gw.example.com/v1"
         );
+    }
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::GatewayClient;
+    use crate::mock_gateway::MockGateway;
+    use crate::types::MobileError;
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn transfer_posts_the_target_to_the_call_route() {
+        let gw = MockGateway::start(|_| (202, "{}".into()));
+        let client = GatewayClient::new(gw.base_url.clone(), "key".into());
+
+        block_on(client.transfer_call("jwt", "tok-1", "sip:1002@pbx.example.com")).unwrap();
+
+        let reqs = gw.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/v1/calls/tok-1/transfer");
+        assert_eq!(reqs[0].authorization.as_deref(), Some("Bearer jwt"));
+        let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "target": "sip:1002@pbx.example.com" })
+        );
+    }
+
+    #[test]
+    fn transfer_maps_gateway_statuses_to_errors() {
+        let cases = [
+            (400, "InvalidTarget"),
+            (401, "AuthenticationError"),
+            (404, "InvalidState"),
+            (502, "CallFailed"),
+            (500, "GatewayError"),
+        ];
+        for (status, expected) in cases {
+            let gw = MockGateway::start(move |_| (status, "{}".into()));
+            let client = GatewayClient::new(gw.base_url.clone(), "key".into());
+            let err = block_on(client.transfer_call("jwt", "tok", "1002")).unwrap_err();
+            let got = match err {
+                MobileError::InvalidTarget => "InvalidTarget",
+                MobileError::AuthenticationError => "AuthenticationError",
+                MobileError::InvalidState => "InvalidState",
+                MobileError::CallFailed => "CallFailed",
+                MobileError::GatewayError => "GatewayError",
+                other => panic!("unexpected error for {status}: {other:?}"),
+            };
+            assert_eq!(got, expected, "HTTP {status}");
+        }
     }
 }

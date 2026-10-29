@@ -115,6 +115,10 @@ callback interface PlatformAudioBridge {
 };
 
 /// Callback interface for receiving events from the Rust core.
+///
+/// Callbacks can arrive on any thread, including background poll threads, and
+/// must not block for long. They may call back into the engine. See the
+/// "Event contract" section of the README for the guaranteed sequence.
 callback interface MobileEventHandler {
     /// Called when registration state changes.
     void on_registration_changed(string device_id, string status, string? error);
@@ -122,7 +126,9 @@ callback interface MobileEventHandler {
     /// Called when an incoming call arrives (via push notification).
     void on_incoming_call(CallOffer offer);
 
-    /// Called when call state changes.
+    /// Called when call state changes. Every call_id that has been reported
+    /// gets exactly one final `Ended`, whoever ended the call (local hangup,
+    /// remote hangup, transfer, caller cancel, or a failed outgoing call).
     void on_call_state_changed(CallInfo info);
 
     /// Called when media statistics are updated.
@@ -183,6 +189,18 @@ interface AriaMobileEngine {
     /// Hang up an active call.
     [Throws=MobileError]
     void hangup(string call_id);
+
+    /// Blind-transfer an active call to `target` (a dial string such as
+    /// "1002" or a "sip:" URI). The PBX takes the call over; on success the
+    /// local call and its media end, and `on_call_state_changed` reports
+    /// `Ended` for `call_id`, exactly as for a remote hangup.
+    ///
+    /// Errors leave the call up: `InvalidTarget` for a target rejected locally
+    /// or by the gateway, `InvalidState` for an unknown call (or a gateway that
+    /// does not know the call or the transfer route), `CallFailed` when the
+    /// PBX refused the transfer.
+    [Throws=MobileError]
+    void transfer_call(string call_id, string target);
 
     /// Set mute state.
     [Throws=MobileError]
@@ -288,7 +306,11 @@ interface AriaMobileEngine {
 
     /// Check if any active call was ended by the remote party.
     /// Returns the call_id if detected, null otherwise.
-    /// The app should call this periodically from a UI timer (~2s).
+    ///
+    /// Kept for apps that poll. The core now detects a remote hangup itself
+    /// and reports it through `on_call_state_changed` (`Ended`) before the
+    /// call_id appears here, so an app using the event handler does not need
+    /// to call this. Only the most recent 16 IDs are retained.
     string? check_remote_hangup();
 };
 
@@ -369,4 +391,7 @@ enum MobileError {
     "InvalidState",
     "GatewayError",
     "Timeout",
+    /// A transfer target was empty, contained characters that are not allowed
+    /// in a SIP URI header (CR, LF, '<', '>'), or was refused by the gateway.
+    "InvalidTarget",
 };

@@ -170,6 +170,8 @@ pub enum MobileError {
     GatewayError,
     #[error("Timeout")]
     Timeout,
+    #[error("Invalid target")]
+    InvalidTarget,
 }
 
 impl From<reqwest::Error> for MobileError {

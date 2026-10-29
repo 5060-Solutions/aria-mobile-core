@@ -82,17 +82,118 @@ pub trait MobileEventHandler: Send + Sync + 'static {
     fn on_error(&self, context: String, message: String);
 }
 
+/// The installed event handler, shared with the background status-poll
+/// threads so they can report a remote hangup themselves.
+type HandlerSlot = Arc<RwLock<Option<Arc<dyn MobileEventHandler>>>>;
+
+/// Active calls keyed by call_id, shared with the status-poll threads.
+type CallMap = Arc<Mutex<HashMap<String, ActiveCallState>>>;
+
+/// How many remotely ended call IDs `check_remote_hangup` keeps for apps that
+/// still poll it. An event-driven app never drains the queue, so it is capped.
+const REMOTE_ENDED_BACKLOG: usize = 16;
+
+/// How long an unanswered incoming call is watched for a caller cancel before
+/// the watch gives up. Well past any ring timeout a PBX would apply.
+const PENDING_INCOMING_MAX_WATCH: Duration = Duration::from_secs(10 * 60);
+
+/// How often a call's status is polled at the gateway.
+const CALL_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Invoke the platform handler, if one is installed.
+///
+/// The handler is cloned out of the lock before it is called, so a callback
+/// that re-enters the engine (including `set_event_handler`) cannot deadlock,
+/// and a poisoned lock is recovered rather than panicking across the FFI
+/// boundary. The callback runs inside `catch_unwind` so a panicking host
+/// callback cannot unwind across FFI.
+fn with_handler(slot: &HandlerSlot, f: impl FnOnce(&dyn MobileEventHandler)) {
+    let handler = slot
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(handler) = handler {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(handler.as_ref())));
+    }
+}
+
+fn emit_call_state_to(slot: &HandlerSlot, info: &CallInfo) {
+    let info = info.clone();
+    with_handler(slot, |h| h.on_call_state_changed(info));
+}
+
+/// Remove a call from the map and stop its status poll and media.
+///
+/// Removal is the single point that decides who ends a call: whichever of
+/// local hangup, transfer, or the remote-hangup poll removes the entry first
+/// owns the `Ended` event, so it fires exactly once per call.
+fn take_call(calls: &CallMap, call_id: &str) -> Option<ActiveCallState> {
+    let mut call = calls
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(call_id)?;
+    call.poll_stop.store(true, Ordering::Relaxed);
+    if let Some(media) = call.media.take() {
+        media.stop();
+    }
+    Some(call)
+}
+
+/// Report a call that has been taken out of the map as ended.
+fn emit_ended(slot: &HandlerSlot, call: &ActiveCallState) {
+    let mut info = call.info.clone();
+    info.state = CallState::Ended;
+    emit_call_state_to(slot, &info);
+}
+
+/// Tear a call down locally and emit `Ended`, unless it was already gone.
+/// Returns whether this call did the teardown.
+fn end_call_locally(calls: &CallMap, slot: &HandlerSlot, call_id: &str) -> bool {
+    match take_call(calls, call_id) {
+        Some(call) => {
+            emit_ended(slot, &call);
+            true
+        }
+        None => false,
+    }
+}
+
+/// A call status that means the gateway no longer has a live call.
+fn status_means_ended(status: &str) -> bool {
+    status == "ended" || status == "unknown"
+}
+
+/// Check a blind-transfer target before it is sent to the gateway.
+///
+/// The gateway places the target in a SIP Refer-To header. CR/LF would let a
+/// caller inject headers, and angle brackets would break out of the
+/// `<...>` that wraps the URI, so both are refused here.
+fn validate_transfer_target(target: &str) -> Result<(), MobileError> {
+    if target.trim().is_empty() {
+        return Err(MobileError::InvalidTarget);
+    }
+    if target.chars().any(|c| matches!(c, '\r' | '\n' | '<' | '>')) {
+        return Err(MobileError::InvalidTarget);
+    }
+    Ok(())
+}
+
 // ── Main Engine ─────────────────────────────────────────────────────────────
 
 pub struct AriaMobileEngine {
     gateway: gateway_client::GatewayClient,
-    event_handler: RwLock<Option<Box<dyn MobileEventHandler>>>,
+    event_handler: HandlerSlot,
     /// Platform audio bridge for mic/speaker I/O
     audio_bridge: RwLock<Option<Arc<dyn media::PlatformAudioBridge>>>,
     /// Active calls keyed by call_id
-    calls: Mutex<HashMap<String, ActiveCallState>>,
-    /// Auth token from gateway
-    auth_token: RwLock<Option<String>>,
+    calls: CallMap,
+    /// Incoming calls that have been offered but not yet accepted or
+    /// rejected, keyed by call_token, each with the stop flag of the poll
+    /// that watches for the caller cancelling.
+    pending_incoming: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// Auth token from gateway. Shared with the status-poll threads so they
+    /// pick up a refreshed token instead of polling with a stale one.
+    auth_token: Arc<RwLock<Option<String>>>,
     /// Deadline after which `auth_token` is considered expired, computed from
     /// the gateway's `expires_in`. `None` means "unknown lifetime" (e.g. an
     /// app-supplied JWT) and disables automatic refresh.
@@ -109,8 +210,11 @@ pub struct AriaMobileEngine {
     /// the full SIP credentials.
     last_registration: RwLock<Option<DeviceRegistration>>,
     /// Call IDs that were ended by the remote party (detected via polling).
-    /// The app checks this via `check_remote_hangup()`.
+    /// Kept for apps that still poll `check_remote_hangup()`; the `Ended`
+    /// event has already been emitted by the time an ID lands here.
     remote_ended: Arc<Mutex<Vec<String>>>,
+    /// Interval between call-status polls. A field so tests can shorten it.
+    poll_interval: Duration,
 }
 
 struct ActiveCallState {
@@ -129,22 +233,27 @@ impl AriaMobileEngine {
                 gateway_config.base_url,
                 gateway_config.api_key,
             ),
-            event_handler: RwLock::new(None),
+            event_handler: Arc::new(RwLock::new(None)),
             audio_bridge: RwLock::new(None),
-            calls: Mutex::new(HashMap::new()),
-            auth_token: RwLock::new(None),
+            calls: Arc::new(Mutex::new(HashMap::new())),
+            pending_incoming: Arc::new(Mutex::new(HashMap::new())),
+            auth_token: Arc::new(RwLock::new(None)),
             token_expires_at: RwLock::new(None),
             device_id: RwLock::new(None),
             ai: RwLock::new(None),
             codec_prefs: RwLock::new(vec![AudioCodec::Opus, AudioCodec::Pcmu, AudioCodec::Pcma]),
             last_registration: RwLock::new(None),
             remote_ended: Arc::new(Mutex::new(Vec::new())),
+            poll_interval: CALL_STATUS_POLL_INTERVAL,
         }
     }
 
     pub fn set_event_handler(&self, handler: Box<dyn MobileEventHandler>) {
-        let mut eh = self.event_handler.write().unwrap();
-        *eh = Some(handler);
+        let mut eh = self
+            .event_handler
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *eh = Some(Arc::from(handler));
     }
 
     pub fn set_audio_bridge(&self, bridge: Box<dyn media::PlatformAudioBridge>) {
@@ -153,34 +262,13 @@ impl AriaMobileEngine {
     }
 
     fn emit_call_state(&self, info: &CallInfo) {
-        // Recover from a poisoned lock rather than panicking across the FFI
-        // boundary, and run the foreign callback inside catch_unwind so a
-        // panicking host callback cannot unwind across FFI (UB) or poison the
-        // lock for every subsequent caller.
-        let guard = self
-            .event_handler
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(handler) = guard.as_ref() {
-            let info = info.clone();
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handler.on_call_state_changed(info);
-            }));
-        }
+        emit_call_state_to(&self.event_handler, info);
     }
 
     #[allow(dead_code)]
     fn emit_error(&self, context: &str, message: &str) {
-        let guard = self
-            .event_handler
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(handler) = guard.as_ref() {
-            let (context, message) = (context.to_string(), message.to_string());
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handler.on_error(context, message);
-            }));
-        }
+        let (context, message) = (context.to_string(), message.to_string());
+        with_handler(&self.event_handler, |h| h.on_error(context, message));
     }
 
     fn get_token(&self) -> Result<String, MobileError> {
@@ -315,13 +403,10 @@ impl AriaMobileEngine {
                 *d = Some(resp.device_id.clone());
             }
 
-            if let Some(handler) = self.event_handler.read().unwrap().as_ref() {
-                handler.on_registration_changed(
-                    resp.device_id.clone(),
-                    "registered".to_string(),
-                    None,
-                );
-            }
+            let device_id = resp.device_id.clone();
+            with_handler(&self.event_handler, |h| {
+                h.on_registration_changed(device_id, "registered".to_string(), None);
+            });
 
             Ok(resp)
         })
@@ -338,9 +423,9 @@ impl AriaMobileEngine {
                 *d = None;
             }
 
-            if let Some(handler) = self.event_handler.read().unwrap().as_ref() {
-                handler.on_registration_changed(device_id, "unregistered".to_string(), None);
-            }
+            with_handler(&self.event_handler, |h| {
+                h.on_registration_changed(device_id, "unregistered".to_string(), None);
+            });
 
             Ok(())
         })
@@ -381,9 +466,13 @@ impl AriaMobileEngine {
                 .get_call_offer(&token, &payload.call_token)
                 .await?;
 
-            if let Some(handler) = self.event_handler.read().unwrap().as_ref() {
-                handler.on_incoming_call(offer.clone());
-            }
+            // Watch for the caller giving up before the user answers. A push
+            // can be delivered more than once for the same call; only one
+            // watcher runs per call_token.
+            self.start_pending_incoming_poll(&offer);
+
+            let for_handler = offer.clone();
+            with_handler(&self.event_handler, |h| h.on_incoming_call(for_handler));
 
             Ok(offer)
         })
@@ -415,6 +504,7 @@ impl AriaMobileEngine {
             self.gateway
                 .accept_call(&token, &call_token, &sdp_answer)
                 .await?;
+            self.clear_pending_incoming(&call_token);
 
             // Use the full call token, not a truncated prefix: two concurrent
             // incoming calls whose tokens share the first 8 chars would collide
@@ -465,9 +555,10 @@ impl AriaMobileEngine {
             }
 
             // Start polling for remote hangup
-            self.start_call_status_poll(call_id.clone(), call_token, poll_stop);
-
+            // Report Connected before the poll starts, so a remote hangup
+            // can never be reported ahead of it.
             self.emit_call_state(&info);
+            self.start_call_status_poll(call_id.clone(), call_token, poll_stop);
             Ok(info)
         })
     }
@@ -477,6 +568,7 @@ impl AriaMobileEngine {
         rt.block_on(async {
             let token = self.ensure_valid_token().await?;
             self.gateway.reject_call(&token, &call_token).await?;
+            self.clear_pending_incoming(&call_token);
             Ok(())
         })
     }
@@ -519,10 +611,22 @@ impl AriaMobileEngine {
 
             // Route the call through the gateway B2BUA — it sends the SIP
             // INVITE on our behalf and returns the SDP answer + call_token.
-            let (call_token, sdp_answer) = self
+            //
+            // `Ringing` has already been reported for this call_id, so a
+            // failure here must close it with `Ended`; otherwise an
+            // event-driven app is left showing a call that never connects.
+            let (call_token, sdp_answer) = match self
                 .gateway
                 .make_call(&token, &uri, &sdp_offer, &credentials)
-                .await?;
+                .await
+            {
+                Ok(answer) => answer,
+                Err(e) => {
+                    info.state = CallState::Ended;
+                    self.emit_call_state(&info);
+                    return Err(e);
+                }
+            };
 
             // Parse the SDP answer to get the remote RTP address
             if let Some((remote_addr, _codec)) = media::parse_sdp_remote_pub(&sdp_answer) {
@@ -563,9 +667,10 @@ impl AriaMobileEngine {
             }
 
             // Start polling for remote hangup
-            self.start_call_status_poll(call_id.clone(), call_token, poll_stop);
-
+            // Report Connected before the poll starts, so a remote hangup
+            // can never be reported ahead of it.
             self.emit_call_state(&info);
+            self.start_call_status_poll(call_id.clone(), call_token, poll_stop);
             log::info!("Outgoing call to {} connected via gateway", uri);
 
             Ok(info)
@@ -577,22 +682,9 @@ impl AriaMobileEngine {
     pub fn hangup(&self, call_id: String) -> Result<(), MobileError> {
         let rt = runtime();
         rt.block_on(async {
-            let call = {
-                let mut calls = self.calls.lock().unwrap();
-                calls.remove(&call_id)
-            };
-
-            let Some(mut call) = call else {
-                return Err(MobileError::InvalidState);
-            };
-
-            // Stop status polling
-            call.poll_stop.store(true, Ordering::Relaxed);
-
-            // Stop media
-            if let Some(media) = call.media.take() {
-                media.stop();
-            }
+            // Taking the call out of the map stops its poll and media, and
+            // means a racing remote-hangup poll cannot also report it.
+            let call = take_call(&self.calls, &call_id).ok_or(MobileError::InvalidState)?;
 
             // If gateway-routed, send hangup to gateway
             if let Some(call_token) = &call.call_token {
@@ -601,10 +693,45 @@ impl AriaMobileEngine {
                 }
             }
 
-            let mut info = call.info.clone();
-            info.state = CallState::Ended;
-            self.emit_call_state(&info);
+            emit_ended(&self.event_handler, &call);
 
+            Ok(())
+        })
+    }
+
+    /// Blind-transfer an active call to `target`.
+    ///
+    /// The gateway sends the REFER; once it has accepted the transfer this
+    /// handset is out of the call, so the local call and media are torn down
+    /// and `Ended` is emitted exactly as for a remote hangup. On any error the
+    /// call is left as it was.
+    pub fn transfer_call(&self, call_id: String, target: String) -> Result<(), MobileError> {
+        let target = target.trim();
+        validate_transfer_target(target)?;
+
+        let call_token = {
+            let calls = self
+                .calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let call = calls.get(&call_id).ok_or(MobileError::InvalidState)?;
+            // Only gateway-routed calls can be transferred: the REFER is sent
+            // by the gateway on the call it holds.
+            call.call_token.clone().ok_or(MobileError::InvalidState)?
+        };
+
+        let rt = runtime();
+        rt.block_on(async {
+            let token = self.ensure_valid_token().await?;
+            self.gateway
+                .transfer_call(&token, &call_token, target)
+                .await?;
+            log::info!("Call {} transferred", call_id);
+
+            // The PBX may already have sent the BYE that ends our leg, in which
+            // case the status poll has torn the call down and reported it.
+            // Either way `Ended` is emitted once.
+            end_call_locally(&self.calls, &self.event_handler, &call_id);
             Ok(())
         })
     }
@@ -657,41 +784,62 @@ impl AriaMobileEngine {
 
     // ── Call Status Polling ────────────────────────────────────────
 
-    /// Spawn a background task that polls the gateway for call status changes.
-    /// Detects remote hangup (BYE from PBX) and ends the local call.
-    fn start_call_status_poll(&self, call_id: String, call_token: String, stop: Arc<AtomicBool>) {
+    /// Spawn a background thread that polls the gateway for a call's status
+    /// every `poll_interval` until `stop` is set, `on_status` returns true, or
+    /// `max_age` (when given) has elapsed.
+    ///
+    /// The thread reads the current auth token on every poll, so a token
+    /// refreshed by another call is picked up rather than polling with an
+    /// expired one.
+    fn spawn_status_poll(
+        &self,
+        call_token: String,
+        stop: Arc<AtomicBool>,
+        max_age: Option<Duration>,
+        mut on_status: impl FnMut(&CallStatusResponse) -> bool + Send + 'static,
+    ) {
+        let started = Instant::now();
         let base_url = self.gateway.base_url().to_string();
         let api_key = self.gateway.api_key().to_string();
-        let auth_token = self.auth_token.read().unwrap().clone().unwrap_or_default();
-        let remote_ended = Arc::clone(&self.remote_ended);
+        let auth_token = Arc::clone(&self.auth_token);
+        let interval = self.poll_interval;
 
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .unwrap();
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    log::error!("Could not start call status poll: {}", e);
+                    return;
+                }
+            };
 
             let gateway = gateway_client::GatewayClient::new(base_url, api_key);
 
             rt.block_on(async {
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    tokio::time::sleep(interval).await;
 
                     if stop.load(Ordering::Relaxed) {
-                        log::debug!("Call status poll stopped for {}", call_id);
+                        log::debug!("Call status poll stopped for {}", call_token);
+                        break;
+                    }
+                    if max_age.is_some_and(|age| started.elapsed() >= age) {
+                        log::debug!("Call status poll expired for {}", call_token);
                         break;
                     }
 
-                    match gateway.get_call_status(&auth_token, &call_token).await {
+                    let token = auth_token
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone()
+                        .unwrap_or_default();
+                    match gateway.get_call_status(&token, &call_token).await {
                         Ok(status) => {
-                            if status.status == "ended" || status.status == "unknown" {
-                                log::info!(
-                                    "Remote hangup detected for {} (reason: {:?})",
-                                    call_id,
-                                    status.reason,
-                                );
+                            if on_status(&status) {
                                 stop.store(true, Ordering::Relaxed);
-                                remote_ended.lock().unwrap().push(call_id.clone());
                                 break;
                             }
                         }
@@ -702,6 +850,133 @@ impl AriaMobileEngine {
                 }
             });
         });
+    }
+
+    /// Poll an established call for a remote hangup (BYE from the PBX).
+    ///
+    /// When the gateway reports the call gone, the poll thread tears the call
+    /// down and emits `Ended` itself, so apps learn of a remote hangup through
+    /// `on_call_state_changed` without polling `check_remote_hangup`.
+    fn start_call_status_poll(&self, call_id: String, call_token: String, stop: Arc<AtomicBool>) {
+        let calls = Arc::clone(&self.calls);
+        let handler = Arc::clone(&self.event_handler);
+        let remote_ended = Arc::clone(&self.remote_ended);
+
+        self.spawn_status_poll(call_token, stop, None, move |status| {
+            if !status_means_ended(&status.status) {
+                return false;
+            }
+            log::info!(
+                "Remote hangup detected for {} (reason: {:?})",
+                call_id,
+                status.reason,
+            );
+            if end_call_locally(&calls, &handler, &call_id) {
+                let mut ended = remote_ended
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                ended.push(call_id.clone());
+                if ended.len() > REMOTE_ENDED_BACKLOG {
+                    let excess = ended.len() - REMOTE_ENDED_BACKLOG;
+                    ended.drain(..excess);
+                }
+            }
+            true
+        });
+    }
+
+    /// Watch an offered incoming call for the caller hanging up before it is
+    /// answered (a CANCEL at the PBX).
+    ///
+    /// If that happens while the call is still unanswered, `Ended` is emitted
+    /// for the call_id the call would have had (`incoming-<call_token>`), so
+    /// the app can dismiss its ringing UI. The watch stops as soon as the call
+    /// is accepted or rejected.
+    fn start_pending_incoming_poll(&self, offer: &CallOffer) {
+        let call_token = offer.call_token.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let mut pending = self
+                .pending_incoming
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pending.contains_key(&call_token) {
+                return;
+            }
+            pending.insert(call_token.clone(), Arc::clone(&stop));
+        }
+
+        let info = CallInfo {
+            call_id: format!("incoming-{call_token}"),
+            remote_uri: offer.caller_uri.clone(),
+            remote_name: offer.caller_name.clone(),
+            state: CallState::Ended,
+            direction: CallDirection::Inbound,
+            muted: false,
+            on_hold: false,
+            duration_secs: 0,
+        };
+        let pending = Arc::clone(&self.pending_incoming);
+        let handler = Arc::clone(&self.event_handler);
+        let token = call_token.clone();
+        // While the gateway hands a call from pending to active it can briefly
+        // report "unknown", so only several in a row count as gone. "ended" is
+        // definitive: the gateway records a CANCEL that way.
+        let mut unknown_streak = 0u32;
+
+        let deadline = Some(PENDING_INCOMING_MAX_WATCH);
+        self.spawn_status_poll(call_token, stop, deadline, move |status| {
+            let gone = match status.status.as_str() {
+                "ended" => true,
+                "unknown" => {
+                    unknown_streak += 1;
+                    unknown_streak >= 3
+                }
+                // Answered, here or on another device: nothing to report.
+                "active" => {
+                    pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&token);
+                    return true;
+                }
+                _ => {
+                    unknown_streak = 0;
+                    false
+                }
+            };
+            if !gone {
+                return false;
+            }
+            // Removing the entry decides the race with accept/reject: if they
+            // got there first, the app already knows the outcome.
+            let still_pending = pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&token)
+                .is_some();
+            if still_pending {
+                log::info!(
+                    "Incoming call {} ended before answer (reason: {:?})",
+                    token,
+                    status.reason,
+                );
+                emit_call_state_to(&handler, &info);
+            }
+            true
+        });
+    }
+
+    /// Stop watching an offered incoming call; it has been accepted or rejected.
+    fn clear_pending_incoming(&self, call_token: &str) {
+        let removed = self
+            .pending_incoming
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(call_token);
+        if let Some(stop) = removed {
+            stop.store(true, Ordering::Relaxed);
+        }
     }
 
     // ── On-device AI ────────────────────────────────────────────────
@@ -862,26 +1137,16 @@ impl AriaMobileEngine {
     /// Returns the call_id if so, and cleans up the call state.
     /// The app should call this periodically (e.g., from a UI timer).
     pub fn check_remote_hangup(&self) -> Option<String> {
-        let ended_id = {
-            let mut ended = self.remote_ended.lock().unwrap();
-            ended.pop()
-        };
+        let ended_id = self
+            .remote_ended
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop();
 
-        if let Some(ref call_id) = ended_id {
-            let call = {
-                let mut calls = self.calls.lock().unwrap();
-                calls.remove(call_id)
-            };
-
-            if let Some(mut call) = call {
-                call.poll_stop.store(true, Ordering::Relaxed);
-                if let Some(media) = call.media.take() {
-                    media.stop();
-                }
-                let mut info = call.info.clone();
-                info.state = CallState::Ended;
-                self.emit_call_state(&info);
-            }
+        // The poll thread has normally torn the call down and emitted `Ended`
+        // already; this only acts if it somehow has not.
+        if let Some(call_id) = &ended_id {
+            end_call_locally(&self.calls, &self.event_handler, call_id);
         }
 
         ended_id
@@ -979,5 +1244,478 @@ impl AriaMobileEngine {
                 active_count
             );
         }
+    }
+}
+
+/// A minimal HTTP/1.1 server standing in for the push gateway in tests.
+///
+/// The crate has no HTTP mocking dependency, and adding one for a handful of
+/// canned responses is not worth it: this answers each request from a
+/// caller-supplied function and records what it received.
+#[cfg(test)]
+pub(crate) mod mock_gateway {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Clone)]
+    pub struct Request {
+        pub method: String,
+        pub path: String,
+        pub authorization: Option<String>,
+        pub body: String,
+    }
+
+    pub struct MockGateway {
+        pub base_url: String,
+        requests: Arc<Mutex<Vec<Request>>>,
+    }
+
+    impl MockGateway {
+        /// Serve until the test process exits, answering each request with
+        /// `respond(&request) -> (status, json body)`.
+        pub fn start(respond: impl Fn(&Request) -> (u16, String) + Send + Sync + 'static) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock gateway");
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&requests);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let Some(req) = read_request(&mut stream) else {
+                        continue;
+                    };
+                    let (status, body) = respond(&req);
+                    seen.lock().unwrap().push(req);
+                    let resp = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            });
+            Self { base_url, requests }
+        }
+
+        pub fn requests(&self) -> Vec<Request> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> Option<Request> {
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).ok()?;
+        let mut parts = line.split_whitespace();
+        let method = parts.next()?.to_string();
+        let path = parts.next()?.to_string();
+
+        let mut content_length = 0usize;
+        let mut authorization = None;
+        loop {
+            let mut header = String::new();
+            reader.read_line(&mut header).ok()?;
+            let header = header.trim_end();
+            if header.is_empty() {
+                break;
+            }
+            let (name, value) = header.split_once(':')?;
+            let value = value.trim();
+            match name.to_ascii_lowercase().as_str() {
+                "content-length" => content_length = value.parse().ok()?,
+                "authorization" => authorization = Some(value.to_string()),
+                _ => {}
+            }
+        }
+
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body).ok()?;
+        Some(Request {
+            method,
+            path,
+            authorization,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mock_gateway::MockGateway;
+
+    /// Records every callback so tests can assert on the event stream.
+    #[derive(Default, Clone)]
+    struct Recorder {
+        states: Arc<Mutex<Vec<CallInfo>>>,
+    }
+
+    impl Recorder {
+        fn states(&self) -> Vec<CallInfo> {
+            self.states.lock().unwrap().clone()
+        }
+
+        /// Wait for at least `n` call-state events, for events emitted from
+        /// a poll thread.
+        fn wait_for(&self, n: usize) -> Vec<CallInfo> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if self.states.lock().unwrap().len() >= n {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            self.states()
+        }
+    }
+
+    impl MobileEventHandler for Recorder {
+        fn on_registration_changed(&self, _: String, _: String, _: Option<String>) {}
+        fn on_incoming_call(&self, _: CallOffer) {}
+        fn on_call_state_changed(&self, info: CallInfo) {
+            self.states.lock().unwrap().push(info);
+        }
+        fn on_media_stats(&self, _: String, _: MediaStats) {}
+        fn on_error(&self, _: String, _: String) {}
+    }
+
+    fn engine(base_url: &str) -> (AriaMobileEngine, Recorder) {
+        init_runtime();
+        let mut engine = AriaMobileEngine::new(GatewayConfig {
+            base_url: base_url.to_string(),
+            api_key: "key".to_string(),
+        });
+        engine.poll_interval = Duration::from_millis(20);
+        engine.store_token("jwt".to_string(), None);
+        let recorder = Recorder::default();
+        engine.set_event_handler(Box::new(recorder.clone()));
+        (engine, recorder)
+    }
+
+    /// Put a connected, gateway-routed call in the engine without media.
+    fn insert_call(engine: &AriaMobileEngine, call_id: &str, call_token: &str) -> Arc<AtomicBool> {
+        let poll_stop = Arc::new(AtomicBool::new(false));
+        engine.calls.lock().unwrap().insert(
+            call_id.to_string(),
+            ActiveCallState {
+                info: CallInfo {
+                    call_id: call_id.to_string(),
+                    remote_uri: "sip:1001@pbx.example.com".to_string(),
+                    remote_name: None,
+                    state: CallState::Connected,
+                    direction: CallDirection::Outbound,
+                    muted: false,
+                    on_hold: false,
+                    duration_secs: 0,
+                },
+                media: None,
+                call_token: Some(call_token.to_string()),
+                poll_stop: Arc::clone(&poll_stop),
+            },
+        );
+        poll_stop
+    }
+
+    /// An address nothing listens on, for tests that must not reach a gateway.
+    const NO_GATEWAY: &str = "http://127.0.0.1:9";
+
+    #[test]
+    fn transfer_target_validation() {
+        for ok in ["1002", "sip:1002@pbx.example.com", "+15551234567"] {
+            assert!(
+                validate_transfer_target(ok).is_ok(),
+                "{ok:?} should be accepted"
+            );
+        }
+        for bad in [
+            "",
+            "   ",
+            "1002\r\nX-Injected: 1",
+            "1002\n",
+            "<sip:1002@pbx>",
+            "sip:1002@pbx>;foo",
+        ] {
+            assert!(
+                matches!(
+                    validate_transfer_target(bad),
+                    Err(MobileError::InvalidTarget)
+                ),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_target_is_refused_before_the_gateway_and_keeps_the_call() {
+        let (engine, recorder) = engine(NO_GATEWAY);
+        insert_call(&engine, "c1", "tok");
+
+        let err = engine
+            .transfer_call("c1".into(), "1002\r\nVia: evil".into())
+            .unwrap_err();
+
+        assert!(matches!(err, MobileError::InvalidTarget));
+        assert!(engine.get_active_call().is_some());
+        assert!(recorder.states().is_empty());
+    }
+
+    #[test]
+    fn transfer_of_an_unknown_call_is_invalid_state() {
+        let (engine, _) = engine(NO_GATEWAY);
+        let err = engine
+            .transfer_call("nope".into(), "1002".into())
+            .unwrap_err();
+        assert!(matches!(err, MobileError::InvalidState));
+    }
+
+    #[test]
+    fn successful_transfer_ends_the_call_and_emits_ended_once() {
+        let gw = MockGateway::start(|_| (202, "{}".into()));
+        let (engine, recorder) = engine(&gw.base_url);
+        let poll_stop = insert_call(&engine, "c1", "tok-42");
+
+        engine
+            .transfer_call("c1".into(), " sip:1002@pbx.example.com ".into())
+            .unwrap();
+
+        let reqs = gw.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].path, "/v1/calls/tok-42/transfer");
+        // The target is trimmed before it is sent.
+        assert_eq!(reqs[0].body, r#"{"target":"sip:1002@pbx.example.com"}"#);
+
+        assert!(engine.get_active_call().is_none());
+        assert!(
+            poll_stop.load(Ordering::Relaxed),
+            "status poll must be stopped"
+        );
+        let states = recorder.states();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].call_id, "c1");
+        assert_eq!(states[0].state, CallState::Ended);
+    }
+
+    #[test]
+    fn failed_transfer_leaves_the_call_up() {
+        for (status, check) in [
+            (
+                400,
+                (|e| matches!(e, MobileError::InvalidTarget)) as fn(&MobileError) -> bool,
+            ),
+            (404, |e| matches!(e, MobileError::InvalidState)),
+            (502, |e| matches!(e, MobileError::CallFailed)),
+        ] {
+            let gw = MockGateway::start(move |_| (status, "{}".into()));
+            let (engine, recorder) = engine(&gw.base_url);
+            insert_call(&engine, "c1", "tok");
+
+            let err = engine
+                .transfer_call("c1".into(), "1002".into())
+                .unwrap_err();
+
+            assert!(check(&err), "HTTP {status} gave {err:?}");
+            assert!(engine.get_active_call().is_some(), "HTTP {status}");
+            assert!(recorder.states().is_empty(), "HTTP {status}");
+        }
+    }
+
+    #[test]
+    fn remote_hangup_is_emitted_without_check_remote_hangup() {
+        let polls = Arc::new(Mutex::new(0u32));
+        let counter = Arc::clone(&polls);
+        let gw = MockGateway::start(move |req| {
+            assert_eq!(req.path, "/v1/calls/tok-7/status");
+            let mut n = counter.lock().unwrap();
+            *n += 1;
+            if *n < 3 {
+                (200, r#"{"status":"active"}"#.into())
+            } else {
+                (200, r#"{"status":"ended","reason":"bye"}"#.into())
+            }
+        });
+        let (engine, recorder) = engine(&gw.base_url);
+        let stop = insert_call(&engine, "c1", "tok-7");
+
+        engine.start_call_status_poll("c1".into(), "tok-7".into(), stop);
+
+        let states = recorder.wait_for(1);
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].call_id, "c1");
+        assert_eq!(states[0].state, CallState::Ended);
+        assert!(engine.get_active_call().is_none());
+
+        // Apps that still poll keep working, and see no second event.
+        assert_eq!(engine.check_remote_hangup().as_deref(), Some("c1"));
+        assert_eq!(engine.check_remote_hangup(), None);
+        assert_eq!(recorder.states().len(), 1);
+    }
+
+    #[test]
+    fn hangup_after_remote_end_does_not_emit_twice() {
+        let gw = MockGateway::start(|_| (200, r#"{"status":"ended"}"#.into()));
+        let (engine, recorder) = engine(&gw.base_url);
+        let stop = insert_call(&engine, "c1", "tok");
+        engine.start_call_status_poll("c1".into(), "tok".into(), stop);
+        recorder.wait_for(1);
+
+        assert!(matches!(
+            engine.hangup("c1".into()),
+            Err(MobileError::InvalidState)
+        ));
+        assert_eq!(recorder.states().len(), 1);
+    }
+
+    #[test]
+    fn local_hangup_emits_ended() {
+        let gw = MockGateway::start(|_| (200, "{}".into()));
+        let (engine, recorder) = engine(&gw.base_url);
+        insert_call(&engine, "c1", "tok");
+
+        engine.hangup("c1".into()).unwrap();
+
+        assert_eq!(gw.requests()[0].path, "/v1/calls/tok/hangup");
+        let states = recorder.states();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].state, CallState::Ended);
+    }
+
+    #[test]
+    fn remote_ended_backlog_is_bounded() {
+        let gw = MockGateway::start(|_| (200, r#"{"status":"ended"}"#.into()));
+        let (engine, recorder) = engine(&gw.base_url);
+        let n = REMOTE_ENDED_BACKLOG + 4;
+        for i in 0..n {
+            let id = format!("c{i}");
+            let stop = insert_call(&engine, &id, &format!("tok{i}"));
+            engine.start_call_status_poll(id, format!("tok{i}"), stop);
+        }
+        assert_eq!(recorder.wait_for(n).len(), n);
+        assert_eq!(
+            engine.remote_ended.lock().unwrap().len(),
+            REMOTE_ENDED_BACKLOG
+        );
+    }
+
+    fn offer(token: &str) -> CallOffer {
+        CallOffer {
+            call_token: token.to_string(),
+            caller_uri: "sip:1001@pbx.example.com".to_string(),
+            caller_name: Some("Alice".to_string()),
+            sdp_offer: String::new(),
+        }
+    }
+
+    #[test]
+    fn caller_cancel_before_answer_emits_ended() {
+        let gw = MockGateway::start(|_| (200, r#"{"status":"ended","reason":"cancelled"}"#.into()));
+        let (engine, recorder) = engine(&gw.base_url);
+
+        engine.start_pending_incoming_poll(&offer("tok-9"));
+
+        let states = recorder.wait_for(1);
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].call_id, "incoming-tok-9");
+        assert_eq!(states[0].state, CallState::Ended);
+        assert_eq!(states[0].direction, CallDirection::Inbound);
+        assert_eq!(states[0].remote_name.as_deref(), Some("Alice"));
+        assert!(engine.pending_incoming.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn answered_or_rejected_call_is_not_reported_as_cancelled() {
+        let gw = MockGateway::start(|_| (200, r#"{"status":"ended"}"#.into()));
+        let (engine, recorder) = engine(&gw.base_url);
+
+        engine.start_pending_incoming_poll(&offer("tok-1"));
+        engine.clear_pending_incoming("tok-1");
+
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(recorder.states().is_empty());
+    }
+
+    #[test]
+    fn a_brief_unknown_during_answer_is_not_a_cancel() {
+        let polls = Arc::new(Mutex::new(0u32));
+        let counter = Arc::clone(&polls);
+        let gw = MockGateway::start(move |_| {
+            let mut n = counter.lock().unwrap();
+            *n += 1;
+            match *n {
+                1 => (200, r#"{"status":"pending"}"#.into()),
+                2 => (200, r#"{"status":"unknown"}"#.into()),
+                _ => (200, r#"{"status":"active"}"#.into()),
+            }
+        });
+        let (engine, recorder) = engine(&gw.base_url);
+
+        engine.start_pending_incoming_poll(&offer("tok-2"));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !engine.pending_incoming.lock().unwrap().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(engine.pending_incoming.lock().unwrap().is_empty());
+        assert!(recorder.states().is_empty());
+    }
+
+    #[test]
+    fn duplicate_push_starts_one_watch() {
+        let (engine, _) = engine(NO_GATEWAY);
+        engine.start_pending_incoming_poll(&offer("tok-3"));
+        let first = Arc::clone(
+            engine
+                .pending_incoming
+                .lock()
+                .unwrap()
+                .get("tok-3")
+                .unwrap(),
+        );
+        engine.start_pending_incoming_poll(&offer("tok-3"));
+        let second = Arc::clone(
+            engine
+                .pending_incoming
+                .lock()
+                .unwrap()
+                .get("tok-3")
+                .unwrap(),
+        );
+        assert!(Arc::ptr_eq(&first, &second));
+        engine.clear_pending_incoming("tok-3");
+    }
+
+    /// A callback that re-enters the engine must not deadlock: the handler is
+    /// cloned out of its lock before it is invoked.
+    #[test]
+    fn handler_can_replace_itself_from_a_callback() {
+        struct Reentrant {
+            engine: Arc<AriaMobileEngine>,
+            fired: Arc<AtomicBool>,
+        }
+        impl MobileEventHandler for Reentrant {
+            fn on_registration_changed(&self, _: String, _: String, _: Option<String>) {}
+            fn on_incoming_call(&self, _: CallOffer) {}
+            fn on_call_state_changed(&self, _: CallInfo) {
+                self.fired.store(true, Ordering::Relaxed);
+                self.engine.set_event_handler(Box::new(Recorder::default()));
+            }
+            fn on_media_stats(&self, _: String, _: MediaStats) {}
+            fn on_error(&self, _: String, _: String) {}
+        }
+
+        let (engine, _) = engine(NO_GATEWAY);
+        let engine = Arc::new(engine);
+        let fired = Arc::new(AtomicBool::new(false));
+        engine.set_event_handler(Box::new(Reentrant {
+            engine: Arc::clone(&engine),
+            fired: Arc::clone(&fired),
+        }));
+        insert_call(&engine, "c1", "tok");
+
+        end_call_locally(&engine.calls, &engine.event_handler, "c1");
+
+        assert!(fired.load(Ordering::Relaxed));
+        // Break the Arc cycle (engine -> handler -> engine).
+        engine.event_handler.write().unwrap().take();
     }
 }
