@@ -80,6 +80,10 @@ The core never mints gateway tokens and never calls the gateway's `/v1/auth/toke
 
 An engine constructed with an empty `api_key` has no token: methods that need the gateway throw `AuthenticationError` without sending a request until `set_gateway_token` is called.
 
+## Gateway failover
+
+When the gateway domain has SRV records, `register_device` resolves them into an ordered list of gateway instances. A request moves to the next instance only when it could not connect, so it was certainly never delivered. A timeout or a reset after sending is returned as an error instead, so a non-idempotent request such as `POST /v1/calls` is never sent twice and the callee never rings twice. A call lives on one instance. Everything after it is placed or offered (accept, reject, cancel, status polls, hangup, transfer) goes to that instance, never to whichever one is first. `POST /v1/calls` may take up to 45 s, longer than the gateway's 30 s INVITE timeout, so the gateway rather than the client decides that an unanswered call has failed.
+
 ## Call Flows
 
 ### Incoming (via push)

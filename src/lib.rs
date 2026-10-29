@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 pub mod ai;
 
 use events::{CallEvents, Dispatcher};
+use gateway_client::Route;
 pub use media::PlatformAudioBridge;
 use types::*;
 
@@ -134,10 +135,11 @@ async fn hang_up_abandoned(
     gateway: &gateway_client::GatewayClient,
     auth: &auth::GatewayAuth,
     events: &Dispatcher,
+    route: &Route,
     call_token: &str,
 ) {
     let (token, generation) = auth.snapshot();
-    match gateway.hangup_call(&token, call_token).await {
+    match gateway.hangup_call(route, &token, call_token).await {
         Ok(()) => log::info!("Hung up an outgoing call cancelled while ringing"),
         Err(MobileError::AuthenticationError) => report_auth_rejected(auth, events, generation),
         Err(e) => log::warn!("Could not hang up a cancelled outgoing call: {}", e),
@@ -194,7 +196,7 @@ pub struct AriaMobileEngine {
     /// Incoming calls that have been offered but not yet accepted or
     /// rejected, keyed by call_token, each with the stop flag of the poll
     /// that watches for the caller cancelling.
-    pending_incoming: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    pending_incoming: Arc<Mutex<HashMap<String, PendingIncoming>>>,
     /// Outgoing calls that are ringing, keyed by call_id. A call moves from
     /// here to `calls` when it is answered. When both locks are held, `calls`
     /// is taken first.
@@ -221,6 +223,14 @@ pub struct AriaMobileEngine {
     poll_interval: Duration,
 }
 
+/// An offered incoming call that has not been accepted or rejected yet.
+struct PendingIncoming {
+    /// Stops the poll that watches for the caller cancelling.
+    stop: Arc<AtomicBool>,
+    /// The gateway instance that offered the call.
+    route: Route,
+}
+
 /// An outgoing call that has been reported `Ringing` and not answered yet.
 struct PendingOutgoing {
     info: CallInfo,
@@ -234,6 +244,9 @@ struct PendingOutgoing {
     dialing: bool,
     /// Tells `dial` that `hangup` has taken the call.
     cancel: tokio::sync::oneshot::Sender<()>,
+    /// The gateway instance `POST /v1/calls` was last sent to, which is the
+    /// one ringing the call; a cancel goes there.
+    route: Arc<Mutex<Option<Route>>>,
     /// What came of `hangup`'s cancel request: `Some(true)` when the gateway
     /// sent a CANCEL, `Some(false)` otherwise. Read before hanging up a call
     /// that was answered anyway, because the gateway ends a call whose answer
@@ -258,6 +271,8 @@ struct ActiveCallState {
     media: Option<media::MobileMediaSession>,
     /// For gateway-routed calls
     call_token: Option<String>,
+    /// The gateway instance holding the call.
+    route: Route,
     /// Set to true to stop the status polling loop
     poll_stop: Arc<AtomicBool>,
     /// Orders this call's events and stops anything after `Ended`.
@@ -396,7 +411,7 @@ impl AriaMobileEngine {
         let rt = runtime();
         rt.block_on(async {
             let token = self.auth.token()?;
-            let offer = self
+            let (offer, route) = self
                 .gateway
                 .get_call_offer(&token, &payload.call_token)
                 .await?;
@@ -404,7 +419,7 @@ impl AriaMobileEngine {
             // Watch for the caller giving up before the user answers. A push
             // can be delivered more than once for the same call; only one
             // watcher runs per call_token.
-            self.start_pending_incoming_poll(&offer);
+            self.start_pending_incoming_poll(&offer, route);
 
             let for_handler = offer.clone();
             self.events.incoming_call(for_handler);
@@ -422,8 +437,10 @@ impl AriaMobileEngine {
         rt.block_on(async {
             let token = self.auth.token()?;
 
-            // Get the call offer to know what codecs the remote supports
-            let offer = self.gateway.get_call_offer(&token, &call_token).await?;
+            // Get the call offer to know what codecs the remote supports. The
+            // instance that returns it holds the call, so the accept, the
+            // status poll and everything after go there.
+            let (offer, route) = self.gateway.get_call_offer(&token, &call_token).await?;
 
             // Start local media and generate SDP answer
             let codecs = if preferred_codecs.is_empty() {
@@ -437,7 +454,7 @@ impl AriaMobileEngine {
 
             // Send the answer to the gateway
             self.gateway
-                .accept_call(&token, &call_token, &sdp_answer)
+                .accept_call(&route, &token, &call_token, &sdp_answer)
                 .await?;
             self.clear_pending_incoming(&call_token);
 
@@ -485,6 +502,7 @@ impl AriaMobileEngine {
                         info: info.clone(),
                         media: Some(media_session),
                         call_token: Some(call_token.clone()),
+                        route: route.clone(),
                         poll_stop: poll_stop.clone(),
                         events: Arc::clone(&events),
                     },
@@ -496,7 +514,7 @@ impl AriaMobileEngine {
 
             // Start polling for remote hangup only after Connected is queued,
             // so a remote hangup can never be reported ahead of it.
-            self.start_call_status_poll(call_id.clone(), call_token, poll_stop);
+            self.start_call_status_poll(call_id.clone(), call_token, route, poll_stop);
             Ok(info)
         })
     }
@@ -505,7 +523,16 @@ impl AriaMobileEngine {
         let rt = runtime();
         rt.block_on(async {
             let token = self.auth.token()?;
-            self.gateway.reject_call(&token, &call_token).await?;
+            let route = self
+                .pending_incoming
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&call_token)
+                .map(|p| p.route.clone())
+                .unwrap_or_else(|| self.gateway.primary_route());
+            self.gateway
+                .reject_call(&route, &token, &call_token)
+                .await?;
             self.clear_pending_incoming(&call_token);
             Ok(())
         })
@@ -571,6 +598,7 @@ impl AriaMobileEngine {
         // learns the call_id, so any hangup for it finds the call here.
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
         let (outcome_tx, outcome_rx) = tokio::sync::watch::channel(None);
+        let attempt: Arc<Mutex<Option<Route>>> = Arc::default();
         self.pending_outgoing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -582,6 +610,7 @@ impl AriaMobileEngine {
                     client_ref: client_ref.clone(),
                     dialing: false,
                     cancel: cancel_tx,
+                    route: Arc::clone(&attempt),
                     cancel_outcome: outcome_tx,
                 },
             );
@@ -624,7 +653,14 @@ impl AriaMobileEngine {
         let destination = uri.clone();
         let mut request = tokio::spawn(async move {
             gateway
-                .make_call(&token, &destination, &sdp_offer, &credentials, &client_ref)
+                .make_call(
+                    &token,
+                    &destination,
+                    &sdp_offer,
+                    &credentials,
+                    &client_ref,
+                    &attempt,
+                )
                 .await
         });
 
@@ -637,13 +673,13 @@ impl AriaMobileEngine {
                 if let Some(media) = &media {
                     media.stop();
                 }
-                let answered = async move { request.await.ok()?.ok().map(|(t, _)| t) };
+                let answered = async move { request.await.ok()?.ok().map(|(t, _, r)| (t, r)) };
                 self.hang_up_if_answered(answered, outcome_rx);
                 return Err(MobileError::Cancelled);
             }
         };
 
-        let (call_token, sdp_answer) = match answer {
+        let (call_token, sdp_answer, route) = match answer {
             Ok(answer) => answer,
             Err(e) => {
                 if let Some(media) = &media {
@@ -711,6 +747,7 @@ impl AriaMobileEngine {
                         info: info.clone(),
                         media,
                         call_token: Some(call_token.clone()),
+                        route: route.clone(),
                         poll_stop: poll_stop.clone(),
                         events: Arc::clone(&events),
                     },
@@ -730,13 +767,13 @@ impl AriaMobileEngine {
             if let Some(media) = media {
                 media.stop();
             }
-            self.hang_up_if_answered(std::future::ready(Some(call_token)), outcome_rx);
+            self.hang_up_if_answered(std::future::ready(Some((call_token, route))), outcome_rx);
             return Err(MobileError::Cancelled);
         }
 
         // The poll starts after Connected is queued, so a remote hangup can
         // never be reported ahead of it.
-        self.start_call_status_poll(call_id.clone(), call_token, poll_stop);
+        self.start_call_status_poll(call_id.clone(), call_token, route, poll_stop);
         log::info!("Outgoing call to {} connected via gateway", uri);
 
         Ok(info)
@@ -751,7 +788,7 @@ impl AriaMobileEngine {
     /// here.
     fn hang_up_if_answered(
         &self,
-        answered: impl std::future::Future<Output = Option<String>> + Send + 'static,
+        answered: impl std::future::Future<Output = Option<(String, Route)>> + Send + 'static,
         mut cancel_outcome: tokio::sync::watch::Receiver<Option<bool>>,
     ) {
         let gateway = Arc::clone(&self.gateway);
@@ -759,7 +796,7 @@ impl AriaMobileEngine {
         let handler = Arc::clone(&self.events);
         tokio::spawn(async move {
             // A 409 (cancelled) or any other failure leaves nothing to hang up.
-            let Some(call_token) = answered.await else {
+            let Some((call_token, route)) = answered.await else {
                 return;
             };
             let accepted = tokio::time::timeout(
@@ -773,7 +810,7 @@ impl AriaMobileEngine {
                 return;
             }
             log::info!("Cancelled outgoing call was answered; hanging it up");
-            hang_up_abandoned(&gateway, &auth, &handler, &call_token).await;
+            hang_up_abandoned(&gateway, &auth, &handler, &route, &call_token).await;
         });
     }
 
@@ -794,7 +831,11 @@ impl AriaMobileEngine {
             let mut result = Ok(());
             if let Some(call_token) = &call.call_token {
                 let sent = match self.auth.token() {
-                    Ok(token) => self.gateway.hangup_call(&token, call_token).await,
+                    Ok(token) => {
+                        self.gateway
+                            .hangup_call(&call.route, &token, call_token)
+                            .await
+                    }
                     Err(e) => Err(e),
                 };
                 if let Err(MobileError::AuthenticationError) = sent {
@@ -826,7 +867,15 @@ impl AriaMobileEngine {
 
         let result = runtime().block_on(async {
             let token = self.auth.token()?;
-            self.gateway.cancel_call(&token, &pending.client_ref).await
+            let route = pending
+                .route
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .unwrap_or_else(|| self.gateway.primary_route());
+            self.gateway
+                .cancel_call(&route, &token, &pending.client_ref)
+                .await
         });
         let _ = pending
             .cancel_outcome
@@ -880,7 +929,7 @@ impl AriaMobileEngine {
         let target = target.trim();
         validate_transfer_target(target)?;
 
-        let call_token = {
+        let (call_token, route) = {
             let calls = self
                 .calls
                 .lock()
@@ -888,14 +937,15 @@ impl AriaMobileEngine {
             let call = calls.get(&call_id).ok_or(MobileError::InvalidState)?;
             // Only gateway-routed calls can be transferred: the REFER is sent
             // by the gateway on the call it holds.
-            call.call_token.clone().ok_or(MobileError::InvalidState)?
+            let call_token = call.call_token.clone().ok_or(MobileError::InvalidState)?;
+            (call_token, call.route.clone())
         };
 
         let rt = runtime();
         rt.block_on(async {
             let token = self.auth.token()?;
             self.gateway
-                .transfer_call(&token, &call_token, target)
+                .transfer_call(&route, &token, &call_token, target)
                 .await?;
             log::info!("Call {} transferred", call_id);
 
@@ -962,66 +1012,56 @@ impl AriaMobileEngine {
     /// an expired one.
     fn spawn_status_poll(
         &self,
+        route: Route,
         call_token: String,
         stop: Arc<AtomicBool>,
         max_age: Option<Duration>,
         mut on_status: impl FnMut(&CallStatusResponse) -> bool + Send + 'static,
     ) {
         let started = Instant::now();
-        let base_url = self.gateway.base_url().to_string();
+        let gateway = Arc::clone(&self.gateway);
         let auth = Arc::clone(&self.auth);
         let handler = Arc::clone(&self.events);
         let interval = self.poll_interval;
 
-        std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    log::error!("Could not start call status poll: {}", e);
-                    return;
+        // A task on the shared runtime rather than a thread with its own: no
+        // thread per call, and the request goes out on the call's own route
+        // with the engine's pinned clients. Callbacks it raises are delivered
+        // on the dispatch thread, never on this task.
+        runtime().spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+
+                if stop.load(Ordering::Relaxed) {
+                    log::debug!("Call status poll stopped for {}", call_token);
+                    break;
                 }
-            };
+                if max_age.is_some_and(|age| started.elapsed() >= age) {
+                    log::debug!("Call status poll expired for {}", call_token);
+                    break;
+                }
 
-            let gateway = gateway_client::GatewayClient::new(base_url);
-
-            rt.block_on(async {
-                loop {
-                    tokio::time::sleep(interval).await;
-
-                    if stop.load(Ordering::Relaxed) {
-                        log::debug!("Call status poll stopped for {}", call_token);
-                        break;
+                // With no token at all the request goes out unauthenticated,
+                // so the gateway's 401 reaches the app the same way.
+                let (token, generation) = auth.snapshot();
+                match gateway.get_call_status(&route, &token, &call_token).await {
+                    Ok(status) => {
+                        if on_status(&status) {
+                            stop.store(true, Ordering::Relaxed);
+                            break;
+                        }
                     }
-                    if max_age.is_some_and(|age| started.elapsed() >= age) {
-                        log::debug!("Call status poll expired for {}", call_token);
-                        break;
+                    // An expired token says nothing about the call, so the
+                    // poll keeps the call up and keeps polling; it resumes
+                    // with the next token from `set_gateway_token`.
+                    Err(MobileError::AuthenticationError) => {
+                        report_auth_rejected(&auth, &handler, generation);
                     }
-
-                    // With no token at all the request goes out unauthenticated,
-                    // so the gateway's 401 reaches the app the same way.
-                    let (token, generation) = auth.snapshot();
-                    match gateway.get_call_status(&token, &call_token).await {
-                        Ok(status) => {
-                            if on_status(&status) {
-                                stop.store(true, Ordering::Relaxed);
-                                break;
-                            }
-                        }
-                        // An expired token says nothing about the call, so the
-                        // poll keeps the call up and keeps polling; it resumes
-                        // with the next token from `set_gateway_token`.
-                        Err(MobileError::AuthenticationError) => {
-                            report_auth_rejected(&auth, &handler, generation);
-                        }
-                        Err(e) => {
-                            log::warn!("Call status poll error: {}", e);
-                        }
+                    Err(e) => {
+                        log::warn!("Call status poll error: {}", e);
                     }
                 }
-            });
+            }
         });
     }
 
@@ -1030,12 +1070,18 @@ impl AriaMobileEngine {
     /// When the gateway reports the call gone, the poll thread tears the call
     /// down and emits `Ended` itself, so apps learn of a remote hangup through
     /// `on_call_state_changed` without polling `check_remote_hangup`.
-    fn start_call_status_poll(&self, call_id: String, call_token: String, stop: Arc<AtomicBool>) {
+    fn start_call_status_poll(
+        &self,
+        call_id: String,
+        call_token: String,
+        route: Route,
+        stop: Arc<AtomicBool>,
+    ) {
         let calls = Arc::clone(&self.calls);
         let handler = Arc::clone(&self.events);
         let remote_ended = Arc::clone(&self.remote_ended);
 
-        self.spawn_status_poll(call_token, stop, None, move |status| {
+        self.spawn_status_poll(route, call_token, stop, None, move |status| {
             if !status_means_ended(&status.status) {
                 return false;
             }
@@ -1065,7 +1111,7 @@ impl AriaMobileEngine {
     /// for the call_id the call would have had (`incoming-<call_token>`), so
     /// the app can dismiss its ringing UI. The watch stops as soon as the call
     /// is accepted or rejected.
-    fn start_pending_incoming_poll(&self, offer: &CallOffer) {
+    fn start_pending_incoming_poll(&self, offer: &CallOffer, route: Route) {
         let call_token = offer.call_token.clone();
         let stop = Arc::new(AtomicBool::new(false));
         {
@@ -1076,7 +1122,13 @@ impl AriaMobileEngine {
             if pending.contains_key(&call_token) {
                 return;
             }
-            pending.insert(call_token.clone(), Arc::clone(&stop));
+            pending.insert(
+                call_token.clone(),
+                PendingIncoming {
+                    stop: Arc::clone(&stop),
+                    route: route.clone(),
+                },
+            );
         }
 
         let info = CallInfo {
@@ -1099,7 +1151,7 @@ impl AriaMobileEngine {
         let offer_events = CallEvents::default();
 
         let deadline = Some(PENDING_INCOMING_MAX_WATCH);
-        self.spawn_status_poll(call_token, stop, deadline, move |status| {
+        self.spawn_status_poll(route, call_token, stop, deadline, move |status| {
             let gone = match status.status.as_str() {
                 "ended" => true,
                 "unknown" => {
@@ -1148,8 +1200,8 @@ impl AriaMobileEngine {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(call_token);
-        if let Some(stop) = removed {
-            stop.store(true, Ordering::Relaxed);
+        if let Some(pending) = removed {
+            pending.stop.store(true, Ordering::Relaxed);
         }
     }
 
@@ -1382,24 +1434,18 @@ impl AriaMobileEngine {
         let current = self.auth.current();
         if let (Some(did), Some((tok, generation))) = (device_id, current) {
             log::info!("Sending heartbeat for device {} after network change", did);
-            // A fresh client on its own thread and runtime, as for the status
-            // polls: this runs in the background and must not block the caller.
-            let base_url = self.gateway.base_url().to_string();
+            // In the background on the shared runtime: this must not block
+            // the caller.
+            let gateway = Arc::clone(&self.gateway);
             let auth = Arc::clone(&self.auth);
             let handler = Arc::clone(&self.events);
-            std::thread::spawn(move || {
-                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    let gateway = gateway_client::GatewayClient::new(base_url);
-                    match rt.block_on(gateway.device_heartbeat(&tok, &did)) {
-                        Ok(()) => log::info!("Gateway heartbeat successful after network change"),
-                        Err(MobileError::AuthenticationError) => {
-                            report_auth_rejected(&auth, &handler, generation);
-                        }
-                        Err(e) => log::warn!("Gateway heartbeat failed: {}", e),
+            runtime().spawn(async move {
+                match gateway.device_heartbeat(&tok, &did).await {
+                    Ok(()) => log::info!("Gateway heartbeat successful after network change"),
+                    Err(MobileError::AuthenticationError) => {
+                        report_auth_rejected(&auth, &handler, generation);
                     }
+                    Err(e) => log::warn!("Gateway heartbeat failed: {}", e),
                 }
             });
         }
@@ -1615,6 +1661,7 @@ mod tests {
                 },
                 media: None,
                 call_token: Some(call_token.to_string()),
+                route: engine.gateway.primary_route(),
                 poll_stop: Arc::clone(&poll_stop),
                 events: Arc::default(),
             },
@@ -1742,7 +1789,12 @@ mod tests {
         let (engine, recorder) = engine(&gw.base_url);
         let stop = insert_call(&engine, "c1", "tok-7");
 
-        engine.start_call_status_poll("c1".into(), "tok-7".into(), stop);
+        engine.start_call_status_poll(
+            "c1".into(),
+            "tok-7".into(),
+            engine.gateway.primary_route(),
+            stop,
+        );
 
         let states = recorder.wait_for(1);
         assert_eq!(states.len(), 1);
@@ -1761,7 +1813,12 @@ mod tests {
         let gw = MockGateway::start(|_| (200, r#"{"status":"ended"}"#.into()));
         let (engine, recorder) = engine(&gw.base_url);
         let stop = insert_call(&engine, "c1", "tok");
-        engine.start_call_status_poll("c1".into(), "tok".into(), stop);
+        engine.start_call_status_poll(
+            "c1".into(),
+            "tok".into(),
+            engine.gateway.primary_route(),
+            stop,
+        );
         recorder.wait_for(1);
 
         assert!(matches!(
@@ -1793,7 +1850,12 @@ mod tests {
         for i in 0..n {
             let id = format!("c{i}");
             let stop = insert_call(&engine, &id, &format!("tok{i}"));
-            engine.start_call_status_poll(id, format!("tok{i}"), stop);
+            engine.start_call_status_poll(
+                id,
+                format!("tok{i}"),
+                engine.gateway.primary_route(),
+                stop,
+            );
         }
         assert_eq!(recorder.wait_for(n).len(), n);
         assert_eq!(
@@ -1816,7 +1878,7 @@ mod tests {
         let gw = MockGateway::start(|_| (200, r#"{"status":"ended","reason":"cancelled"}"#.into()));
         let (engine, recorder) = engine(&gw.base_url);
 
-        engine.start_pending_incoming_poll(&offer("tok-9"));
+        engine.start_pending_incoming_poll(&offer("tok-9"), engine.gateway.primary_route());
 
         let states = recorder.wait_for(1);
         assert_eq!(states.len(), 1);
@@ -1832,7 +1894,7 @@ mod tests {
         let gw = MockGateway::start(|_| (200, r#"{"status":"ended"}"#.into()));
         let (engine, recorder) = engine(&gw.base_url);
 
-        engine.start_pending_incoming_poll(&offer("tok-1"));
+        engine.start_pending_incoming_poll(&offer("tok-1"), engine.gateway.primary_route());
         engine.clear_pending_incoming("tok-1");
 
         std::thread::sleep(Duration::from_millis(200));
@@ -1854,7 +1916,7 @@ mod tests {
         });
         let (engine, recorder) = engine(&gw.base_url);
 
-        engine.start_pending_incoming_poll(&offer("tok-2"));
+        engine.start_pending_incoming_poll(&offer("tok-2"), engine.gateway.primary_route());
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while !engine.pending_incoming.lock().unwrap().is_empty() && Instant::now() < deadline {
@@ -1867,23 +1929,25 @@ mod tests {
     #[test]
     fn duplicate_push_starts_one_watch() {
         let (engine, _) = engine(NO_GATEWAY);
-        engine.start_pending_incoming_poll(&offer("tok-3"));
+        engine.start_pending_incoming_poll(&offer("tok-3"), engine.gateway.primary_route());
         let first = Arc::clone(
-            engine
+            &engine
                 .pending_incoming
                 .lock()
                 .unwrap()
                 .get("tok-3")
-                .unwrap(),
+                .unwrap()
+                .stop,
         );
-        engine.start_pending_incoming_poll(&offer("tok-3"));
+        engine.start_pending_incoming_poll(&offer("tok-3"), engine.gateway.primary_route());
         let second = Arc::clone(
-            engine
+            &engine
                 .pending_incoming
                 .lock()
                 .unwrap()
                 .get("tok-3")
-                .unwrap(),
+                .unwrap()
+                .stop,
         );
         assert!(Arc::ptr_eq(&first, &second));
         engine.clear_pending_incoming("tok-3");
@@ -2028,7 +2092,12 @@ mod tests {
         });
         let (engine, recorder) = engine(&gw.base_url);
         let stop = insert_call(&engine, "c1", "tok");
-        engine.start_call_status_poll("c1".into(), "tok".into(), Arc::clone(&stop));
+        engine.start_call_status_poll(
+            "c1".into(),
+            "tok".into(),
+            engine.gateway.primary_route(),
+            Arc::clone(&stop),
+        );
 
         // Many rejected polls, one callback.
         assert!(eventually(|| gw.requests().len() >= 5));
@@ -2063,7 +2132,12 @@ mod tests {
         let (engine, recorder) = engine(&gw.base_url);
         engine.set_gateway_token(String::new());
         let stop = insert_call(&engine, "c1", "tok");
-        engine.start_call_status_poll("c1".into(), "tok".into(), Arc::clone(&stop));
+        engine.start_call_status_poll(
+            "c1".into(),
+            "tok".into(),
+            engine.gateway.primary_route(),
+            Arc::clone(&stop),
+        );
 
         assert!(eventually(|| recorder.auth_required() == 1));
         let seen = gw.requests().len();
@@ -2078,7 +2152,7 @@ mod tests {
         let gw = MockGateway::start(|_| (401, "{}".into()));
         let (engine, recorder) = engine(&gw.base_url);
 
-        engine.start_pending_incoming_poll(&offer("tok-5"));
+        engine.start_pending_incoming_poll(&offer("tok-5"), engine.gateway.primary_route());
 
         assert!(eventually(|| gw.requests().len() >= 5));
         assert_eq!(recorder.auth_required(), 1);
@@ -2678,7 +2752,12 @@ mod tests {
             .unwrap();
         dial(&engine).unwrap();
         let stop = insert_call(&engine, "c-401", "tok-401");
-        engine.start_call_status_poll("c-401".into(), "tok-401".into(), Arc::clone(&stop));
+        engine.start_call_status_poll(
+            "c-401".into(),
+            "tok-401".into(),
+            engine.gateway.primary_route(),
+            Arc::clone(&stop),
+        );
 
         let kinds = [
             "registration",
@@ -2750,6 +2829,60 @@ mod tests {
                 "round {round}"
             );
         }
+    }
+
+    /// Everything about a call goes to the gateway instance that placed it,
+    /// not to the primary route.
+    #[test]
+    fn an_outgoing_call_stays_on_the_instance_that_placed_it() {
+        let gw = MockGateway::start(|req| match req.path.as_str() {
+            "/v1/calls" => answer("ct-pin"),
+            "/v1/calls/ct-pin/status" => (200, r#"{"status":"active"}"#.into()),
+            _ => (200, "{}".into()),
+        });
+        // Neither the base URL nor the primary route accepts connections, so
+        // the call can only work on the second route.
+        let (engine, _) = engine(NO_GATEWAY);
+        engine
+            .gateway
+            .set_test_routes(&[NO_GATEWAY, gw.base_url.as_str()]);
+
+        let info = dial(&engine).unwrap();
+        assert!(eventually(|| count(&gw, "/v1/calls/ct-pin/status") >= 2));
+        engine.hangup(info.call_id).unwrap();
+
+        assert!(eventually(|| count(&gw, "/v1/calls/ct-pin/hangup") == 1));
+    }
+
+    #[test]
+    fn an_incoming_call_stays_on_the_instance_that_offered_it() {
+        let gw = MockGateway::start(|req| {
+            match req.path.as_str() {
+            "/v1/calls/tok-pin" => (
+                200,
+                r#"{"call_token":"tok-pin","caller_uri":"sip:a@b","caller_name":null,"sdp_offer":""}"#
+                    .into(),
+            ),
+            "/v1/calls/tok-pin/status" => (200, r#"{"status":"pending"}"#.into()),
+            _ => (200, "{}".into()),
+        }
+        });
+        let (engine, _) = engine(NO_GATEWAY);
+        engine
+            .gateway
+            .set_test_routes(&[NO_GATEWAY, gw.base_url.as_str()]);
+
+        engine
+            .handle_push_notification(PushCallPayload {
+                call_token: "tok-pin".into(),
+                caller_uri: "sip:a@b".into(),
+                caller_name: None,
+                gateway_url: gw.base_url.clone(),
+            })
+            .unwrap();
+        assert!(eventually(|| count(&gw, "/v1/calls/tok-pin/status") >= 2));
+        engine.reject_incoming_call("tok-pin".into()).unwrap();
+        assert_eq!(count(&gw, "/v1/calls/tok-pin/reject"), 1);
     }
 
     /// A callback that re-enters the engine must not deadlock: the handler is
