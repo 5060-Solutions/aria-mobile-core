@@ -723,8 +723,8 @@ fn parse_sdp_remote(sdp: &str) -> Option<(SocketAddr, AudioCodec)> {
 
     for line in sdp.lines() {
         let line = line.trim();
-        if line.starts_with("c=IN IP4 ") {
-            remote_ip = Some(line[9..].trim().to_string());
+        if let Some(ip) = line.strip_prefix("c=IN IP4 ") {
+            remote_ip = Some(ip.trim().to_string());
         } else if line.starts_with("m=audio ") {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 4 {

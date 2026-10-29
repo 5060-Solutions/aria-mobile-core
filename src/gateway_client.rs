@@ -431,6 +431,7 @@ impl GatewayClient {
     }
 
     /// Send a device heartbeat — forces SIP re-registration after network change.
+    #[allow(dead_code)]
     pub async fn device_heartbeat(&self, token: &str, device_id: &str) -> Result<(), MobileError> {
         let target_count = self.resolved_target_count();
         for idx in 0..target_count {

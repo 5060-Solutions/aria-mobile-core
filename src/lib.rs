@@ -25,7 +25,15 @@ pub mod ai;
 pub use media::PlatformAudioBridge;
 use types::*;
 
-uniffi::include_scaffolding!("aria_mobile");
+// The UniFFI-generated scaffolding leaves a blank line after a doc comment,
+// which clippy flags. That file is regenerated on every build, so the lint is
+// silenced for the generated module only rather than patched by hand.
+#[allow(clippy::empty_line_after_doc_comments)]
+mod uniffi_scaffolding {
+    use super::*;
+    uniffi::include_scaffolding!("aria_mobile");
+}
+pub use uniffi_scaffolding::*;
 
 // ── Global Runtime ──────────────────────────────────────────────────────────
 

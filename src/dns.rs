@@ -44,6 +44,12 @@ pub struct SrvResolver {
     query_timeout: Duration,
 }
 
+impl Default for SrvResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SrvResolver {
     /// Create a new resolver using system DNS configuration.
     pub fn new() -> Self {
