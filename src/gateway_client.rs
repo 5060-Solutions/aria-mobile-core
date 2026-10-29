@@ -505,7 +505,10 @@ impl GatewayClient {
 
         if !resp.status().is_success() {
             log::error!("Get call offer failed: {}", resp.status());
-            return Err(status_error(resp.status(), MobileError::CallFailed));
+            return Err(status_error(
+                resp.status(),
+                MobileError::CallFailed(format!("no call offer (HTTP {})", resp.status())),
+            ));
         }
 
         let body: GatewayCallOffer = read_json_capped(resp).await?;
@@ -540,7 +543,10 @@ impl GatewayClient {
 
         if !resp.status().is_success() {
             log::error!("Accept call failed: {}", resp.status());
-            return Err(status_error(resp.status(), MobileError::CallFailed));
+            return Err(status_error(
+                resp.status(),
+                MobileError::CallFailed(format!("accept refused (HTTP {})", resp.status())),
+            ));
         }
 
         Ok(())
@@ -562,7 +568,10 @@ impl GatewayClient {
 
         if !resp.status().is_success() {
             log::error!("Reject call failed: {}", resp.status());
-            return Err(status_error(resp.status(), MobileError::CallFailed));
+            return Err(status_error(
+                resp.status(),
+                MobileError::CallFailed(format!("reject refused (HTTP {})", resp.status())),
+            ));
         }
 
         Ok(())
@@ -630,7 +639,13 @@ impl GatewayClient {
         }
         if !resp.status().is_success() {
             log::error!("Make call failed: {}", resp.status());
-            return Err(status_error(resp.status(), MobileError::CallFailed));
+            return Err(status_error(
+                resp.status(),
+                MobileError::CallFailed(format!(
+                    "the call did not connect (HTTP {})",
+                    resp.status()
+                )),
+            ));
         }
         let body: MakeCallResponse = read_json_capped(resp).await?;
         Ok((body.call_token, body.sdp_answer, route))
@@ -684,7 +699,10 @@ impl GatewayClient {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(status_error(resp.status(), MobileError::CallFailed));
+            return Err(status_error(
+                resp.status(),
+                MobileError::CallFailed(format!("no call status (HTTP {})", resp.status())),
+            ));
         }
 
         let body: CallStatusResponse = read_json_capped(resp).await?;
@@ -717,7 +735,10 @@ impl GatewayClient {
         Err(if status == reqwest::StatusCode::NOT_FOUND {
             MobileError::InvalidState
         } else {
-            status_error(status, MobileError::CallFailed)
+            status_error(
+                status,
+                MobileError::CallFailed(format!("hangup refused (HTTP {status})")),
+            )
         })
     }
 
@@ -756,7 +777,7 @@ impl GatewayClient {
             400 => MobileError::InvalidTarget,
             401 | 403 => MobileError::AuthenticationError,
             404 => MobileError::InvalidState,
-            502 => MobileError::CallFailed,
+            502 => MobileError::CallFailed("the PBX refused the transfer".into()),
             504 => MobileError::Timeout,
             _ => MobileError::GatewayError,
         })
@@ -908,7 +929,7 @@ mod transfer_tests {
                 MobileError::InvalidTarget => "InvalidTarget",
                 MobileError::AuthenticationError => "AuthenticationError",
                 MobileError::InvalidState => "InvalidState",
-                MobileError::CallFailed => "CallFailed",
+                MobileError::CallFailed(_) => "CallFailed",
                 MobileError::GatewayError => "GatewayError",
                 MobileError::Timeout => "Timeout",
                 other => panic!("unexpected error for {status}: {other:?}"),

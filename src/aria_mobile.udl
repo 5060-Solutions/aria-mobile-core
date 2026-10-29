@@ -254,15 +254,25 @@ interface AriaMobileEngine {
     void hangup(string call_id);
 
     /// Blind-transfer an active call to `target` (a dial string such as
-    /// "1002" or a "sip:" URI). The PBX takes the call over; on success the
-    /// local call and its media end, and `on_call_state_changed` reports
-    /// `Ended` for `call_id`, exactly as for a remote hangup.
+    /// "1002" or a "sip:" URI), and wait for the outcome. On success the PBX
+    /// has taken the call over: the local call and its media end, and
+    /// `on_call_state_changed` reports `Ended` for `call_id`.
     ///
-    /// Errors leave the call up: `InvalidTarget` for a target rejected locally
-    /// or by the gateway, `InvalidState` for an unknown call or one that is not
-    /// active yet (still ringing), or a gateway without the transfer route,
-    /// `CallFailed` when the PBX refused the transfer, `Timeout` when the PBX
-    /// did not answer it. The call can block for up to about 8 s.
+    /// After the PBX accepts the REFER, the core polls the call's status
+    /// every 300 ms until it shows the outcome, for up to 30 s.
+    ///
+    /// These errors leave the call fully up: `InvalidTarget` for a target
+    /// rejected locally or by the gateway; `InvalidState` for an unknown call,
+    /// one that is not active yet (still ringing), or a gateway without the
+    /// transfer route; `CallFailed` when the PBX refused the REFER or reported
+    /// the transfer failed (the message carries the SIP status, such as 486);
+    /// `Timeout` when the PBX did not answer the REFER, or no outcome arrived
+    /// within 30 s; `AuthenticationError` for a rejected token.
+    ///
+    /// `InvalidState` after the REFER was accepted means the call ended for
+    /// another reason meanwhile; `Ended` has been reported. A gateway that
+    /// does not report transfer outcomes ends the call on acceptance, as
+    /// before. Blocks for up to about 40 s; call it off the UI thread.
     [Throws=MobileError]
     void transfer_call(string call_id, string target);
 
@@ -453,6 +463,8 @@ enum MobileError {
     /// new token from the PBX and pass it to `set_gateway_token`.
     "AuthenticationError",
     "RegistrationFailed",
+    /// The call or a call operation failed; the message says why, for
+    /// example the SIP status of a failed transfer.
     "CallFailed",
     "MediaError",
     "InvalidState",

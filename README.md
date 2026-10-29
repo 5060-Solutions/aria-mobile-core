@@ -130,10 +130,15 @@ A hangup that lands just after the answer works through the same fallback. In ev
 1. App calls `transfer_call(call_id, target)`; `target` is a dial string (`"1002"`) or a `sip:` URI
 2. Engine rejects an empty target or one containing CR, LF, `<` or `>` with `InvalidTarget`, before any network request
 3. Engine sends `POST /v1/calls/{token}/transfer` with `{"target": "..."}`; the gateway sends the REFER to the PBX
-4. On `202` the local call and media are torn down and `on_call_state_changed` reports `Ended`, as for a remote hangup
-5. On failure the call stays up and the method throws: `400` -> `InvalidTarget`, `404` -> `InvalidState` (unknown call, a call not answered yet, or a gateway without the transfer route), `502` -> `CallFailed` (PBX refused), `504` -> `Timeout` (PBX did not answer the REFER within 8 s), anything else -> `GatewayError`
+4. If the REFER is refused, the call stays up and the method throws: `400` -> `InvalidTarget`, `404` -> `InvalidState` (unknown call, a call not answered yet, or a gateway without the transfer route), `502` -> `CallFailed` (PBX refused), `504` -> `Timeout` (PBX did not answer the REFER within 8 s), anything else -> `GatewayError`
+5. A `202` only means the PBX accepted the REFER, and the transfer can still fail. The core polls `GET /v1/calls/{token}/status` every 300 ms for up to 30 s:
+   - `{"status":"ended","reason":"transferred"}`: success. The local call and media are torn down, `Ended` is reported, and the method returns.
+   - `{"status":"active","transfer":"failed","transfer_code":486}`: the PBX's NOTIFY reported a failure. The method throws `CallFailed`, whose message carries the SIP status, and the call stays fully up with media running, so the caller is not left in dead air.
+   - Still `"transfer":"pending"` after 30 s: `Timeout`, with the call still up.
+   - Ended for any other reason meanwhile: `Ended` is reported, as for a remote hangup, and the method throws `InvalidState`.
+   - An active call with no `transfer` field: a gateway that does not report outcomes. The call is ended on the `202`, as before.
 
-`transfer_call` can block for up to about 8 s while the gateway waits on the PBX, so call it off the UI thread. The gateway accepts a bare target of letters, digits and `+*#.-_`, or a `sip:`/`sips:` URI. The core's local check is deliberately looser, so the gateway remains the authority and its refusal surfaces as `InvalidTarget`. After a `202` the PBX finishes the transfer and the gateway reports the call as ended with reason `transferred`. The core ends the local call as soon as the `202` arrives, without waiting for that.
+`transfer_call` can block for up to about 40 s (the REFER, then the outcome), so call it off the UI thread. The gateway accepts a bare target of letters, digits and `+*#.-_`, or a `sip:`/`sips:` URI. The core's local check is deliberately looser, so the gateway remains the authority and its refusal surfaces as `InvalidTarget`.
 
 ## Event contract
 
@@ -154,7 +159,7 @@ Apps can be fully event-driven: install a `MobileEventHandler` with `set_event_h
 | Mute / hold | `set_mute` re-emits the current state with `muted` updated; `set_hold` emits `OnHold` or `Connected`. |
 | Local hangup | `Ended` from `hangup`. |
 | Remote hangup (BYE) | `Ended`, emitted by the core within about 2 s of the gateway seeing the BYE. No app polling is needed. |
-| Blind transfer | `Ended` once the gateway accepts `transfer_call`. |
+| Blind transfer | `Ended` once the gateway reports the call transferred. A failed or timed-out transfer emits nothing; the call stays up. |
 
 **Guarantees.** Each `call_id` that has been reported receives exactly one `Ended`, and nothing after it, whichever of the causes above wins a race. A call's events are delivered in the order its state changed, even when the changes come from different threads (for example concurrent `set_hold` and `set_mute`). Delivery is asynchronous: an engine method queues its events before it returns, but the callback may run before or after the method returns, so do not rely on either. Treat the events as the source of truth for call state and the method's return value as the outcome of that request.
 

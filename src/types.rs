@@ -149,6 +149,14 @@ pub struct CallStatusResponse {
     pub status: String,
     /// Reason the call ended (if status == "ended")
     pub reason: Option<String>,
+    /// On an active call after a blind transfer was accepted: "pending"
+    /// while the PBX works on it, "failed" when its NOTIFY reported a
+    /// failure. Absent on a gateway that does not report transfer outcomes.
+    #[serde(default)]
+    pub transfer: Option<String>,
+    /// The SIP status of a failed transfer.
+    #[serde(default)]
+    pub transfer_code: Option<u16>,
 }
 
 /// Errors from the mobile engine.
@@ -160,8 +168,10 @@ pub enum MobileError {
     AuthenticationError,
     #[error("Registration failed")]
     RegistrationFailed,
-    #[error("Call failed")]
-    CallFailed,
+    /// The message says why, for example the SIP status of a failed
+    /// transfer. It reaches the app as the error's message.
+    #[error("Call failed: {0}")]
+    CallFailed(String),
     #[error("Media error")]
     MediaError,
     #[error("Invalid state")]
