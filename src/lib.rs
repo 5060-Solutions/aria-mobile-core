@@ -163,9 +163,33 @@ fn end_call_locally(calls: &CallMap, events: &Dispatcher, call_id: &str) -> bool
     }
 }
 
-/// A call status that means the gateway no longer has a live call.
-fn status_means_ended(status: &str) -> bool {
-    status == "ended" || status == "unknown"
+/// How many consecutive `unknown` statuses count as the gateway having lost
+/// a call. A single one can be a transient answer (a gateway instance
+/// restarting, or briefly between states) and must not drop a live call.
+const UNKNOWN_STATUSES_BEFORE_ENDED: u32 = 3;
+
+/// Tracks status answers for one call and says when they mean it is gone:
+/// at once for `ended`, and after [`UNKNOWN_STATUSES_BEFORE_ENDED`]
+/// consecutive `unknown`s.
+#[derive(Default)]
+struct GoneDetector {
+    unknown_streak: u32,
+}
+
+impl GoneDetector {
+    fn is_gone(&mut self, status: &str) -> bool {
+        match status {
+            "ended" => true,
+            "unknown" => {
+                self.unknown_streak += 1;
+                self.unknown_streak >= UNKNOWN_STATUSES_BEFORE_ENDED
+            }
+            _ => {
+                self.unknown_streak = 0;
+                false
+            }
+        }
+    }
 }
 
 /// Check a blind-transfer target before it is sent to the gateway.
@@ -1080,9 +1104,10 @@ impl AriaMobileEngine {
         let calls = Arc::clone(&self.calls);
         let handler = Arc::clone(&self.events);
         let remote_ended = Arc::clone(&self.remote_ended);
+        let mut gone = GoneDetector::default();
 
         self.spawn_status_poll(route, call_token, stop, None, move |status| {
-            if !status_means_ended(&status.status) {
+            if !gone.is_gone(&status.status) {
                 return false;
             }
             log::info!(
@@ -1806,6 +1831,48 @@ mod tests {
         assert_eq!(engine.check_remote_hangup().as_deref(), Some("c1"));
         assert_eq!(engine.check_remote_hangup(), None);
         assert_eq!(recorder.states().len(), 1);
+    }
+
+    #[test]
+    fn a_stray_unknown_status_does_not_end_a_live_call() {
+        let polls = Arc::new(Mutex::new(0u32));
+        let counter = Arc::clone(&polls);
+        // unknown, active, unknown, unknown, active, ... then unknown x3.
+        let script = [
+            "unknown", "active", "unknown", "unknown", "active", "unknown", "unknown", "unknown",
+        ];
+        let gw = MockGateway::start(move |_| {
+            let mut n = counter.lock().unwrap();
+            let status = script.get(*n as usize).copied().unwrap_or("unknown");
+            *n += 1;
+            (200, format!(r#"{{"status":"{status}"}}"#))
+        });
+        let (engine, recorder) = engine(&gw.base_url);
+        let stop = insert_call(&engine, "c1", "tok");
+        engine.start_call_status_poll(
+            "c1".into(),
+            "tok".into(),
+            engine.gateway.primary_route(),
+            stop,
+        );
+
+        // Ended only after the third unknown in a row, the eighth answer.
+        let states = recorder.wait_for(1);
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].state, CallState::Ended);
+        assert!(*polls.lock().unwrap() >= 8);
+    }
+
+    #[test]
+    fn gone_detector_needs_consecutive_unknowns() {
+        let mut d = GoneDetector::default();
+        assert!(!d.is_gone("unknown"));
+        assert!(!d.is_gone("unknown"));
+        assert!(!d.is_gone("active"));
+        assert!(!d.is_gone("unknown"));
+        assert!(!d.is_gone("unknown"));
+        assert!(d.is_gone("unknown"));
+        assert!(GoneDetector::default().is_gone("ended"));
     }
 
     #[test]
