@@ -12,8 +12,8 @@ mod media;
 mod types;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 /// Refresh the gateway auth token this many seconds before it actually expires,
@@ -22,8 +22,8 @@ const TOKEN_REFRESH_SKEW_SECS: u64 = 60;
 
 pub mod ai;
 
-use types::*;
 pub use media::PlatformAudioBridge;
+use types::*;
 
 uniffi::include_scaffolding!("aria_mobile");
 
@@ -58,7 +58,9 @@ fn shutdown_runtime() {
 }
 
 fn runtime() -> &'static tokio::runtime::Runtime {
-    RUNTIME.get().expect("Runtime not initialized — call init_runtime() first")
+    RUNTIME
+        .get()
+        .expect("Runtime not initialized — call init_runtime() first")
 }
 
 // ── Event Handler ───────────────────────────────────────────────────────────
@@ -126,11 +128,7 @@ impl AriaMobileEngine {
             token_expires_at: RwLock::new(None),
             device_id: RwLock::new(None),
             ai: RwLock::new(None),
-            codec_prefs: RwLock::new(vec![
-                AudioCodec::Opus,
-                AudioCodec::Pcmu,
-                AudioCodec::Pcma,
-            ]),
+            codec_prefs: RwLock::new(vec![AudioCodec::Opus, AudioCodec::Pcmu, AudioCodec::Pcma]),
             last_registration: RwLock::new(None),
             remote_ended: Arc::new(Mutex::new(Vec::new())),
         }
@@ -281,9 +279,10 @@ impl AriaMobileEngine {
             } else {
                 let (token, expires_in) = self
                     .gateway
-                    .create_token(
-                        &format!("{}@{}", registration.sip.username, registration.sip.domain),
-                    )
+                    .create_token(&format!(
+                        "{}@{}",
+                        registration.sip.username, registration.sip.domain
+                    ))
                     .await?;
                 (token, Some(expires_in))
             };
@@ -332,11 +331,7 @@ impl AriaMobileEngine {
             }
 
             if let Some(handler) = self.event_handler.read().unwrap().as_ref() {
-                handler.on_registration_changed(
-                    device_id,
-                    "unregistered".to_string(),
-                    None,
-                );
+                handler.on_registration_changed(device_id, "unregistered".to_string(), None);
             }
 
             Ok(())
@@ -396,10 +391,7 @@ impl AriaMobileEngine {
             let token = self.ensure_valid_token().await?;
 
             // Get the call offer to know what codecs the remote supports
-            let offer = self
-                .gateway
-                .get_call_offer(&token, &call_token)
-                .await?;
+            let offer = self.gateway.get_call_offer(&token, &call_token).await?;
 
             // Start local media and generate SDP answer
             let codecs = if preferred_codecs.is_empty() {
@@ -500,8 +492,7 @@ impl AriaMobileEngine {
             };
 
             // Allocate RTP port and build SDP offer
-            let (media_session, sdp_offer) =
-                media::create_offer_session(&codecs).await?;
+            let (media_session, sdp_offer) = media::create_offer_session(&codecs).await?;
 
             let call_id = format!("outgoing-{}", uuid::Uuid::new_v4().as_simple());
 
@@ -660,12 +651,7 @@ impl AriaMobileEngine {
 
     /// Spawn a background task that polls the gateway for call status changes.
     /// Detects remote hangup (BYE from PBX) and ends the local call.
-    fn start_call_status_poll(
-        &self,
-        call_id: String,
-        call_token: String,
-        stop: Arc<AtomicBool>,
-    ) {
+    fn start_call_status_poll(&self, call_id: String, call_token: String, stop: Arc<AtomicBool>) {
         let base_url = self.gateway.base_url().to_string();
         let api_key = self.gateway.api_key().to_string();
         let auth_token = self.auth_token.read().unwrap().clone().unwrap_or_default();
@@ -789,7 +775,10 @@ impl AriaMobileEngine {
     pub fn ai_start_capture(&self, call_id: String) -> Result<(), MobileError> {
         let state = self.ai_state()?;
         let session = state.start_capture(&call_id)?;
-        let calls = self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let call = calls.get(&call_id).ok_or(MobileError::InvalidState)?;
         let media = call.media.as_ref().ok_or(MobileError::MediaError)?;
         media.set_ai_tap(Some(session));
@@ -806,7 +795,10 @@ impl AriaMobileEngine {
     pub fn ai_stop_capture(&self, call_id: String) {
         #[cfg(feature = "ai")]
         {
-            let calls = self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let calls = self
+                .calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(media) = calls.get(&call_id).and_then(|c| c.media.as_ref()) {
                 media.set_ai_tap(None);
             }
@@ -955,7 +947,9 @@ impl AriaMobileEngine {
                     rt.block_on(async {
                         let client = reqwest::Client::new();
                         match client.post(&url).bearer_auth(&tok).send().await {
-                            Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 204 => {
+                            Ok(resp)
+                                if resp.status().is_success() || resp.status().as_u16() == 204 =>
+                            {
                                 log::info!("Gateway heartbeat successful after network change");
                             }
                             Ok(resp) => {

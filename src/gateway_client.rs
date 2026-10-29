@@ -170,10 +170,8 @@ fn enforce_https(base_url: String) -> String {
         let authority = rest.split('/').next().unwrap_or("");
         let host_port = authority.rsplit('@').next().unwrap_or("");
         let host = host_port.split(':').next().unwrap_or("");
-        let is_local = host == "localhost"
-            || host == "127.0.0.1"
-            || host == "::1"
-            || host.ends_with(".local");
+        let is_local =
+            host == "localhost" || host == "127.0.0.1" || host == "::1" || host.ends_with(".local");
         // Userinfo has no business in a gateway URL; if it is present, do not
         // grant the exemption whatever the host looks like.
         let has_userinfo = authority.contains('@');
@@ -318,7 +316,10 @@ impl GatewayClient {
                 log::debug!("No SRV targets for gateway domain {}", domain);
             }
             Err(e) => {
-                log::debug!("Gateway SRV resolution failed: {} (will use base_url directly)", e);
+                log::debug!(
+                    "Gateway SRV resolution failed: {} (will use base_url directly)",
+                    e
+                );
             }
         }
 
@@ -329,7 +330,11 @@ impl GatewayClient {
     #[allow(dead_code)]
     pub fn resolved_target_count(&self) -> usize {
         let resolved = self.resolved_targets.read().unwrap();
-        if resolved.is_empty() { 1 } else { resolved.len() }
+        if resolved.is_empty() {
+            1
+        } else {
+            resolved.len()
+        }
     }
 
     /// Obtain a JWT auth token from the gateway, with SRV failover.
@@ -403,13 +408,7 @@ impl GatewayClient {
 
         for idx in 0..target_count {
             let (client, url) = self.target_request(idx, "/v1/devices");
-            match client
-                .post(&url)
-                .bearer_auth(token)
-                .json(&req)
-                .send()
-                .await
-            {
+            match client.post(&url).bearer_auth(token).json(&req).send().await {
                 Ok(resp) => {
                     if !resp.status().is_success() {
                         log::error!("Device registration failed: {}", resp.status());
@@ -431,14 +430,8 @@ impl GatewayClient {
         Err(last_err)
     }
 
-
-
     /// Send a device heartbeat — forces SIP re-registration after network change.
-    pub async fn device_heartbeat(
-        &self,
-        token: &str,
-        device_id: &str,
-    ) -> Result<(), MobileError> {
+    pub async fn device_heartbeat(&self, token: &str, device_id: &str) -> Result<(), MobileError> {
         let target_count = self.resolved_target_count();
         for idx in 0..target_count {
             let (client, url) =
@@ -460,11 +453,7 @@ impl GatewayClient {
     }
 
     /// Unregister a device.
-    pub async fn unregister_device(
-        &self,
-        token: &str,
-        device_id: &str,
-    ) -> Result<(), MobileError> {
+    pub async fn unregister_device(&self, token: &str, device_id: &str) -> Result<(), MobileError> {
         let resp = self
             .http
             .delete(self.url(&format!("/v1/devices/{}", device_id)))
@@ -533,11 +522,7 @@ impl GatewayClient {
     }
 
     /// Reject an incoming call.
-    pub async fn reject_call(
-        &self,
-        token: &str,
-        call_token: &str,
-    ) -> Result<(), MobileError> {
+    pub async fn reject_call(&self, token: &str, call_token: &str) -> Result<(), MobileError> {
         let resp = self
             .http
             .post(self.url(&format!("/v1/calls/{}/reject", call_token)))
@@ -583,13 +568,7 @@ impl GatewayClient {
 
         for idx in 0..target_count {
             let (client, url) = self.target_request(idx, "/v1/calls");
-            match client
-                .post(&url)
-                .bearer_auth(token)
-                .json(&req)
-                .send()
-                .await
-            {
+            match client.post(&url).bearer_auth(token).json(&req).send().await {
                 Ok(resp) => {
                     if !resp.status().is_success() {
                         log::error!("Make call failed: {}", resp.status());
@@ -630,11 +609,7 @@ impl GatewayClient {
     }
 
     /// Hang up an active call via the gateway.
-    pub async fn hangup_call(
-        &self,
-        token: &str,
-        call_token: &str,
-    ) -> Result<(), MobileError> {
+    pub async fn hangup_call(&self, token: &str, call_token: &str) -> Result<(), MobileError> {
         let resp = self
             .http
             .post(self.url(&format!("/v1/calls/{}/hangup", call_token)))

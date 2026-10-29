@@ -12,9 +12,9 @@
 //! That lets a host ship one binary and ask [`AriaMobileEngine::ai_available`]
 //! at runtime rather than inferring support from its build flavour.
 
-use crate::types::{AiCallInsight, AiDownloadProgress, AiInsightSummary, AiModel, MobileError};
 #[cfg(feature = "ai")]
 use crate::types::AiTranscriptSegment;
+use crate::types::{AiCallInsight, AiDownloadProgress, AiInsightSummary, AiModel, MobileError};
 
 #[cfg(feature = "ai")]
 use std::collections::HashMap;
@@ -121,9 +121,7 @@ impl AiState {
     }
 
     pub fn clear_insights(&self) -> u64 {
-        self.store
-            .as_ref()
-            .map_or(0, |s| s.clear().unwrap_or(0))
+        self.store.as_ref().map_or(0, |s| s.clear().unwrap_or(0))
     }
 
     pub fn models(&self) -> Vec<AiModel> {
@@ -213,26 +211,39 @@ impl AiState {
             MobileError::InvalidState
         })?;
         let drain = session.spawn_drain_thread(Self::DRAIN_INTERVAL);
-        self.sessions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(
-            call_id.to_string(),
-            CaptureSession {
-                session: session.clone(),
-                _drain: drain,
-            },
-        );
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                call_id.to_string(),
+                CaptureSession {
+                    session: session.clone(),
+                    _drain: drain,
+                },
+            );
         Ok(session)
     }
 
     /// Stop capturing but keep the audio, so it can still be transcribed.
     pub fn stop_capture(&self, call_id: &str) {
-        if let Some(entry) = self.sessions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(call_id) {
+        if let Some(entry) = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(call_id)
+        {
             let _ = entry.session.stop();
         }
     }
 
     /// Throw away a capture without transcribing it.
     pub fn discard(&self, call_id: &str) {
-        if let Some(entry) = self.sessions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(call_id) {
+        if let Some(entry) = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(call_id)
+        {
             entry.session.discard();
         }
     }
@@ -243,7 +254,10 @@ impl AiState {
     /// [`MobileError::InvalidState`] when there is no capture for that call, no
     /// speech-to-text model is installed, or the model fails to run.
     pub fn transcribe(&self, call_id: &str) -> Result<AiCallInsight, MobileError> {
-        let entry = self.sessions.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        let entry = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(call_id)
             .ok_or_else(|| {
                 log::warn!("transcribe: no capture for {call_id}");
