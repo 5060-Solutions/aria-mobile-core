@@ -1003,12 +1003,20 @@ mod ai_tap_tests {
         ai: Arc<CallSession>,
         bridge: Arc<RecordingBridge>,
         port: u16,
+        /// The far end: the session's remote address, so the RX loop's
+        /// source latch accepts what it sends, and where TX goes.
+        peer: tokio::net::UdpSocket,
     }
 
     async fn fixture(call_id: &str) -> Fixture {
-        // Somewhere to send TX to that will not bother anyone.
-        let sink: SocketAddr = "127.0.0.1:9".parse().expect("addr");
-        let session = MobileMediaSession::new(sink, AudioCodec::Pcmu)
+        // The tone must come from the session's remote address: RX drops
+        // packets from any other source. TX goes back to the same socket,
+        // which nothing reads.
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let remote = peer.local_addr().expect("peer addr");
+        let session = MobileMediaSession::new(remote, AudioCodec::Pcmu)
             .await
             .expect("media session");
         let port = session.local_port();
@@ -1024,14 +1032,12 @@ mod ai_tap_tests {
             ai,
             bridge,
             port,
+            peer,
         }
     }
 
-    /// Send `n` packets of tone at the session's RTP port.
-    async fn send_tone(port: u16, n: u16) {
-        let tx = tokio::net::UdpSocket::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
+    /// Send `n` packets of tone from `tx` at the session's RTP port.
+    async fn send_tone(tx: &tokio::net::UdpSocket, port: u16, n: u16) {
         let target: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
         let ssrc = 0x1234_5678;
         for i in 0..n {
@@ -1047,7 +1053,7 @@ mod ai_tap_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn far_end_rtp_reaches_the_ai_and_still_reaches_the_speaker() {
         let f = fixture("call-tap-1").await;
-        send_tone(f.port, 50).await;
+        send_tone(&f.peer, f.port, 50).await;
 
         // push_* only fills the ring buffer; captured_ms counts what pump()
         // has drained and resampled. In production this is the AI core's own
@@ -1078,13 +1084,13 @@ mod ai_tap_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn detaching_the_tap_stops_the_flow_without_ending_the_call() {
         let f = fixture("call-tap-2").await;
-        send_tone(f.port, 25).await;
+        send_tone(&f.peer, f.port, 25).await;
         f.ai.pump().expect("pump");
         let before = f.ai.tap().stats().1.captured_ms;
         assert!(before > 0, "expected audio before detaching");
 
         f.session.set_ai_tap(None);
-        send_tone(f.port, 25).await;
+        send_tone(&f.peer, f.port, 25).await;
         f.ai.pump().expect("pump");
         let after = f.ai.tap().stats().1.captured_ms;
         assert_eq!(after, before, "audio kept flowing to the AI after detach");
@@ -1132,7 +1138,7 @@ mod ai_tap_tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = vec![8000_i16; 160];
         f.session.set_hold(true);
-        send_tone(f.port, 50).await;
+        send_tone(&f.peer, f.port, 50).await;
 
         f.ai.pump().expect("pump");
         let (local, remote) = f.ai.tap().stats();
