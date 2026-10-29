@@ -364,10 +364,37 @@ pub struct AriaMobileEngine {
 
 /// An offered incoming call that has not been accepted or rejected yet.
 struct PendingIncoming {
-    /// Stops the poll that watches for the caller cancelling.
+    /// Stops the poll that watches the call.
     stop: Arc<AtomicBool>,
     /// The gateway instance that offered the call.
     route: Route,
+    /// The call as it would be reported, under `incoming-<call_token>`.
+    info: CallInfo,
+    /// Shared with the active call if it is accepted, so the offer and the
+    /// call get exactly one `Ended` between them.
+    events: Arc<CallEvents>,
+    /// `accept_incoming_call` is sending the accept, so an `active` status
+    /// is this handset answering, not another device.
+    accepting: bool,
+    /// The accept may or may not have reached the gateway (it timed out or
+    /// the connection dropped), and the app has been told the call ended.
+    /// The watch hangs the call up if it turns out to have been answered,
+    /// and rejects it if it is still ringing.
+    abandoned: bool,
+    /// The watch has already rejected the abandoned call.
+    rejected: bool,
+}
+
+/// What a status poll does after a status answer.
+enum PollAction {
+    /// Keep polling.
+    Continue,
+    /// Stop polling.
+    Stop,
+    /// Reject the (still ringing) call, then keep polling.
+    Reject,
+    /// Hang the (answered) call up, then stop polling.
+    HangUp,
 }
 
 /// How many outgoing call_ids are remembered once used, so that a late
@@ -655,33 +682,96 @@ impl AriaMobileEngine {
             let (media_session, sdp_answer) =
                 media::create_answer_session(&offer.sdp_offer, &codecs).await?;
 
-            // Send the answer to the gateway
-            self.gateway
-                .accept_call(&route, &token, &call_token, &sdp_answer)
-                .await?;
-            self.clear_pending_incoming(&call_token);
+            self.answer_offer(&token, offer, route, Some(media_session), sdp_answer)
+                .await
+        })
+    }
 
-            // Use the full call token, not a truncated prefix: two concurrent
-            // incoming calls whose tokens share the first 8 chars would collide
-            // on the same HashMap key, orphaning one call's media/poll threads.
-            let call_id = format!("incoming-{call_token}");
-            let info = CallInfo {
-                call_id: call_id.clone(),
-                remote_uri: offer.caller_uri,
-                remote_name: offer.caller_name,
-                state: CallState::Connected,
-                direction: CallDirection::Inbound,
-                muted: false,
-                on_hold: false,
-                duration_secs: 0,
-            };
+    /// Send the answer for an offered call and make it the active call.
+    ///
+    /// If the accept fails with a timeout or a transport error, the gateway
+    /// may have accepted the call anyway. The app is told the call ended
+    /// (exactly one `Ended` for `incoming-<call_token>`), and the call is
+    /// handed to the incoming watch as abandoned: it hangs the call up if it
+    /// shows up `active`, and rejects it while it still rings, so it is never
+    /// left connected with nobody on this end. A refusal from the gateway
+    /// leaves the call offered, as before. `media` is `None` only in tests.
+    async fn answer_offer(
+        &self,
+        token: &str,
+        offer: CallOffer,
+        route: Route,
+        media: Option<media::MobileMediaSession>,
+        sdp_answer: String,
+    ) -> Result<CallInfo, MobileError> {
+        let call_token = offer.call_token.clone();
+        let call_id = format!("incoming-{call_token}");
+        let info = CallInfo {
+            call_id: call_id.clone(),
+            remote_uri: offer.caller_uri.clone(),
+            remote_name: offer.caller_name.clone(),
+            state: CallState::Connected,
+            direction: CallDirection::Inbound,
+            muted: false,
+            on_hold: false,
+            duration_secs: 0,
+        };
 
-            // Start RTP processing with the platform audio bridge. Without this
-            // the media session is created and stored but its RX/TX threads
-            // never run, so an ANSWERED INBOUND CALL HAS NO AUDIO in either
-            // direction. (The remote RTP address is already set by
-            // `create_answer_session` from the caller's SDP offer, so unlike the
-            // outbound path there is no separate `update_remote` step here.)
+        // From here an `active` status is this handset answering.
+        let events = {
+            let mut pending = self
+                .pending_incoming
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match pending.get_mut(&call_token) {
+                Some(entry) => {
+                    entry.accepting = true;
+                    Arc::clone(&entry.events)
+                }
+                None => Arc::default(),
+            }
+        };
+
+        match self
+            .gateway
+            .accept_call(&route, token, &call_token, &sdp_answer)
+            .await
+        {
+            Ok(()) => {}
+            Err(e @ (MobileError::Timeout | MobileError::NetworkError)) => {
+                log::warn!("Accept of {call_id} has an unknown outcome ({e}); abandoning it");
+                if let Some(media) = &media {
+                    media.stop();
+                }
+                self.watch_incoming(&offer, route, true);
+                events.emit_ended(&self.events, &info);
+                return Err(e);
+            }
+            Err(e) => {
+                // Refused: the call is still offered and still watched.
+                if let Some(entry) = self
+                    .pending_incoming
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get_mut(&call_token)
+                {
+                    entry.accepting = false;
+                }
+                if let Some(media) = &media {
+                    media.stop();
+                }
+                return Err(e);
+            }
+        }
+        self.clear_pending_incoming(&call_token);
+
+        // Start RTP processing with the platform audio bridge. Without this
+        // the media session is created and stored but its RX/TX threads
+        // never run, so an ANSWERED INBOUND CALL HAS NO AUDIO in either
+        // direction. (The remote RTP address is already set by
+        // `create_answer_session` from the caller's SDP offer, so unlike the
+        // outbound path there is no separate `update_remote` step here.)
+        if let Some(media_session) = &media {
             if let Some(bridge) = self
                 .audio_bridge
                 .read()
@@ -693,33 +783,53 @@ impl AriaMobileEngine {
             } else {
                 log::warn!("No audio bridge set — inbound call will have no audio");
             }
+        }
 
-            let poll_stop = Arc::new(AtomicBool::new(false));
-            let events = Arc::new(CallEvents::default());
-
-            {
-                let mut calls = self.calls.lock().unwrap();
+        let poll_stop = Arc::new(AtomicBool::new(false));
+        let connected = {
+            let mut calls = self
+                .calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Queued while the call-map lock is held, so nothing done to the
+            // call afterwards can be delivered ahead of it. Refused when the
+            // offer was already reported ended (the caller hung up as it
+            // was answered).
+            let connected = events.emit(&self.events, info.clone());
+            if connected {
                 calls.insert(
                     call_id.clone(),
                     ActiveCallState {
                         info: info.clone(),
-                        media: Some(media_session),
+                        media,
                         call_token: Some(call_token.clone()),
                         route: route.clone(),
                         poll_stop: poll_stop.clone(),
                         events: Arc::clone(&events),
                     },
                 );
-                // Queued while the call-map lock is held, so nothing done to
-                // the call afterwards can be delivered ahead of it.
-                events.emit(&self.events, info.clone());
+            } else if let Some(media) = &media {
+                media.stop();
             }
+            connected
+        };
+        if !connected {
+            log::info!("{call_id} ended as it was answered; hanging up");
+            let (gateway, auth, handler) = (
+                Arc::clone(&self.gateway),
+                Arc::clone(&self.auth),
+                Arc::clone(&self.events),
+            );
+            runtime().spawn(async move {
+                hang_up_at_gateway(&gateway, &auth, &handler, &route, &call_id, &call_token).await;
+            });
+            return Err(MobileError::InvalidState);
+        }
 
-            // Start polling for remote hangup only after Connected is queued,
-            // so a remote hangup can never be reported ahead of it.
-            self.start_call_status_poll(call_id.clone(), call_token, route, poll_stop);
-            Ok(info)
-        })
+        // Start polling for remote hangup only after Connected is queued,
+        // so a remote hangup can never be reported ahead of it.
+        self.start_call_status_poll(call_id, call_token, route, poll_stop);
+        Ok(info)
     }
 
     pub fn reject_incoming_call(&self, call_token: String) -> Result<(), MobileError> {
@@ -1425,7 +1535,7 @@ impl AriaMobileEngine {
         call_token: String,
         stop: Arc<AtomicBool>,
         max_age: Option<Duration>,
-        mut on_status: impl FnMut(&CallStatusResponse) -> bool + Send + 'static,
+        mut on_status: impl FnMut(&CallStatusResponse) -> PollAction + Send + 'static,
     ) {
         let started = Instant::now();
         let gateway = Arc::clone(&self.gateway);
@@ -1454,12 +1564,32 @@ impl AriaMobileEngine {
                 // so the gateway's 401 reaches the app the same way.
                 let (token, generation) = auth.snapshot();
                 match gateway.get_call_status(&route, &token, &call_token).await {
-                    Ok(status) => {
-                        if on_status(&status) {
+                    Ok(status) => match on_status(&status) {
+                        PollAction::Continue => {}
+                        PollAction::Stop => {
                             stop.store(true, Ordering::Relaxed);
                             break;
                         }
-                    }
+                        PollAction::Reject => {
+                            if let Err(e) = gateway.reject_call(&route, &token, &call_token).await {
+                                log::warn!("Could not reject {}: {}", call_token, e);
+                            }
+                        }
+                        PollAction::HangUp => {
+                            stop.store(true, Ordering::Relaxed);
+                            let call_id = format!("incoming-{call_token}");
+                            hang_up_at_gateway(
+                                &gateway,
+                                &auth,
+                                &handler,
+                                &route,
+                                &call_id,
+                                &call_token,
+                            )
+                            .await;
+                            break;
+                        }
+                    },
                     // An expired token says nothing about the call, so the
                     // poll keeps the call up and keeps polling; it resumes
                     // with the next token from `set_gateway_token`.
@@ -1493,7 +1623,7 @@ impl AriaMobileEngine {
 
         self.spawn_status_poll(route, call_token, stop, None, move |status| {
             if !gone.is_gone(&status.status) {
-                return false;
+                return PollAction::Continue;
             }
             log::info!(
                 "Remote hangup detected for {} (reason: {:?})",
@@ -1510,7 +1640,7 @@ impl AriaMobileEngine {
                     ended.drain(..excess);
                 }
             }
-            true
+            PollAction::Stop
         });
     }
 
@@ -1522,85 +1652,110 @@ impl AriaMobileEngine {
     /// the app can dismiss its ringing UI. The watch stops as soon as the call
     /// is accepted or rejected.
     fn start_pending_incoming_poll(&self, offer: &CallOffer, route: Route) {
+        self.watch_incoming(offer, route, false);
+    }
+
+    /// Watch an offered call, or mark an existing watch `abandoned`. Returns
+    /// the events shared by everything that can report the call.
+    ///
+    /// Until the call is accepted or rejected the watch reports, with one
+    /// `Ended` for `incoming-<call_token>`, the caller hanging up (`ended`,
+    /// or `unknown` three times in a row) and the call being answered on
+    /// another device (`active` while this handset is not accepting). For an
+    /// abandoned call it instead hangs the call up if it is `active`, and
+    /// rejects it once while it still rings; the app has already been told
+    /// it ended.
+    fn watch_incoming(&self, offer: &CallOffer, route: Route, abandoned: bool) -> Arc<CallEvents> {
         let call_token = offer.call_token.clone();
         let stop = Arc::new(AtomicBool::new(false));
-        {
+        let events = {
             let mut pending = self
                 .pending_incoming
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if pending.contains_key(&call_token) {
-                return;
+            if let Some(existing) = pending.get_mut(&call_token) {
+                existing.abandoned |= abandoned;
+                existing.accepting &= !abandoned;
+                return Arc::clone(&existing.events);
             }
+            let events: Arc<CallEvents> = Arc::default();
             pending.insert(
                 call_token.clone(),
                 PendingIncoming {
                     stop: Arc::clone(&stop),
                     route: route.clone(),
+                    info: CallInfo {
+                        call_id: format!("incoming-{call_token}"),
+                        remote_uri: offer.caller_uri.clone(),
+                        remote_name: offer.caller_name.clone(),
+                        state: CallState::Ended,
+                        direction: CallDirection::Inbound,
+                        muted: false,
+                        on_hold: false,
+                        duration_secs: 0,
+                    },
+                    events: Arc::clone(&events),
+                    accepting: false,
+                    abandoned,
+                    rejected: false,
                 },
             );
-        }
-
-        let info = CallInfo {
-            call_id: format!("incoming-{call_token}"),
-            remote_uri: offer.caller_uri.clone(),
-            remote_name: offer.caller_name.clone(),
-            state: CallState::Ended,
-            direction: CallDirection::Inbound,
-            muted: false,
-            on_hold: false,
-            duration_secs: 0,
+            events
         };
+
         let pending = Arc::clone(&self.pending_incoming);
         let handler = Arc::clone(&self.events);
         let token = call_token.clone();
         // While the gateway hands a call from pending to active it can briefly
         // report "unknown", so only several in a row count as gone. "ended" is
         // definitive: the gateway records a CANCEL that way.
-        let mut unknown_streak = 0u32;
-        let offer_events = CallEvents::default();
+        let mut gone = GoneDetector::default();
 
         let deadline = Some(PENDING_INCOMING_MAX_WATCH);
         self.spawn_status_poll(route, call_token, stop, deadline, move |status| {
-            let gone = match status.status.as_str() {
-                "ended" => true,
-                "unknown" => {
-                    unknown_streak += 1;
-                    unknown_streak >= 3
-                }
-                // Answered, here or on another device: nothing to report.
-                "active" => {
-                    pending
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(&token);
-                    return true;
-                }
-                _ => {
-                    unknown_streak = 0;
-                    false
-                }
-            };
-            if !gone {
-                return false;
-            }
-            // Removing the entry decides the race with accept/reject: if they
-            // got there first, the app already knows the outcome.
-            let still_pending = pending
+            // Decided under the pending lock, against accept, reject and
+            // abandonment.
+            let mut pending = pending
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&token)
-                .is_some();
-            if still_pending {
-                log::info!(
-                    "Incoming call {} ended before answer (reason: {:?})",
-                    token,
-                    status.reason,
-                );
-                offer_events.emit(&handler, info.clone());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(entry) = pending.get_mut(&token) else {
+                // Accepted or rejected meanwhile: the app knows the outcome.
+                return PollAction::Stop;
+            };
+            if status.status == "active" {
+                let accepting = entry.accepting;
+                let entry = pending.remove(&token).expect("present");
+                if accepting {
+                    // This handset is answering; accept reports the outcome.
+                    return PollAction::Stop;
+                }
+                if entry.abandoned {
+                    log::info!("Abandoned incoming call {} was answered; hanging up", token);
+                    return PollAction::HangUp;
+                }
+                log::info!("Incoming call {} answered elsewhere", token);
+                entry.events.emit(&handler, entry.info.clone());
+                return PollAction::Stop;
             }
-            true
+            if gone.is_gone(&status.status) {
+                let entry = pending.remove(&token).expect("present");
+                if !entry.abandoned {
+                    log::info!(
+                        "Incoming call {} ended before answer (reason: {:?})",
+                        token,
+                        status.reason,
+                    );
+                    entry.events.emit(&handler, entry.info.clone());
+                }
+                return PollAction::Stop;
+            }
+            if entry.abandoned && !entry.rejected {
+                entry.rejected = true;
+                return PollAction::Reject;
+            }
+            PollAction::Continue
         });
+        events
     }
 
     /// Stop watching an offered incoming call; it has been accepted or rejected.
@@ -1920,6 +2075,11 @@ pub(crate) mod mock_gateway {
                         let (status, body) = respond(&req);
                         req.status = status;
                         seen.lock().unwrap().push(req);
+                        // Status 0: drop the connection without answering,
+                        // as a request lost after it was delivered.
+                        if status == 0 {
+                            return;
+                        }
                         let resp = format!(
                             "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
                              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -2558,6 +2718,14 @@ mod tests {
         let (engine, recorder) = engine(&gw.base_url);
 
         engine.start_pending_incoming_poll(&offer("tok-2"), engine.gateway.primary_route());
+        // This handset is answering.
+        engine
+            .pending_incoming
+            .lock()
+            .unwrap()
+            .get_mut("tok-2")
+            .unwrap()
+            .accepting = true;
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while !engine.pending_incoming.lock().unwrap().is_empty() && Instant::now() < deadline {
@@ -2565,6 +2733,148 @@ mod tests {
         }
         assert!(engine.pending_incoming.lock().unwrap().is_empty());
         assert!(recorder.states().is_empty());
+    }
+
+    #[test]
+    fn a_call_answered_on_another_device_is_reported_ended_once() {
+        let gw = MockGateway::start(|_| (200, r#"{"status":"active"}"#.into()));
+        let (engine, recorder) = engine(&gw.base_url);
+
+        engine.start_pending_incoming_poll(&offer("tok-o"), engine.gateway.primary_route());
+
+        let states = recorder.wait_for(1);
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].call_id, "incoming-tok-o");
+        assert_eq!(states[0].state, CallState::Ended);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(recorder.states().len(), 1);
+        assert!(gw.requests().iter().all(|r| r.path.ends_with("/status")));
+    }
+
+    /// `answer_offer` with a mock gateway, without media.
+    fn answer_here(engine: &AriaMobileEngine, token: &str) -> Result<CallInfo, MobileError> {
+        runtime().block_on(engine.answer_offer(
+            "jwt",
+            offer(token),
+            engine.gateway.primary_route(),
+            None,
+            "v=0".into(),
+        ))
+    }
+
+    /// A gateway with one offered call, `tok-a`, whose accept the client
+    /// never hears back about: the request arrives, the gateway acts on it
+    /// (if `accepts`), and the connection drops without a response.
+    fn gateway_that_drops_the_accept(accepts: bool) -> MockGateway {
+        let state = Arc::new(Mutex::new("pending"));
+        MockGateway::start(move |req| {
+            let mut state = state.lock().unwrap();
+            match req.path.as_str() {
+                "/v1/calls/tok-a/accept" => {
+                    if accepts {
+                        *state = "active";
+                    }
+                    (0, String::new())
+                }
+                "/v1/calls/tok-a/status" => (200, format!(r#"{{"status":"{state}"}}"#)),
+                "/v1/calls/tok-a/reject" | "/v1/calls/tok-a/hangup" => {
+                    *state = "ended";
+                    (200, "{}".into())
+                }
+                _ => (200, "{}".into()),
+            }
+        })
+    }
+
+    #[test]
+    fn an_accept_that_reached_the_gateway_but_not_the_app_is_hung_up() {
+        let gw = gateway_that_drops_the_accept(true);
+        let (engine, recorder) = engine(&gw.base_url);
+        engine.start_pending_incoming_poll(&offer("tok-a"), engine.gateway.primary_route());
+
+        let err = answer_here(&engine, "tok-a").unwrap_err();
+        assert!(
+            matches!(err, MobileError::NetworkError | MobileError::Timeout),
+            "{err:?}"
+        );
+
+        // The app hears the call ended, once, and the call is not left up.
+        assert!(eventually(|| count(&gw, "/v1/calls/tok-a/hangup") == 1));
+        std::thread::sleep(Duration::from_millis(100));
+        let states = recorder.states();
+        assert_eq!(states.len(), 1, "{states:?}");
+        assert_eq!(states[0].call_id, "incoming-tok-a");
+        assert_eq!(states[0].state, CallState::Ended);
+        assert!(engine.get_active_call().is_none());
+        assert_eq!(count(&gw, "/v1/calls/tok-a/reject"), 0);
+    }
+
+    #[test]
+    fn an_accept_that_never_arrived_is_rejected_not_left_ringing() {
+        let gw = gateway_that_drops_the_accept(false);
+        let (engine, recorder) = engine(&gw.base_url);
+        engine.start_pending_incoming_poll(&offer("tok-a"), engine.gateway.primary_route());
+
+        answer_here(&engine, "tok-a").unwrap_err();
+
+        assert!(eventually(|| count(&gw, "/v1/calls/tok-a/reject") == 1));
+        assert!(eventually(|| engine
+            .pending_incoming
+            .lock()
+            .unwrap()
+            .is_empty()));
+        let states = recorder.states();
+        assert_eq!(states.len(), 1, "{states:?}");
+        assert_eq!(states[0].state, CallState::Ended);
+        assert_eq!(count(&gw, "/v1/calls/tok-a/hangup"), 0);
+    }
+
+    /// Without a push (no watch yet), a lost accept still gets a watch that
+    /// hangs the call up.
+    #[test]
+    fn a_lost_accept_without_a_push_is_still_hung_up() {
+        let gw = gateway_that_drops_the_accept(true);
+        let (engine, recorder) = engine(&gw.base_url);
+
+        answer_here(&engine, "tok-a").unwrap_err();
+
+        assert!(eventually(|| count(&gw, "/v1/calls/tok-a/hangup") == 1));
+        assert_eq!(recorder.states().len(), 1);
+    }
+
+    #[test]
+    fn a_refused_accept_leaves_the_call_offered() {
+        let gw = MockGateway::start(|req| match req.path.as_str() {
+            "/v1/calls/tok-f/accept" => (404, "{}".into()),
+            _ => (200, r#"{"status":"pending"}"#.into()),
+        });
+        let (engine, recorder) = engine(&gw.base_url);
+        engine.start_pending_incoming_poll(&offer("tok-f"), engine.gateway.primary_route());
+
+        let err = answer_here(&engine, "tok-f").unwrap_err();
+
+        assert!(matches!(err, MobileError::CallFailed(_)), "{err:?}");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(recorder.states().is_empty());
+        let pending = engine.pending_incoming.lock().unwrap();
+        assert!(!pending["tok-f"].accepting && !pending["tok-f"].abandoned);
+        drop(pending);
+        engine.clear_pending_incoming("tok-f");
+    }
+
+    #[test]
+    fn an_accepted_call_shares_the_offers_single_ended() {
+        let gw = MockGateway::start(|_| (200, r#"{"status":"pending"}"#.into()));
+        let (engine, recorder) = engine(&gw.base_url);
+        engine.start_pending_incoming_poll(&offer("tok-s"), engine.gateway.primary_route());
+
+        let info = answer_here(&engine, "tok-s").unwrap();
+        assert_eq!(info.call_id, "incoming-tok-s");
+        assert!(engine.pending_incoming.lock().unwrap().is_empty());
+        engine.hangup(info.call_id).unwrap();
+
+        let states: Vec<_> = recorder.states().iter().map(|i| i.state).collect();
+        assert_eq!(states, [CallState::Connected, CallState::Ended]);
     }
 
     #[test]

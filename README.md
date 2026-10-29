@@ -156,6 +156,8 @@ Apps can be fully event-driven: install a `MobileEventHandler` with `set_event_h
 | Outgoing, hung up before it is answered | `Ringing` then `Ended`, or only `Ended` if `hangup(id)` came before `make_call_with_id(id, ...)`. `make_call_with_id` throws `Cancelled`. |
 | Incoming | `on_incoming_call(offer)` from `handle_push_notification`, then `Connected` from `accept_incoming_call`. `reject_incoming_call` emits nothing. |
 | Caller cancels before answer | `Ended` for `incoming-<call_token>`, detected within about 2 s while the call is unanswered (watched for up to 10 minutes). |
+| Answered on another device | `Ended` for `incoming-<call_token>`, once the gateway reports the call active while this handset is not accepting it. |
+| Accept with an unknown outcome | `accept_incoming_call` throws `Timeout` or `NetworkError`, and `Ended` is reported for `incoming-<call_token>`. The gateway may have accepted the call anyway, so the core keeps watching it. If it shows up active, the core hangs it up. If it is still ringing, the core rejects it. It is never left connected with nobody on this end. If the gateway refused the accept (an HTTP error), nothing is reported, and the call stays offered. |
 | Mute / hold | `set_mute` re-emits the current state with `muted` updated; `set_hold` emits `OnHold` or `Connected`. |
 | Local hangup | `Ended` from `hangup`. |
 | Remote hangup (BYE) | `Ended`, emitted by the core within about 2 s of the gateway seeing the BYE. No app polling is needed. |
