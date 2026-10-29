@@ -140,13 +140,17 @@ callback interface MobileEventHandler {
     /// Called when media statistics are updated.
     void on_media_stats(string call_id, MediaStats stats);
 
-    /// Called when an error occurs.
+    /// Called when background work failed in a way the app should surface.
+    /// Currently fired with context `"hangup"` when the gateway did not
+    /// confirm hanging up a call even after one retry (for example a 404
+    /// because it does not know the call): the call has ended here, but the
+    /// other party may still be connected. `message` names the call_id.
     void on_error(string context, string message);
 
     /// Called when background work (call-status polls, the caller-cancel
-    /// watch, the network-change heartbeat, hanging up an outgoing call that
-    /// was answered after it was cancelled) had the gateway token rejected
-    /// with 401. Fetch a new token from
+    /// watch, the network-change heartbeat, `hangup`'s gateway hangup or
+    /// cancel, and hanging up an outgoing call that was answered after it
+    /// was cancelled) had the gateway token rejected with 401. Fetch a new token from
     /// the PBX (`POST /api/v1/devices/{id}/gateway-token`) and pass it to
     /// `set_gateway_token`. Emitted at most once per token: it fires again
     /// only after `set_gateway_token` has been called and the new token is
@@ -224,12 +228,13 @@ interface AriaMobileEngine {
     /// (see `make_call`). Throws `InvalidState` for an unknown or already
     /// ended call_id.
     ///
-    /// The local call always ends and `Ended` is emitted. Throws
-    /// `AuthenticationError` if the gateway rejected the token (401) for the
-    /// hangup or, for a ringing call, the cancel. The far end may then stay up
-    /// until the PBX times it out (a ringing call that is answered is still
-    /// hung up in the background): fetch a new token and call
-    /// `set_gateway_token`.
+    /// Never waits on the gateway: the call is torn down locally and `Ended`
+    /// is queued at once, and the gateway hangup (or, for a ringing call, the
+    /// cancel) runs in the background. Throws `AuthenticationError`, after
+    /// ending the call locally, only when there is no gateway token at all,
+    /// in which case nothing is sent. Background failures are reported later:
+    /// a rejected token through `on_auth_required`, and a hangup the gateway
+    /// did not confirm (after one retry) through `on_error`.
     [Throws=MobileError]
     void hangup(string call_id);
 
