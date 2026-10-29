@@ -140,6 +140,17 @@ callback interface MobileEventHandler {
 
     /// Called when an error occurs.
     void on_error(string context, string message);
+
+    /// Called when background work (call-status polls, the caller-cancel
+    /// watch, the network-change heartbeat) had the gateway token rejected
+    /// with 401. Fetch a new token from
+    /// the PBX (`POST /api/v1/devices/{id}/gateway-token`) and pass it to
+    /// `set_gateway_token`. Emitted at most once per token: it fires again
+    /// only after `set_gateway_token` has been called and the new token is
+    /// rejected too. A rejected poll does not end the call; polling resumes
+    /// with the new token. Engine methods report a 401 by throwing
+    /// `AuthenticationError` instead of through this callback.
+    void on_auth_required();
 };
 
 /// The main mobile SIP engine interface.
@@ -196,6 +207,11 @@ interface AriaMobileEngine {
     // ── Mid-call Controls ──────────────────────────────────────────
 
     /// Hang up an active call.
+    ///
+    /// The local call always ends and `Ended` is emitted. Throws
+    /// `AuthenticationError` if the gateway rejected the token (401), in
+    /// which case the far end may stay up until the PBX times it out: fetch a
+    /// new token and call `set_gateway_token`.
     [Throws=MobileError]
     void hangup(string call_id);
 
@@ -394,6 +410,9 @@ dictionary AiCallInsight {
 [Error]
 enum MobileError {
     "NetworkError",
+    /// There is no gateway token, or the gateway rejected it (HTTP 401).
+    /// Every method that talks to the gateway reports a 401 this way. Fetch a
+    /// new token from the PBX and pass it to `set_gateway_token`.
     "AuthenticationError",
     "RegistrationFailed",
     "CallFailed",

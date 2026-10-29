@@ -77,6 +77,7 @@ pub trait MobileEventHandler: Send + Sync + 'static {
     fn on_call_state_changed(&self, info: CallInfo);
     fn on_media_stats(&self, call_id: String, stats: MediaStats);
     fn on_error(&self, context: String, message: String);
+    fn on_auth_required(&self);
 }
 
 /// The installed event handler, shared with the background status-poll
@@ -117,6 +118,15 @@ fn with_handler(slot: &HandlerSlot, f: impl FnOnce(&dyn MobileEventHandler)) {
 fn emit_call_state_to(slot: &HandlerSlot, info: &CallInfo) {
     let info = info.clone();
     with_handler(slot, |h| h.on_call_state_changed(info));
+}
+
+/// Tell the app that background work had the gateway token of `generation`
+/// rejected, unless it has already been told about this token.
+fn report_auth_rejected(auth: &auth::GatewayAuth, slot: &HandlerSlot, generation: u64) {
+    if auth.report_rejection(generation) {
+        log::warn!("Gateway rejected the token; asking the app for a new one");
+        with_handler(slot, |h| h.on_auth_required());
+    }
 }
 
 /// Remove a call from the map and stop its status poll and media.
@@ -585,16 +595,25 @@ impl AriaMobileEngine {
             // means a racing remote-hangup poll cannot also report it.
             let call = take_call(&self.calls, &call_id).ok_or(MobileError::InvalidState)?;
 
-            // If gateway-routed, send hangup to gateway
+            // If gateway-routed, send hangup to gateway. Other gateway
+            // failures are ignored as before: the call is over locally either
+            // way, and the gateway also ends it when the PBX sends BYE.
+            let mut result = Ok(());
             if let Some(call_token) = &call.call_token {
-                if let Ok(token) = self.auth.token() {
-                    let _ = self.gateway.hangup_call(&token, call_token).await;
+                let sent = match self.auth.token() {
+                    Ok(token) => self.gateway.hangup_call(&token, call_token).await,
+                    Err(e) => Err(e),
+                };
+                if let Err(MobileError::AuthenticationError) = sent {
+                    // The local call still ends, but the far end may stay up
+                    // until the PBX times it out, so the app must know.
+                    result = Err(MobileError::AuthenticationError);
                 }
             }
 
             emit_ended(&self.event_handler, &call);
 
-            Ok(())
+            result
         })
     }
 
@@ -700,6 +719,7 @@ impl AriaMobileEngine {
         let started = Instant::now();
         let base_url = self.gateway.base_url().to_string();
         let auth = Arc::clone(&self.auth);
+        let handler = Arc::clone(&self.event_handler);
         let interval = self.poll_interval;
 
         std::thread::spawn(move || {
@@ -729,13 +749,21 @@ impl AriaMobileEngine {
                         break;
                     }
 
-                    let token = auth.token().unwrap_or_default();
+                    // With no token at all the request goes out unauthenticated,
+                    // so the gateway's 401 reaches the app the same way.
+                    let (token, generation) = auth.current().unwrap_or_default();
                     match gateway.get_call_status(&token, &call_token).await {
                         Ok(status) => {
                             if on_status(&status) {
                                 stop.store(true, Ordering::Relaxed);
                                 break;
                             }
+                        }
+                        // An expired token says nothing about the call, so the
+                        // poll keeps the call up and keeps polling; it resumes
+                        // with the next token from `set_gateway_token`.
+                        Err(MobileError::AuthenticationError) => {
+                            report_auth_rejected(&auth, &handler, generation);
                         }
                         Err(e) => {
                             log::warn!("Call status poll error: {}", e);
@@ -1099,34 +1127,27 @@ impl AriaMobileEngine {
 
         // Send heartbeat to push gateway — re-registers SIP with fresh socket
         let device_id = self.device_id.read().unwrap().clone();
-        let token = self.auth.token().ok();
-        if let (Some(did), Some(tok)) = (device_id, token) {
+        let current = self.auth.current();
+        if let (Some(did), Some((tok, generation))) = (device_id, current) {
             log::info!("Sending heartbeat for device {} after network change", did);
-            // Build heartbeat URL and send via a simple HTTP POST.
-            // We avoid cloning GatewayClient by constructing the request directly.
+            // A fresh client on its own thread and runtime, as for the status
+            // polls: this runs in the background and must not block the caller.
             let base_url = self.gateway.base_url().to_string();
-            let url = format!("{}/v1/devices/{}/heartbeat", base_url, did);
+            let auth = Arc::clone(&self.auth);
+            let handler = Arc::clone(&self.event_handler);
             std::thread::spawn(move || {
                 if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                 {
-                    rt.block_on(async {
-                        let client = reqwest::Client::new();
-                        match client.post(&url).bearer_auth(&tok).send().await {
-                            Ok(resp)
-                                if resp.status().is_success() || resp.status().as_u16() == 204 =>
-                            {
-                                log::info!("Gateway heartbeat successful after network change");
-                            }
-                            Ok(resp) => {
-                                log::warn!("Gateway heartbeat failed: HTTP {}", resp.status());
-                            }
-                            Err(e) => {
-                                log::warn!("Gateway heartbeat failed: {}", e);
-                            }
+                    let gateway = gateway_client::GatewayClient::new(base_url);
+                    match rt.block_on(gateway.device_heartbeat(&tok, &did)) {
+                        Ok(()) => log::info!("Gateway heartbeat successful after network change"),
+                        Err(MobileError::AuthenticationError) => {
+                            report_auth_rejected(&auth, &handler, generation);
                         }
-                    });
+                        Err(e) => log::warn!("Gateway heartbeat failed: {}", e),
+                    }
                 }
             });
         }
@@ -1243,11 +1264,16 @@ mod tests {
     #[derive(Default, Clone)]
     struct Recorder {
         states: Arc<Mutex<Vec<CallInfo>>>,
+        auth_required: Arc<Mutex<u32>>,
     }
 
     impl Recorder {
         fn states(&self) -> Vec<CallInfo> {
             self.states.lock().unwrap().clone()
+        }
+
+        fn auth_required(&self) -> u32 {
+            *self.auth_required.lock().unwrap()
         }
 
         /// Wait for at least `n` call-state events, for events emitted from
@@ -1272,6 +1298,9 @@ mod tests {
         }
         fn on_media_stats(&self, _: String, _: MediaStats) {}
         fn on_error(&self, _: String, _: String) {}
+        fn on_auth_required(&self) {
+            *self.auth_required.lock().unwrap() += 1;
+        }
     }
 
     fn engine(base_url: &str) -> (AriaMobileEngine, Recorder) {
@@ -1645,6 +1674,116 @@ mod tests {
         assert!(gw.requests().is_empty());
     }
 
+    fn is_auth_error<T>(r: Result<T, MobileError>) -> bool {
+        matches!(r, Err(MobileError::AuthenticationError))
+    }
+
+    #[test]
+    fn a_401_from_the_gateway_is_an_authentication_error() {
+        let gw = MockGateway::start(|_| (401, "{}".into()));
+        let (engine, _) = engine(&gw.base_url);
+
+        assert!(is_auth_error(engine.register_device(registration())));
+        assert!(is_auth_error(engine.unregister_device("d1".into())));
+        assert!(is_auth_error(engine.handle_push_notification(
+            PushCallPayload {
+                call_token: "tok".into(),
+                caller_uri: "sip:1001@pbx.example.com".into(),
+                caller_name: None,
+                gateway_url: gw.base_url.clone(),
+            }
+        )));
+        assert!(is_auth_error(
+            engine.accept_incoming_call("tok".into(), vec![])
+        ));
+        assert!(is_auth_error(engine.reject_incoming_call("tok".into())));
+        insert_call(&engine, "c1", "tok");
+        assert!(is_auth_error(
+            engine.transfer_call("c1".into(), "1002".into())
+        ));
+        // A refused transfer leaves the call up.
+        assert!(engine.get_active_call().is_some());
+    }
+
+    #[test]
+    fn hangup_with_a_rejected_token_still_ends_the_call() {
+        let gw = MockGateway::start(|_| (401, "{}".into()));
+        let (engine, recorder) = engine(&gw.base_url);
+        insert_call(&engine, "c1", "tok");
+
+        assert!(is_auth_error(engine.hangup("c1".into())));
+
+        assert!(engine.get_active_call().is_none());
+        let states = recorder.states();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].state, CallState::Ended);
+        // Synchronous methods report through the error, not the callback.
+        assert_eq!(recorder.auth_required(), 0);
+    }
+
+    /// Wait until `f` holds, for state changed by a poll thread.
+    fn eventually(mut f: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        f()
+    }
+
+    #[test]
+    fn a_rejected_poll_asks_for_a_token_once_and_keeps_the_call() {
+        // Reject every token except "fresh"; with "fresh" the call is live.
+        let gw = MockGateway::start(|req| {
+            if req.authorization.as_deref() == Some("Bearer fresh") {
+                (200, r#"{"status":"active"}"#.into())
+            } else {
+                (401, "{}".into())
+            }
+        });
+        let (engine, recorder) = engine(&gw.base_url);
+        let stop = insert_call(&engine, "c1", "tok");
+        engine.start_call_status_poll("c1".into(), "tok".into(), Arc::clone(&stop));
+
+        // Many rejected polls, one callback.
+        assert!(eventually(|| gw.requests().len() >= 5));
+        assert_eq!(recorder.auth_required(), 1);
+        assert!(engine.get_active_call().is_some());
+        assert!(recorder.states().is_empty());
+
+        // A new token that is also rejected is reported again, once.
+        engine.set_gateway_token("also-expired".into());
+        let seen = gw.requests().len();
+        assert!(eventually(|| gw.requests().len() >= seen + 5));
+        assert_eq!(recorder.auth_required(), 2);
+
+        // A working token resumes polling, and the call is still up.
+        engine.set_gateway_token("fresh".into());
+        assert!(eventually(|| gw
+            .requests()
+            .iter()
+            .any(|r| r.authorization.as_deref() == Some("Bearer fresh"))));
+        assert_eq!(recorder.auth_required(), 2);
+        assert!(engine.get_active_call().is_some());
+        assert!(recorder.states().is_empty());
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn a_rejected_cancel_watch_asks_for_a_token_and_reports_no_cancel() {
+        let gw = MockGateway::start(|_| (401, "{}".into()));
+        let (engine, recorder) = engine(&gw.base_url);
+
+        engine.start_pending_incoming_poll(&offer("tok-5"));
+
+        assert!(eventually(|| gw.requests().len() >= 5));
+        assert_eq!(recorder.auth_required(), 1);
+        assert!(recorder.states().is_empty());
+        engine.clear_pending_incoming("tok-5");
+    }
+
     /// A callback that re-enters the engine must not deadlock: the handler is
     /// cloned out of its lock before it is invoked.
     #[test]
@@ -1662,6 +1801,7 @@ mod tests {
             }
             fn on_media_stats(&self, _: String, _: MediaStats) {}
             fn on_error(&self, _: String, _: String) {}
+            fn on_auth_required(&self) {}
         }
 
         let (engine, _) = engine(NO_GATEWAY);

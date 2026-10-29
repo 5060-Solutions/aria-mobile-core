@@ -21,6 +21,9 @@ struct Inner {
     /// was actually sent rather than whichever one is current when the
     /// response arrives.
     generation: u64,
+    /// Whether background work has already reported this token as rejected,
+    /// so `on_auth_required` fires at most once per token.
+    rejection_reported: bool,
 }
 
 impl GatewayAuth {
@@ -30,6 +33,7 @@ impl GatewayAuth {
             inner: Mutex::new(Inner {
                 token: Some(token).filter(|t| !t.is_empty()),
                 generation: 0,
+                rejection_reported: false,
             }),
         }
     }
@@ -45,6 +49,7 @@ impl GatewayAuth {
         let mut inner = self.lock();
         inner.token = Some(token).filter(|t| !t.is_empty());
         inner.generation += 1;
+        inner.rejection_reported = false;
     }
 
     /// The current token and its generation, if there is one.
@@ -58,6 +63,19 @@ impl GatewayAuth {
         self.current()
             .map(|(t, _)| t)
             .ok_or(MobileError::AuthenticationError)
+    }
+
+    /// Record that background work had the token of `generation` rejected
+    /// with 401. Returns true when the app should be told, which is only the
+    /// first time for the current token: a rejection of a token that has
+    /// since been replaced, or a repeat, returns false.
+    pub(crate) fn report_rejection(&self, generation: u64) -> bool {
+        let mut inner = self.lock();
+        if inner.generation != generation || inner.rejection_reported {
+            return false;
+        }
+        inner.rejection_reported = true;
+        true
     }
 }
 
@@ -86,5 +104,20 @@ mod tests {
         let (t, g1) = auth.current().unwrap();
         assert_eq!(t, "t1");
         assert!(g1 > g0);
+    }
+
+    #[test]
+    fn a_rejection_is_reported_once_per_token() {
+        let auth = GatewayAuth::new("t0".into());
+        let (_, g0) = auth.current().unwrap();
+        assert!(auth.report_rejection(g0));
+        assert!(!auth.report_rejection(g0));
+
+        auth.set("t1".into());
+        // A late 401 for the replaced token says nothing about the new one.
+        assert!(!auth.report_rejection(g0));
+        let (_, g1) = auth.current().unwrap();
+        assert!(auth.report_rejection(g1));
+        assert!(!auth.report_rejection(g1));
     }
 }

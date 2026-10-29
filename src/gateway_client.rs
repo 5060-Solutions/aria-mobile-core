@@ -47,6 +47,19 @@ async fn read_json_capped<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&buf).map_err(|_| MobileError::GatewayError)
 }
 
+/// The error for a failed gateway response: `AuthenticationError` when the
+/// gateway rejected the bearer token (401), otherwise `otherwise`.
+///
+/// A 401 always means the token is missing, expired or revoked, and the app
+/// must fetch a new one from the PBX, so every route reports it the same way.
+fn status_error(status: reqwest::StatusCode, otherwise: MobileError) -> MobileError {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        MobileError::AuthenticationError
+    } else {
+        otherwise
+    }
+}
+
 pub struct GatewayClient {
     base_url: String,
     http: reqwest::Client,
@@ -351,7 +364,7 @@ impl GatewayClient {
                 Ok(resp) => {
                     if !resp.status().is_success() {
                         log::error!("Device registration failed: {}", resp.status());
-                        return Err(MobileError::RegistrationFailed);
+                        return Err(status_error(resp.status(), MobileError::RegistrationFailed));
                     }
                     let body: RegisterDeviceResponse = read_json_capped(resp).await?;
                     return Ok(DeviceRegistrationResponse {
@@ -370,7 +383,6 @@ impl GatewayClient {
     }
 
     /// Send a device heartbeat — forces SIP re-registration after network change.
-    #[allow(dead_code)]
     pub async fn device_heartbeat(&self, token: &str, device_id: &str) -> Result<(), MobileError> {
         let target_count = self.resolved_target_count();
         for idx in 0..target_count {
@@ -380,6 +392,10 @@ impl GatewayClient {
                 Ok(resp) if resp.status().is_success() || resp.status() == 204 => {
                     log::info!("Device heartbeat successful for {}", device_id);
                     return Ok(());
+                }
+                Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                    log::warn!("Device heartbeat rejected the gateway token");
+                    return Err(MobileError::AuthenticationError);
                 }
                 Ok(resp) => {
                     log::warn!("Device heartbeat failed: {}", resp.status());
@@ -403,7 +419,7 @@ impl GatewayClient {
 
         if !resp.status().is_success() {
             log::error!("Device unregister failed: {}", resp.status());
-            return Err(MobileError::GatewayError);
+            return Err(status_error(resp.status(), MobileError::GatewayError));
         }
 
         Ok(())
@@ -424,7 +440,7 @@ impl GatewayClient {
 
         if !resp.status().is_success() {
             log::error!("Get call offer failed: {}", resp.status());
-            return Err(MobileError::CallFailed);
+            return Err(status_error(resp.status(), MobileError::CallFailed));
         }
 
         let body: GatewayCallOffer = read_json_capped(resp).await?;
@@ -455,7 +471,7 @@ impl GatewayClient {
 
         if !resp.status().is_success() {
             log::error!("Accept call failed: {}", resp.status());
-            return Err(MobileError::CallFailed);
+            return Err(status_error(resp.status(), MobileError::CallFailed));
         }
 
         Ok(())
@@ -472,7 +488,7 @@ impl GatewayClient {
 
         if !resp.status().is_success() {
             log::error!("Reject call failed: {}", resp.status());
-            return Err(MobileError::CallFailed);
+            return Err(status_error(resp.status(), MobileError::CallFailed));
         }
 
         Ok(())
@@ -512,7 +528,7 @@ impl GatewayClient {
                 Ok(resp) => {
                     if !resp.status().is_success() {
                         log::error!("Make call failed: {}", resp.status());
-                        return Err(MobileError::CallFailed);
+                        return Err(status_error(resp.status(), MobileError::CallFailed));
                     }
                     let body: MakeCallResponse = read_json_capped(resp).await?;
                     return Ok((body.call_token, body.sdp_answer));
@@ -541,7 +557,7 @@ impl GatewayClient {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(MobileError::CallFailed);
+            return Err(status_error(resp.status(), MobileError::CallFailed));
         }
 
         let body: CallStatusResponse = read_json_capped(resp).await?;
@@ -559,7 +575,7 @@ impl GatewayClient {
 
         if !resp.status().is_success() {
             log::error!("Hangup call failed: {}", resp.status());
-            return Err(MobileError::CallFailed);
+            return Err(status_error(resp.status(), MobileError::CallFailed));
         }
 
         Ok(())
