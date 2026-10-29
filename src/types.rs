@@ -77,7 +77,7 @@ pub enum EndReason {
     AnsweredElsewhere,
     /// An incoming call was rejected.
     Rejected,
-    /// The call was blind-transferred away from this handset.
+    /// The call was transferred away from this handset (blind or attended).
     Transferred,
     /// The call could not be set up: an outgoing call failed, or an accept
     /// had an unknown outcome.
@@ -189,7 +189,7 @@ pub struct CallStatusResponse {
     pub status: String,
     /// Reason the call ended (if status == "ended")
     pub reason: Option<String>,
-    /// On an active call after a blind transfer was accepted: "pending"
+    /// On an active call after a transfer was accepted: "pending"
     /// while the PBX works on it, "failed" when its NOTIFY reported a
     /// failure. Absent on a gateway that does not report transfer outcomes.
     #[serde(default)]

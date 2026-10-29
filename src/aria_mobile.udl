@@ -83,7 +83,7 @@ enum EndReason {
     /// An incoming call was rejected with `reject_incoming_call`, or
     /// declined according to the gateway.
     "Rejected",
-    /// The call was blind-transferred away from this handset.
+    /// The call was transferred away from this handset (blind or attended).
     "Transferred",
     /// The call could not be set up: an outgoing call failed, or an accept
     /// had an unknown outcome.
