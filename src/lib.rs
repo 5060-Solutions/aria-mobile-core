@@ -136,7 +136,7 @@ async fn hang_up_abandoned(
     events: &Dispatcher,
     call_token: &str,
 ) {
-    let (token, generation) = auth.current().unwrap_or_default();
+    let (token, generation) = auth.snapshot();
     match gateway.hangup_call(&token, call_token).await {
         Ok(()) => log::info!("Hung up an outgoing call cancelled while ringing"),
         Err(MobileError::AuthenticationError) => report_auth_rejected(auth, events, generation),
@@ -1002,7 +1002,7 @@ impl AriaMobileEngine {
 
                     // With no token at all the request goes out unauthenticated,
                     // so the gateway's 401 reaches the app the same way.
-                    let (token, generation) = auth.current().unwrap_or_default();
+                    let (token, generation) = auth.snapshot();
                     match gateway.get_call_status(&token, &call_token).await {
                         Ok(status) => {
                             if on_status(&status) {
@@ -2051,6 +2051,25 @@ mod tests {
         assert_eq!(recorder.auth_required(), 2);
         assert!(engine.get_active_call().is_some());
         assert!(recorder.states().is_empty());
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn a_poll_without_any_token_asks_for_one() {
+        let gw = MockGateway::start(|req| match req.authorization.as_deref() {
+            Some("Bearer fresh") => (200, r#"{"status":"active"}"#.into()),
+            _ => (401, "{}".into()),
+        });
+        let (engine, recorder) = engine(&gw.base_url);
+        engine.set_gateway_token(String::new());
+        let stop = insert_call(&engine, "c1", "tok");
+        engine.start_call_status_poll("c1".into(), "tok".into(), Arc::clone(&stop));
+
+        assert!(eventually(|| recorder.auth_required() == 1));
+        let seen = gw.requests().len();
+        assert!(eventually(|| gw.requests().len() >= seen + 3));
+        assert_eq!(recorder.auth_required(), 1);
+        assert!(engine.get_active_call().is_some());
         stop.store(true, Ordering::Relaxed);
     }
 

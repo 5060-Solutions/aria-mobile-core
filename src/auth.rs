@@ -58,6 +58,15 @@ impl GatewayAuth {
         inner.token.clone().map(|t| (t, inner.generation))
     }
 
+    /// The current token (empty when there is none) and its generation, for
+    /// background requests. They are sent even without a token, so that the
+    /// gateway's 401 is reported against the right generation and the app is
+    /// still asked for a token.
+    pub(crate) fn snapshot(&self) -> (String, u64) {
+        let inner = self.lock();
+        (inner.token.clone().unwrap_or_default(), inner.generation)
+    }
+
     /// The current token, or `AuthenticationError` when there is none.
     pub(crate) fn token(&self) -> Result<String, MobileError> {
         self.current()
@@ -119,5 +128,17 @@ mod tests {
         let (_, g1) = auth.current().unwrap();
         assert!(auth.report_rejection(g1));
         assert!(!auth.report_rejection(g1));
+    }
+
+    /// Clearing the token is a new generation too: a 401 sent without a
+    /// token must still be reported once.
+    #[test]
+    fn a_rejection_without_a_token_is_reported() {
+        let auth = GatewayAuth::new("t0".into());
+        auth.set(String::new());
+        let (token, generation) = auth.snapshot();
+        assert!(token.is_empty());
+        assert!(auth.report_rejection(generation));
+        assert!(!auth.report_rejection(generation));
     }
 }
