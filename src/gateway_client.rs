@@ -139,6 +139,12 @@ struct MakeCallRequest {
     client_ref: String,
 }
 
+/// The JSON body of a gateway error response.
+#[derive(Deserialize)]
+struct ErrorBody {
+    error: String,
+}
+
 #[derive(Serialize)]
 struct CancelCallRequest<'a> {
     client_ref: &'a str,
@@ -607,9 +613,20 @@ impl GatewayClient {
             })
             .await?;
         if resp.status() == reqwest::StatusCode::CONFLICT {
-            // Cancelled through `cancel_call` while it rang.
-            log::info!("Outgoing call cancelled at the gateway");
-            return Err(MobileError::Cancelled);
+            // 409 carries a reason. Only `cancelled` means the call was
+            // cancelled through `cancel_call` while it rang; anything else
+            // (such as `client_ref_in_use`) is a gateway-side refusal.
+            let body: Option<ErrorBody> = read_json_capped(resp).await.ok();
+            return Err(match body.as_ref().map(|b| b.error.as_str()) {
+                Some("cancelled") => {
+                    log::info!("Outgoing call cancelled at the gateway");
+                    MobileError::Cancelled
+                }
+                other => {
+                    log::error!("Make call refused with 409: {:?}", other);
+                    MobileError::GatewayError
+                }
+            });
         }
         if !resp.status().is_success() {
             log::error!("Make call failed: {}", resp.status());
@@ -1011,5 +1028,33 @@ mod transfer_tests {
 
         assert!(result.is_err());
         assert!(second.requests().is_empty(), "the call was sent twice");
+    }
+
+    #[test]
+    fn only_a_cancelled_409_is_a_cancel() {
+        for (body, cancelled) in [
+            (r#"{"error":"cancelled"}"#, true),
+            (r#"{"error":"client_ref_in_use"}"#, false),
+            ("{}", false),
+            ("not json", false),
+        ] {
+            let body = body.to_string();
+            let gw = MockGateway::start(move |_| (409, body.clone()));
+            let client = GatewayClient::new(gw.base_url.clone());
+            let err = block_on(client.make_call(
+                "jwt",
+                "1002",
+                "v=0",
+                &creds(),
+                "ref",
+                &Default::default(),
+            ))
+            .unwrap_err();
+            if cancelled {
+                assert!(matches!(err, MobileError::Cancelled), "{err:?}");
+            } else {
+                assert!(matches!(err, MobileError::GatewayError), "{err:?}");
+            }
+        }
     }
 }
