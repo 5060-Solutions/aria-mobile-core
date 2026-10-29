@@ -49,7 +49,6 @@ async fn read_json_capped<T: serde::de::DeserializeOwned>(
 
 pub struct GatewayClient {
     base_url: String,
-    api_key: String,
     http: reqwest::Client,
     /// Resolved gateway failover targets from SRV lookup, ordered by priority.
     /// First entry is the primary; rest are failover targets.
@@ -80,20 +79,6 @@ fn build_target_url(scheme: &str, domain: &str, port: u16, path_prefix: &str) ->
         format!("{domain}:{port}")
     };
     format!("{scheme}://{host_port}{path_prefix}")
-}
-
-#[derive(Serialize)]
-struct TokenRequest {
-    user_id: String,
-    api_key: String,
-}
-
-#[derive(Deserialize)]
-struct TokenResponse {
-    token: String,
-    /// Token lifetime in seconds, as reported by the gateway. Used by the
-    /// caller to schedule a transparent refresh before expiry.
-    expires_in: u64,
 }
 
 #[derive(Serialize)]
@@ -191,7 +176,7 @@ fn enforce_https(base_url: String) -> String {
 }
 
 impl GatewayClient {
-    pub fn new(base_url: String, api_key: String) -> Self {
+    pub fn new(base_url: String) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -199,7 +184,6 @@ impl GatewayClient {
 
         Self {
             base_url: enforce_https(base_url),
-            api_key,
             http,
             resolved_targets: RwLock::new(Vec::new()),
         }
@@ -214,16 +198,6 @@ impl GatewayClient {
             .resolve(domain, addr)
             .build()
             .expect("Failed to create pinned HTTP client")
-    }
-
-    /// Check if the api_key looks like a JWT (starts with "eyJ").
-    pub fn api_key_is_jwt(&self) -> bool {
-        self.api_key.starts_with("eyJ")
-    }
-
-    /// Get the raw api_key value.
-    pub fn api_key(&self) -> &str {
-        &self.api_key
     }
 
     /// Get the base URL.
@@ -340,46 +314,6 @@ impl GatewayClient {
         } else {
             resolved.len()
         }
-    }
-
-    /// Obtain a JWT auth token from the gateway, with SRV failover.
-    ///
-    /// Returns the token together with its lifetime in seconds (`expires_in`)
-    /// so the caller can schedule a transparent refresh before expiry.
-    pub async fn create_token(&self, user_id: &str) -> Result<(String, u64), MobileError> {
-        // Resolve gateway via SRV on first use
-        let _ = self.resolve_gateway().await;
-
-        let target_count = self.resolved_target_count();
-        let mut last_err = MobileError::NetworkError;
-
-        for idx in 0..target_count {
-            let (client, url) = self.target_request(idx, "/v1/auth/token");
-            match client
-                .post(&url)
-                .json(&TokenRequest {
-                    user_id: user_id.to_string(),
-                    api_key: self.api_key.clone(),
-                })
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    if !resp.status().is_success() {
-                        log::error!("Token request failed: {}", resp.status());
-                        return Err(MobileError::AuthenticationError);
-                    }
-                    let body: TokenResponse = read_json_capped(resp).await?;
-                    return Ok((body.token, body.expires_in));
-                }
-                Err(e) => {
-                    log::warn!("Token request to {} failed: {} (trying next)", url, e);
-                    last_err = e.into();
-                }
-            }
-        }
-
-        Err(last_err)
     }
 
     /// Register a device with the push gateway, with SRV failover.
@@ -776,7 +710,7 @@ mod transfer_tests {
     #[test]
     fn transfer_posts_the_target_to_the_call_route() {
         let gw = MockGateway::start(|_| (202, "{}".into()));
-        let client = GatewayClient::new(gw.base_url.clone(), "key".into());
+        let client = GatewayClient::new(gw.base_url.clone());
 
         block_on(client.transfer_call("jwt", "tok-1", "sip:1002@pbx.example.com")).unwrap();
 
@@ -804,7 +738,7 @@ mod transfer_tests {
         ];
         for (status, expected) in cases {
             let gw = MockGateway::start(move |_| (status, "{}".into()));
-            let client = GatewayClient::new(gw.base_url.clone(), "key".into());
+            let client = GatewayClient::new(gw.base_url.clone());
             let err = block_on(client.transfer_call("jwt", "tok", "1002")).unwrap_err();
             let got = match err {
                 MobileError::InvalidTarget => "InvalidTarget",

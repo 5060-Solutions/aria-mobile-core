@@ -9,6 +9,10 @@ namespace aria_mobile {
 /// Configuration for connecting to the push gateway.
 dictionary GatewayConfig {
     string base_url;
+    /// The PBX-issued gateway token (`gateway_token` from the PBX device
+    /// registration), used as the bearer token for every gateway request.
+    /// The core never mints tokens itself. Replace it later with
+    /// `set_gateway_token`.
     string api_key;
 };
 
@@ -149,10 +153,15 @@ interface AriaMobileEngine {
     /// Set the platform audio bridge for microphone/speaker I/O.
     void set_audio_bridge(PlatformAudioBridge bridge);
 
+    /// Replace the bearer token used for all gateway requests, including the
+    /// background call-status polls. Pass a token fetched from the PBX
+    /// (`POST /api/v1/devices/{id}/gateway-token`). Does not re-register.
+    void set_gateway_token(string token);
+
     // ── Device Registration ─────────────────────────────────────────
 
-    /// Register this device with the push gateway.
-    /// Returns device_id and auth token.
+    /// Register this device with the push gateway, authenticating with the
+    /// current PBX-issued gateway token. Returns device_id and the token used.
     [Throws=MobileError]
     DeviceRegistrationResponse register_device(DeviceRegistration registration);
 

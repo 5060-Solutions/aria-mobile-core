@@ -71,6 +71,15 @@ The API is defined in `src/aria_mobile.udl`. Key types:
 - `CallInfo` / `CallState` -- active call state
 - `AudioCodec` -- codec selection (PCMU, PCMA, Opus, G.729)
 
+## Gateway authentication
+
+The core never mints gateway tokens and never calls the gateway's `/v1/auth/token`. Only the PBX holds the issuer key, so the app obtains every gateway token from the PBX and hands it to the core:
+
+1. At PBX device registration (`POST /api/v1/devices`) the response carries `gateway_token`. Pass it as `GatewayConfig.api_key` when constructing `AriaMobileEngine`, then call `register_device`.
+2. When the token expires or is revoked, fetch a new one with `POST /api/v1/devices/{id}/gateway-token` and pass it to `set_gateway_token(token)`. Every later gateway request uses it, including the background call-status polls. `set_gateway_token` does not re-register, so it is safe mid-call.
+
+An engine constructed with an empty `api_key` has no token: methods that need the gateway throw `AuthenticationError` without sending a request until `set_gateway_token` is called.
+
 ## Call Flows
 
 ### Incoming (via push)
