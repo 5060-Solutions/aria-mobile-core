@@ -148,9 +148,9 @@ A hangup that lands just after the answer works through the same fallback. In ev
 ### Attended transfer
 
 1. With a call on hold, the user places a consultation call to the target (`make_call`; the first call is held automatically and the new call goes to the same gateway instance, see above), talks to them, then the app calls `transfer_attended(call_id, consult_call_id)`
-2. Engine checks, before any request, that both are distinct connected calls (`InvalidState` otherwise) and that one is incoming and the other outgoing (`TransferUnsupported` otherwise: the PBX accepts the REFER only on a call the phone received, with `Replaces` naming one it placed). Either call may be on hold
-3. Engine sends `POST /v1/calls/{call_token}/transfer` with `{"replaces": "<consult call_token>"}`; the gateway sends the REFER with `Replaces` on the incoming call, whichever order the tokens are in
-4. If it is refused, both calls stay up and the method throws: `400 same_call`, `404` and `409 call_not_established` -> `InvalidState`, `409 unsupported_by_pbx` -> `TransferUnsupported`, `409` without a body (a transfer of either call is in progress) -> `GatewayError`, `502` -> `CallFailed`, `504` -> `Timeout`
+2. Engine checks, before any request, that both are distinct connected calls (`InvalidState` otherwise). Each call may be incoming or outgoing, in any combination, and either may be on hold
+3. Engine sends `POST /v1/calls/{call_token}/transfer` with `{"replaces": "<consult call_token>"}`; the gateway sends the REFER on `call_id`'s call with `Replaces` naming the consultation call
+4. If it is refused, both calls stay up and the method throws: `400 same_call`, `404` and `409 call_not_established` -> `InvalidState`, `409 unsupported_by_pbx` (a gateway or PBX that cannot join these two calls; older PBX releases join only a call the phone received with one it placed) -> `TransferUnsupported`, `409` without a body (a transfer of either call is in progress) -> `GatewayError`, `502` -> `CallFailed`, `504` -> `Timeout`
 5. After the `202`, both calls' `/status` is polled as for a blind transfer, and the first verdict on either decides:
    - Both `ended`/`transferred`: each call is reported `Ended` once with reason `Transferred`. If one is reported transferred and the other is still up 5 s later, the other is ended here too (and hung up at the gateway).
    - `"transfer":"failed"`: `CallFailed` with the SIP status (`Timeout` for 408). Both calls stay up as they were.
