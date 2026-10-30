@@ -224,9 +224,10 @@ pub enum MobileError {
     InvalidTarget,
     #[error("Cancelled")]
     Cancelled,
-    /// An attended transfer between two calls the PBX cannot join: it needs
-    /// one call this phone received and one it placed.
-    #[error("Transfer unsupported: one call must be incoming and the other outgoing")]
+    /// An attended transfer between two calls the gateway or PBX cannot
+    /// join (`409 unsupported_by_pbx`; older PBX releases join only a call
+    /// this phone received with one it placed).
+    #[error("Transfer unsupported: the PBX cannot join these two calls")]
     TransferUnsupported,
 }
 

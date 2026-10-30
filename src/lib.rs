@@ -1694,12 +1694,14 @@ impl AriaMobileEngine {
     /// - Either call ended for another reason meanwhile: `InvalidState`; that
     ///   call is reported `Ended`, and the other stays up.
     ///
+    /// Each call may be incoming or outgoing, in any combination; the REFER
+    /// goes on `call_id` with `Replaces` naming `consult_call_id`.
+    ///
     /// Checked here before anything is sent, leaving both calls as they
     /// were: `InvalidState` unless both are distinct connected
-    /// gateway-routed calls, and `TransferUnsupported` unless one is
-    /// incoming and the other outgoing (the PBX accepts the REFER only on a
-    /// call the phone received, with `Replaces` naming one it placed). Any
-    /// error from the REFER itself also leaves both calls as they were.
+    /// gateway-routed calls. Any error from the REFER itself also leaves
+    /// both calls as they were, including `TransferUnsupported` from a
+    /// gateway or PBX that cannot join these two calls.
     pub fn transfer_attended(
         &self,
         call_id: String,
@@ -1722,13 +1724,6 @@ impl AriaMobileEngine {
                 .call_token
                 .clone()
                 .ok_or(MobileError::InvalidState)?;
-            if call.info.direction == consult.info.direction {
-                log::warn!(
-                    "Attended transfer of {call_id} with {consult_call_id}: both are {:?}",
-                    call.info.direction
-                );
-                return Err(MobileError::TransferUnsupported);
-            }
             (
                 call_token,
                 call.route.clone(),
@@ -2932,6 +2927,40 @@ mod tests {
         assert!(gw.requests().iter().all(|r| !r.path.ends_with("/hangup")));
     }
 
+    /// Two calls going the same way are sent to the gateway like any other
+    /// pair: the PBX joins calls in any direction.
+    #[test]
+    fn attended_transfer_joins_two_calls_in_the_same_direction() {
+        for direction in [CallDirection::Inbound, CallDirection::Outbound] {
+            let gw = attended_gateway(&[("tok-a", &[TRANSFERRED]), ("tok-b", &[TRANSFERRED])]);
+            let (engine, recorder) = engine(&gw.base_url);
+            let route = engine.gateway.primary_route();
+            insert_call_on(&engine, "call-a", "tok-a", direction, route.clone());
+            insert_call_on(&engine, "call-b", "tok-b", direction, route);
+
+            engine
+                .transfer_attended("call-a".into(), "call-b".into())
+                .unwrap();
+
+            let transfers: Vec<_> = gw
+                .requests()
+                .into_iter()
+                .filter(|r| r.path.ends_with("/transfer"))
+                .collect();
+            assert_eq!(transfers.len(), 1, "{direction:?}");
+            assert_eq!(transfers[0].path, "/v1/calls/tok-a/transfer");
+            assert_eq!(transfers[0].body, r#"{"replaces":"tok-b"}"#);
+            assert!(engine.get_calls().is_empty(), "{direction:?}");
+            for id in ["call-a", "call-b"] {
+                assert_eq!(
+                    ended_reasons(&recorder, id),
+                    [Some(EndReason::Transferred)],
+                    "{direction:?} {id}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_failed_attended_transfer_keeps_both_calls_up() {
         let failed = r#"{"status":"active","transfer":"failed","transfer_code":503}"#;
@@ -3062,13 +3091,6 @@ mod tests {
         for (a, b) in invalid {
             let err = engine.transfer_attended(a.into(), b.into()).unwrap_err();
             assert!(matches!(err, MobileError::InvalidState), "{a} {b}: {err:?}");
-        }
-        for (a, b) in [("incoming-a", "incoming-b"), ("outgoing-c", "outgoing-d")] {
-            let err = engine.transfer_attended(a.into(), b.into()).unwrap_err();
-            assert!(
-                matches!(err, MobileError::TransferUnsupported),
-                "{a} {b}: {err:?}"
-            );
         }
         assert_eq!(engine.get_calls().len(), 4);
         assert!(recorder.states().is_empty());

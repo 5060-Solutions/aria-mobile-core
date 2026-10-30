@@ -35,7 +35,7 @@ fn public_types_are_reachable() {
     ));
     assert!(MobileError::TransferUnsupported
         .to_string()
-        .contains("incoming"));
+        .contains("cannot join"));
 
     let info = CallInfo {
         call_id: "outgoing-x".into(),

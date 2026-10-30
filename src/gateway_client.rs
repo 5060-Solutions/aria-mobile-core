@@ -830,18 +830,18 @@ impl GatewayClient {
     }
 
     /// Attended-transfer: join the far ends of two of the user's calls and
-    /// drop this phone from both. The gateway sends a REFER with `Replaces`
-    /// on whichever of the two the phone received, so the token order does
-    /// not matter; both calls must be on this route's gateway instance.
+    /// drop this phone from both. The gateway sends a REFER on `call_token`'s
+    /// call with `Replaces` naming `replaces_token`'s, whichever direction
+    /// each call has; both calls must be on this route's gateway instance.
     ///
     /// Status mapping, in line with [`transfer_call`](Self::transfer_call):
     /// 202 (or any 2xx) is success; 400 (`same_call`, or a body the gateway
     /// could not read), 404 (either call unknown here) and 409
     /// `call_not_established` mean the calls cannot be transferred as they
-    /// are (`InvalidState`); 409 `unsupported_by_pbx` means both calls go
-    /// the same way (`TransferUnsupported`); any other 409 (a transfer of
-    /// either call already in progress) is a `GatewayError`; 502 and 504 are
-    /// as for a blind transfer.
+    /// are (`InvalidState`); 409 `unsupported_by_pbx` means the gateway or
+    /// PBX cannot join these two calls (`TransferUnsupported`); any other
+    /// 409 (a transfer of either call already in progress) is a
+    /// `GatewayError`; 502 and 504 are as for a blind transfer.
     pub async fn transfer_attended(
         &self,
         route: &Route,
