@@ -447,6 +447,12 @@ impl MobileMediaSession {
         self.muted.store(muted, Ordering::Relaxed);
     }
 
+    /// Hold or resume the call. While held, the RTP loops keep running (the
+    /// stream stays up and the far end hears silence), but received audio is
+    /// dropped before it is decoded, so it reaches neither the speaker nor
+    /// the AI tap, and the TX loop does not ask the bridge for microphone
+    /// audio. Call waiting relies on this: the bridge is shared, and only the
+    /// active call may use it.
     pub fn set_hold(&self, on_hold: bool) {
         self.on_hold.store(on_hold, Ordering::Relaxed);
     }
@@ -997,12 +1003,20 @@ mod ai_tap_tests {
         ai: Arc<CallSession>,
         bridge: Arc<RecordingBridge>,
         port: u16,
+        /// The far end: the session's remote address, so the RX loop's
+        /// source latch accepts what it sends, and where TX goes.
+        peer: tokio::net::UdpSocket,
     }
 
     async fn fixture(call_id: &str) -> Fixture {
-        // Somewhere to send TX to that will not bother anyone.
-        let sink: SocketAddr = "127.0.0.1:9".parse().expect("addr");
-        let session = MobileMediaSession::new(sink, AudioCodec::Pcmu)
+        // The tone must come from the session's remote address: RX drops
+        // packets from any other source. TX goes back to the same socket,
+        // which nothing reads.
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let remote = peer.local_addr().expect("peer addr");
+        let session = MobileMediaSession::new(remote, AudioCodec::Pcmu)
             .await
             .expect("media session");
         let port = session.local_port();
@@ -1018,14 +1032,12 @@ mod ai_tap_tests {
             ai,
             bridge,
             port,
+            peer,
         }
     }
 
-    /// Send `n` packets of tone at the session's RTP port.
-    async fn send_tone(port: u16, n: u16) {
-        let tx = tokio::net::UdpSocket::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
+    /// Send `n` packets of tone from `tx` at the session's RTP port.
+    async fn send_tone(tx: &tokio::net::UdpSocket, port: u16, n: u16) {
         let target: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
         let ssrc = 0x1234_5678;
         for i in 0..n {
@@ -1041,7 +1053,7 @@ mod ai_tap_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn far_end_rtp_reaches_the_ai_and_still_reaches_the_speaker() {
         let f = fixture("call-tap-1").await;
-        send_tone(f.port, 50).await;
+        send_tone(&f.peer, f.port, 50).await;
 
         // push_* only fills the ring buffer; captured_ms counts what pump()
         // has drained and resampled. In production this is the AI core's own
@@ -1072,13 +1084,13 @@ mod ai_tap_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn detaching_the_tap_stops_the_flow_without_ending_the_call() {
         let f = fixture("call-tap-2").await;
-        send_tone(f.port, 25).await;
+        send_tone(&f.peer, f.port, 25).await;
         f.ai.pump().expect("pump");
         let before = f.ai.tap().stats().1.captured_ms;
         assert!(before > 0, "expected audio before detaching");
 
         f.session.set_ai_tap(None);
-        send_tone(f.port, 25).await;
+        send_tone(&f.peer, f.port, 25).await;
         f.ai.pump().expect("pump");
         let after = f.ai.tap().stats().1.captured_ms;
         assert_eq!(after, before, "audio kept flowing to the AI after detach");
@@ -1117,6 +1129,32 @@ mod ai_tap_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_held_call_reaches_neither_the_ai_nor_the_speaker() {
+        // With call waiting the held call's far end must not be transcribed
+        // into the active call's insight, nor played over it.
+        let f = fixture("call-tap-held").await;
+        *f.bridge
+            .capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = vec![8000_i16; 160];
+        f.session.set_hold(true);
+        send_tone(&f.peer, f.port, 50).await;
+
+        f.ai.pump().expect("pump");
+        let (local, remote) = f.ai.tap().stats();
+        assert_eq!(remote.captured_ms, 0, "held far-end audio reached the AI");
+        assert_eq!(local.captured_ms, 0, "held microphone audio reached the AI");
+        let played = f
+            .bridge
+            .played
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert_eq!(played, 0, "held call audio reached the speaker");
+        f.session.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_muted_microphone_is_silence_to_the_ai_as_well() {
         // The transcript must not contain words the far end never heard.
         let f = fixture("call-tap-3").await;
@@ -1139,6 +1177,99 @@ mod ai_tap_tests {
         );
 
         f.session.stop();
+    }
+}
+
+/// A held call keeps its RTP stream running but neither plays the far end
+/// nor reads the microphone: with call waiting, the other call owns both.
+#[cfg(test)]
+mod hold_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    /// Counts what the session hands the platform and asks it for.
+    #[derive(Default)]
+    struct CountingBridge {
+        played: AtomicUsize,
+        captures: AtomicUsize,
+    }
+
+    impl PlatformAudioBridge for CountingBridge {
+        fn on_playback_audio(&self, samples: Vec<i16>, _sample_rate: u32) {
+            self.played.fetch_add(samples.len(), Ordering::Relaxed);
+        }
+
+        fn on_capture_audio(&self, _sample_rate: u32, frame_size: u32) -> Vec<i16> {
+            self.captures.fetch_add(1, Ordering::Relaxed);
+            vec![1000_i16; frame_size as usize]
+        }
+    }
+
+    /// One 20 ms PCMU packet (µ-law 0x00 is a loud sample, so it decodes to
+    /// non-empty PCM).
+    fn rtp_packet(seq: u16) -> Vec<u8> {
+        let mut pkt = vec![0x80, 0];
+        pkt.extend_from_slice(&seq.to_be_bytes());
+        pkt.extend_from_slice(&(u32::from(seq) * 160).to_be_bytes());
+        pkt.extend_from_slice(&0x1234_5678_u32.to_be_bytes());
+        pkt.extend(std::iter::repeat_n(0_u8, 160));
+        pkt
+    }
+
+    /// Send `n` packets from `peer` to the session on `port`, then let them
+    /// drain through the RX loop.
+    async fn send(peer: &UdpSocket, port: u16, from_seq: u16, n: u16) {
+        let target: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        for seq in from_seq..from_seq + n {
+            let _ = peer.send_to(&rtp_packet(seq), target).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_call_neither_plays_nor_reads_the_microphone() {
+        // No remote yet: it is learned from the first packet, as on an
+        // outgoing call, so TX goes back to the test's socket.
+        let placeholder: SocketAddr = "0.0.0.0:0".parse().expect("addr");
+        let session = MobileMediaSession::new(placeholder, AudioCodec::Pcmu)
+            .await
+            .expect("media session");
+        let port = session.local_port();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+
+        session.set_hold(true);
+        let bridge = Arc::new(CountingBridge::default());
+        session.start_with_bridge(bridge.clone());
+        send(&peer, port, 0, 30).await;
+
+        assert_eq!(
+            bridge.played.load(Ordering::Relaxed),
+            0,
+            "held call audio reached the speaker"
+        );
+        assert_eq!(
+            bridge.captures.load(Ordering::Relaxed),
+            0,
+            "a held call read the microphone"
+        );
+        let stats = session.stats();
+        assert!(stats.packets_received > 0, "RX stopped while held");
+        assert!(stats.packets_sent > 0, "RTP stopped while held");
+
+        // The positive control: resumed, the same path plays and captures.
+        session.set_hold(false);
+        send(&peer, port, 30, 30).await;
+        assert!(
+            bridge.played.load(Ordering::Relaxed) > 0,
+            "no playback once resumed"
+        );
+        assert!(
+            bridge.captures.load(Ordering::Relaxed) > 0,
+            "no capture once resumed"
+        );
+        session.stop();
     }
 }
 

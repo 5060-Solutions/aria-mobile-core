@@ -31,7 +31,7 @@ Shared Rust engine for the Aria iOS and Android softphone apps. Exposes a cross-
 
 ## Features
 
-- **Push gateway HTTP client** -- device registration, call signaling (accept/reject/hangup/blind transfer), outgoing call initiation
+- **Push gateway HTTP client** -- device registration, call signaling (accept/reject/hangup/blind and attended transfer), outgoing call initiation
 - **SDP generation/parsing** -- offer/answer with codec negotiation (PCMU, PCMA, Opus, G.729)
 - **RTP media sessions** -- UDP socket management, STUN discovery, DTMF (RFC 2833)
 - **UniFFI bindings** -- type-safe Swift and Kotlin APIs generated from a single UDL definition
@@ -83,6 +83,8 @@ An engine constructed with an empty `api_key` has no token: methods that need th
 ## Gateway failover
 
 When the gateway domain has SRV records, `register_device` resolves them into an ordered list of gateway instances. A request moves to the next instance only when it could not connect, so it was certainly never delivered. A timeout or a reset after sending is returned as an error instead, so a non-idempotent request such as `POST /v1/calls` is never sent twice and the callee never rings twice. A call lives on one instance. Everything after it is placed or offered (accept, reject, cancel, status polls, hangup, transfer) goes to that instance, never to whichever one is first. `POST /v1/calls` may take up to 45 s, longer than the gateway's 30 s INVITE timeout, so the gateway rather than the client decides that an unanswered call has failed.
+
+A call dialed while another call is live (connected, ringing, or being accepted) is pinned to that call's instance: it is placed there only, with no failover, and fails if that instance cannot be reached. The PBX joins two calls in an attended transfer only when both reach it from the same gateway (the same source IP), and the gateway can only refer a pair of calls it holds itself, so a consultation call placed through another instance could never complete the transfer.
 
 ## Call Flows
 
@@ -143,6 +145,17 @@ A hangup that lands just after the answer works through the same fallback. In ev
 
 `transfer_call` can block for up to about 45 s (the REFER, then the outcome), so call it off the UI thread. The gateway accepts a bare target of letters, digits and `+*#.-_`, or a `sip:`/`sips:` URI. The core's local check is deliberately looser, so the gateway remains the authority and its refusal surfaces as `InvalidTarget`.
 
+### Attended transfer
+
+1. With a call on hold, the user places a consultation call to the target (`make_call`; the first call is held automatically and the new call goes to the same gateway instance, see above), talks to them, then the app calls `transfer_attended(call_id, consult_call_id)`
+2. Engine checks, before any request, that both are distinct connected calls (`InvalidState` otherwise) and that one is incoming and the other outgoing (`TransferUnsupported` otherwise: the PBX accepts the REFER only on a call the phone received, with `Replaces` naming one it placed). Either call may be on hold
+3. Engine sends `POST /v1/calls/{call_token}/transfer` with `{"replaces": "<consult call_token>"}`; the gateway sends the REFER with `Replaces` on the incoming call, whichever order the tokens are in
+4. If it is refused, both calls stay up and the method throws: `400 same_call`, `404` and `409 call_not_established` -> `InvalidState`, `409 unsupported_by_pbx` -> `TransferUnsupported`, `409` without a body (a transfer of either call is in progress) -> `GatewayError`, `502` -> `CallFailed`, `504` -> `Timeout`
+5. After the `202`, both calls' `/status` is polled as for a blind transfer, and the first verdict on either decides:
+   - Both `ended`/`transferred`: each call is reported `Ended` once with reason `Transferred`. If one is reported transferred and the other is still up 5 s later, the other is ended here too (and hung up at the gateway).
+   - `"transfer":"failed"`: `CallFailed` with the SIP status (`Timeout` for 408). Both calls stay up as they were.
+   - Either call ended for another reason (say the caller hung up mid-transfer): that call is reported `Ended`, the other stays up, and the method throws `InvalidState`.
+
 ## Event contract
 
 Apps can be fully event-driven: install a `MobileEventHandler` with `set_event_handler` and drive the call UI from it instead of polling `get_active_call` or `check_remote_hangup`.
@@ -163,9 +176,11 @@ Apps can be fully event-driven: install a `MobileEventHandler` with `set_event_h
 | Answered on another device | `Ended` for `incoming-<call_token>`, once the gateway reports the call active while this handset is not accepting it. | `AnsweredElsewhere` |
 | Accept with an unknown outcome | `accept_incoming_call` throws `Timeout` or `NetworkError`, and `Ended` is reported for `incoming-<call_token>`. The gateway may have accepted the call anyway, so the core keeps watching it. If it shows up active, the core hangs it up. If it is still ringing, the core rejects it. It is never left connected with nobody on this end. If the gateway refused the accept (an HTTP error), nothing is reported, and the call stays offered. | `Failed` |
 | Mute / hold | `set_mute` re-emits the current state with `muted` updated; `set_hold` emits `OnHold` or `Connected`. | |
+| Call waiting | When a call connects, or is resumed with `set_hold(id, false)`, every other connected call is put on hold first and reported `OnHold`, just ahead of the new call's `Connected`. `swap_calls(active, held)` reports `OnHold` for the first, then `Connected` for the second. | |
 | Local hangup | `Ended` from `hangup`. | `LocalHangup` |
 | Remote hangup (BYE) | `Ended`, emitted by the core within about 2 s of the gateway seeing the BYE. No app polling is needed. | From the gateway's `/status` `reason` (see below); `RemoteHangup` by default |
 | Blind transfer | `Ended` once the gateway reports the call transferred. A failed or timed-out transfer emits nothing; the call stays up. | `Transferred` |
+| Attended transfer | `Ended` for each of the two calls once the gateway reports them transferred. A failed or timed-out transfer emits nothing; both calls stay up. | `Transferred` |
 
 **End reasons.** `CallInfo.end_reason` is set only on the `Ended` event, and is null on every other event. When a call ends at the gateway, the core maps the `reason` from `GET /v1/calls/{token}/status` as follows: `bye_from_remote` -> `RemoteHangup`, `transferred` -> `Transferred`, `cancelled` -> `CallerCancelled`, `rejected` -> `Rejected`, and `no_ack` (the PBX never acknowledged the answer) -> `Failed`. A missing or unrecognised reason, or a call that just disappeared (`unknown` three times in a row), falls back to `RemoteHangup` for an active call and `CallerCancelled` for an offered one. For CallKit: `RemoteHangup`, `Transferred` and `CallerCancelled` -> `.remoteEnded`; `AnsweredElsewhere` -> `.answeredElsewhere`; `Failed` -> `.failed`; `LocalHangup`, `Cancelled` and `Rejected` follow the app's own `hangup` or `reject_incoming_call`, so the app has already reported the end itself. The gateway does not send `rejected` today. The mapping is there so that a decline elsewhere would arrive as `Rejected`. Android's `DisconnectCause` values map the same way (`REMOTE`, `ANSWERED_ELSEWHERE`, `ERROR`, `LOCAL`, `REJECTED`, `CANCELED`).
 
@@ -179,7 +194,9 @@ Apps can be fully event-driven: install a `MobileEventHandler` with `set_event_h
 
 **Token expiry (`on_auth_required`).** A gateway 401 means the gateway token is missing, expired or revoked. Engine methods that wait on the gateway report it by throwing `AuthenticationError`. Background work cannot throw, so it calls `on_auth_required()` instead. That covers the call-status polls, the caller-cancel watch on an offered incoming call, the network-change heartbeat, `hangup`'s gateway hangup or cancel, and hanging up an outgoing call that was answered after it was cancelled. `on_auth_required` fires at most once per token. It fires again only after `set_gateway_token` has been called and the new token is rejected as well, and a 401 for a token that has already been replaced is ignored. The app should fetch a new token from the PBX (`POST /api/v1/devices/{id}/gateway-token`) and call `set_gateway_token`. A rejected poll never ends a call: the call stays up, polling continues, and it uses the new token once one is set. Until then a remote hangup cannot be detected.
 
-**Polling APIs.** `get_active_call` remains a valid snapshot. `check_remote_hangup` still works for apps that poll it, but the `Ended` event has already been delivered by the time an ID appears there, and only the most recent 16 IDs are kept.
+**Call waiting.** Up to two calls can be live at once: connected (held or not), outgoing and ringing, or incoming and being accepted. At most one connected call is off hold; only that call plays to the speaker, reads the microphone and feeds the AI tap, while a held call's RTP keeps flowing (silence out, inbound dropped). Hold is local: no re-INVITE is sent. A third `make_call`, `make_call_with_id` or `accept_incoming_call` throws `InvalidState` without sending or reporting anything, and a refused `make_call_with_id` does not use up its id. Incoming offers are not limited: `handle_push_notification` still returns a third call so the app can show it and `reject_incoming_call` it. When the active call ends, a held call stays held until the app resumes it. `get_calls` lists the live calls, oldest first.
+
+**Polling APIs.** `get_active_call` remains a valid snapshot: the connected call that is off hold, or else the most recently created live call. `check_remote_hangup` still works for apps that poll it, but the `Ended` event has already been delivered by the time an ID appears there, and only the most recent 16 IDs are kept.
 
 ## Dependencies
 

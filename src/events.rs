@@ -175,6 +175,19 @@ impl CallEvents {
     /// Queue `info`. Returns false, queueing nothing, when the call has
     /// already been reported `Ended`.
     pub(crate) fn emit(&self, dispatcher: &Dispatcher, info: CallInfo) -> bool {
+        self.emit_after(dispatcher, info, || {})
+    }
+
+    /// Like [`emit`](Self::emit), but run `before` first, under this call's
+    /// lock, only when `info` will be queued. Events `before` queues for
+    /// other calls are therefore delivered just ahead of `info`, and not at
+    /// all when this call has already ended.
+    pub(crate) fn emit_after(
+        &self,
+        dispatcher: &Dispatcher,
+        info: CallInfo,
+        before: impl FnOnce(),
+    ) -> bool {
         let mut ended = self
             .ended
             .lock()
@@ -182,6 +195,7 @@ impl CallEvents {
         if *ended {
             return false;
         }
+        before();
         *ended = info.state == CallState::Ended;
         let mut info = info;
         if !*ended {

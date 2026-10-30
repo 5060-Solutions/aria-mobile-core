@@ -12,7 +12,30 @@ fn public_types_are_reachable() {
         base_url: "https://gw.example.com".into(),
         api_key: String::new(),
     };
-    let _engine = AriaMobileEngine::new(config);
+    let engine = AriaMobileEngine::new(config);
+
+    // Call waiting: listing calls and swapping between two of them.
+    let calls: Vec<CallInfo> = engine.get_calls();
+    assert!(calls.is_empty());
+    assert!(engine.get_active_call().is_none());
+    assert!(matches!(
+        engine.swap_calls("incoming-a".into(), "outgoing-b".into()),
+        Err(MobileError::InvalidState)
+    ));
+
+    // Attended transfer: refused locally, without a gateway, for calls that
+    // do not exist; both calls named the same way is refused too.
+    assert!(matches!(
+        engine.transfer_attended("incoming-a".into(), "outgoing-b".into()),
+        Err(MobileError::InvalidState)
+    ));
+    assert!(matches!(
+        engine.transfer_attended("incoming-a".into(), "incoming-a".into()),
+        Err(MobileError::InvalidState)
+    ));
+    assert!(MobileError::TransferUnsupported
+        .to_string()
+        .contains("incoming"));
 
     let info = CallInfo {
         call_id: "outgoing-x".into(),

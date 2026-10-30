@@ -83,7 +83,7 @@ enum EndReason {
     /// An incoming call was rejected with `reject_incoming_call`, or
     /// declined according to the gateway.
     "Rejected",
-    /// The call was blind-transferred away from this handset.
+    /// The call was transferred away from this handset (blind or attended).
     "Transferred",
     /// The call could not be set up: an outgoing call failed, or an accept
     /// had an unknown outcome.
@@ -232,6 +232,9 @@ interface AriaMobileEngine {
     /// `NetworkError`: the gateway may have accepted it anyway), `Ended` is
     /// reported for `incoming-<call_token>`, and the core hangs the call up
     /// if it was accepted or rejects it if it still rings.
+    ///
+    /// Throws `InvalidState`, without contacting the gateway, when two calls
+    /// are already live (see `get_calls`); the call stays offered.
     [Throws=MobileError]
     CallInfo accept_incoming_call(string call_token, sequence<AudioCodec> preferred_codecs);
 
@@ -250,7 +253,8 @@ interface AriaMobileEngine {
     /// end answers or the call fails, after reporting `Ringing`.
     ///
     /// Throws `InvalidState` for a malformed id, or one that is in use or
-    /// was used recently. Because the app knows the id up front,
+    /// was used recently, and, without using the id up or reporting
+    /// anything, when two calls are already live (see `get_calls`). Because the app knows the id up front,
     /// `hangup(call_id)` works at any point:
     /// - Before this is called: `Ended` is reported at once, and this then
     ///   throws `Cancelled` without reporting anything or sending a request.
@@ -313,13 +317,52 @@ interface AriaMobileEngine {
     [Throws=MobileError]
     void transfer_call(string call_id, string target);
 
+    /// Attended (consultative) transfer: join the far ends of `call_id` and
+    /// `consult_call_id` (typically a call the user placed to the transfer
+    /// target while `call_id` was on hold) and drop this phone from both,
+    /// then wait for the outcome as `transfer_call` does. Either call may be
+    /// on hold here; the PBX bridges the far ends itself.
+    ///
+    /// On success both calls end: `on_call_state_changed` reports `Ended`
+    /// with reason `Transferred` exactly once for each.
+    ///
+    /// Checked before anything is sent: `InvalidState` unless the two are
+    /// distinct connected calls (not ringing, not ended);
+    /// `TransferUnsupported` unless one is incoming and the other outgoing
+    /// (the PBX can only join a call this phone received with one it
+    /// placed). From the gateway: `InvalidState` when it does not know
+    /// either call or one is not established; `TransferUnsupported` as
+    /// above; `GatewayError` when a transfer of either call is already in
+    /// progress; `CallFailed` when the PBX refused the REFER or reported the
+    /// transfer failed (the message carries the SIP status, such as 503);
+    /// `Timeout` as for `transfer_call`; `AuthenticationError` for a
+    /// rejected token. All of these leave both calls up, as they were.
+    ///
+    /// `InvalidState` after the REFER was accepted means one of the calls
+    /// ended for another reason meanwhile; that call has been reported
+    /// `Ended` and the other stays up. Blocks for up to about 45 s; call it
+    /// off the UI thread.
+    [Throws=MobileError]
+    void transfer_attended(string call_id, string consult_call_id);
+
     /// Set mute state.
     [Throws=MobileError]
     void set_mute(string call_id, boolean muted);
 
-    /// Set hold state.
+    /// Hold or resume a call. Local only: media to and from the far end
+    /// stops (the RTP stream keeps running), but no re-INVITE is sent.
+    /// Resuming a call first holds every other connected call, so at most one
+    /// call is ever off hold; each call whose hold state changed is reported
+    /// through `on_call_state_changed`. A call that connects (answered, or an
+    /// outgoing call that is answered) likewise holds the others first.
     [Throws=MobileError]
     void set_hold(string call_id, boolean on_hold);
+
+    /// Put `active_call_id` on hold and resume `held_call_id` in one step.
+    /// Each call whose hold state changed is reported, the one going on hold
+    /// first. Throws `InvalidState` unless both are distinct connected calls.
+    [Throws=MobileError]
+    void swap_calls(string active_call_id, string held_call_id);
 
     /// Send a DTMF digit.
     [Throws=MobileError]
@@ -327,8 +370,16 @@ interface AriaMobileEngine {
 
     // ── State Queries ──────────────────────────────────────────────
 
-    /// Get current call info, if any.
+    /// The connected call that is off hold, if any; otherwise the most
+    /// recently created live call (held, or outgoing and ringing).
     CallInfo? get_active_call();
+
+    /// Every live call (connected, held, or outgoing and ringing), oldest
+    /// first. At most two calls are live at once: a third `make_call`,
+    /// `make_call_with_id` or `accept_incoming_call` throws `InvalidState`
+    /// without side effects. Incoming calls are still offered
+    /// (`handle_push_notification`), so the app can show and reject them.
+    sequence<CallInfo> get_calls();
 
     /// Get media statistics for a call.
     MediaStats? get_media_stats(string call_id);
@@ -516,4 +567,8 @@ enum MobileError {
     /// `make_call` was cancelled by `hangup` before it returned. `Ended` has
     /// already been reported for the call.
     "Cancelled",
+    /// `transfer_attended` was asked to join two calls the PBX cannot join:
+    /// both incoming or both outgoing. It needs one call this phone received
+    /// and one it placed. Both calls stay up.
+    "TransferUnsupported",
 };

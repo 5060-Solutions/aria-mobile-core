@@ -13,8 +13,8 @@ mod gateway_client;
 mod media;
 mod types;
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -89,6 +89,14 @@ pub trait MobileEventHandler: Send + Sync + 'static {
 /// Active calls keyed by call_id, shared with the status-poll threads.
 type CallMap = Arc<Mutex<HashMap<String, ActiveCallState>>>;
 
+/// How many calls can be live at once: connected (held or not), outgoing and
+/// ringing, or incoming and being accepted. One call plus one waiting call.
+///
+/// Offered incoming calls are not counted. They have not been answered, so
+/// they cost no media, and the app must still be able to show (and decline)
+/// a call that arrives while two are up; only accepting it is refused.
+const MAX_LIVE_CALLS: usize = 2;
+
 /// How many remotely ended call IDs `check_remote_hangup` keeps for apps that
 /// still poll it. An event-driven app never drains the queue, so it is capped.
 const REMOTE_ENDED_BACKLOG: usize = 16;
@@ -106,6 +114,17 @@ const TRANSFER_POLL_INTERVAL: Duration = Duration::from_millis(300);
 /// transfer with no outcome as failed with 408, so the gateway's verdict
 /// normally arrives first; this only covers a gateway that stops answering.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(35);
+
+/// Once one call of an attended transfer is reported transferred, how long
+/// the other has to be reported ended too before it is ended here.
+const TRANSFER_SETTLE: Duration = Duration::from_secs(5);
+
+/// One call of a transfer whose outcome is awaited.
+struct TransferLeg<'a> {
+    call_id: &'a str,
+    call_token: &'a str,
+    route: &'a Route,
+}
 
 /// How often a call's status is polled at the gateway.
 const CALL_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -286,6 +305,84 @@ fn end_call_locally(
     }
 }
 
+/// Put a connected call on or off hold here (no re-INVITE): its media and its
+/// reported state. Returns whether its hold state changed; the caller queues
+/// the event.
+fn apply_hold(call: &mut ActiveCallState, on_hold: bool) -> bool {
+    if let Some(media) = &call.media {
+        media.set_hold(on_hold);
+    }
+    let changed = call.info.on_hold != on_hold;
+    call.info.on_hold = on_hold;
+    call.info.state = if on_hold {
+        CallState::OnHold
+    } else {
+        CallState::Connected
+    };
+    changed
+}
+
+/// Hold every connected call except `keep` that is not held already, and
+/// report each one that changed.
+///
+/// Called under the call-map lock just before `keep` becomes the un-held
+/// call, which keeps the invariant that at most one connected call is off
+/// hold: only that call plays to the speaker and reads the microphone.
+fn hold_others(calls: &mut HashMap<String, ActiveCallState>, keep: &str, events: &Dispatcher) {
+    for (call_id, call) in calls.iter_mut() {
+        if call_id != keep && apply_hold(call, true) {
+            log::info!("Holding {call_id}: {keep} is now the active call");
+            call.events.emit(events, call.info.clone());
+        }
+    }
+}
+
+/// How many calls count against [`MAX_LIVE_CALLS`].
+fn live_call_count(
+    calls: &HashMap<String, ActiveCallState>,
+    outgoing: &OutgoingCalls,
+    accepting: &HashSet<String>,
+) -> usize {
+    calls.len() + outgoing.ringing.len() + accepting.len()
+}
+
+/// The gateway route of the oldest live call whose route is known: a
+/// connected call, or a ringing outgoing call once it has been sent.
+fn live_call_route(
+    calls: &HashMap<String, ActiveCallState>,
+    outgoing: &OutgoingCalls,
+) -> Option<Route> {
+    let connected = calls.values().map(|c| (c.seq, Some(c.route.clone())));
+    let ringing = outgoing.ringing.values().map(|p| {
+        let route = p
+            .route
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        (p.seq, route)
+    });
+    connected
+        .chain(ringing)
+        .filter_map(|(seq, route)| Some((seq, route?)))
+        .min_by_key(|(seq, _)| *seq)
+        .map(|(_, route)| route)
+}
+
+/// Every live call with its creation order: connected calls and ringing
+/// outgoing ones.
+fn live_calls(
+    calls: &HashMap<String, ActiveCallState>,
+    outgoing: &OutgoingCalls,
+) -> Vec<(u64, CallInfo)> {
+    let mut live: Vec<(u64, CallInfo)> = calls
+        .values()
+        .map(|c| (c.seq, c.info.clone()))
+        .chain(outgoing.ringing.values().map(|p| (p.seq, p.info.clone())))
+        .collect();
+    live.sort_by_key(|(seq, _)| *seq);
+    live
+}
+
 /// How many consecutive `unknown` statuses count as the gateway having lost
 /// a call. A single one can be a transient answer (a gateway instance
 /// restarting, or briefly between states) and must not drop a live call.
@@ -348,6 +445,12 @@ pub struct AriaMobileEngine {
     /// here to `calls` when it is answered. When both locks are held, `calls`
     /// is taken first.
     pending_outgoing: Mutex<OutgoingCalls>,
+    /// Call tokens `accept_incoming_call` is accepting, counted against
+    /// [`MAX_LIVE_CALLS`] until the call is in `calls` or the accept failed.
+    /// Lock order: `calls`, then `pending_outgoing`, then this.
+    accepting: Mutex<HashSet<String>>,
+    /// Creation order of calls, for `get_calls`.
+    next_seq: AtomicU64,
     /// The PBX-issued gateway token. Shared with the status-poll threads so
     /// they pick up a token replaced by `set_gateway_token`.
     auth: Arc<auth::GatewayAuth>,
@@ -397,6 +500,22 @@ struct PendingIncoming {
     abandoned: bool,
     /// The watch has already rejected the abandoned call.
     rejected: bool,
+}
+
+/// A slot under [`MAX_LIVE_CALLS`] held by `accept_incoming_call` for one
+/// call token, released when dropped.
+struct AcceptReservation<'a> {
+    accepting: &'a Mutex<HashSet<String>>,
+    call_token: String,
+}
+
+impl Drop for AcceptReservation<'_> {
+    fn drop(&mut self) {
+        self.accepting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.call_token);
+    }
 }
 
 /// Coalesces network-change heartbeats.
@@ -471,6 +590,8 @@ fn new_outgoing_call_id() -> String {
 /// An outgoing call that has been reported `Ringing` and not answered yet.
 struct PendingOutgoing {
     info: CallInfo,
+    /// Creation order, carried over to the call once it is answered.
+    seq: u64,
     events: Arc<CallEvents>,
     /// Sent with `POST /v1/calls` so the gateway can cancel the call by it
     /// before it has assigned a call token.
@@ -516,10 +637,15 @@ struct ReservedOutgoing {
     outcome_rx: tokio::sync::watch::Receiver<Option<bool>>,
     attempt: Arc<Mutex<Option<Route>>>,
     done_tx: tokio::sync::watch::Sender<bool>,
+    /// The route of the other live call, which this one must use too (see
+    /// `reserve_outgoing`).
+    pin: Option<Route>,
 }
 
 struct ActiveCallState {
     info: CallInfo,
+    /// Creation order, for `get_calls`.
+    seq: u64,
     media: Option<media::MobileMediaSession>,
     /// For gateway-routed calls
     call_token: Option<String>,
@@ -540,6 +666,8 @@ impl AriaMobileEngine {
             calls: Arc::new(Mutex::new(HashMap::new())),
             pending_incoming: Arc::new(Mutex::new(HashMap::new())),
             pending_outgoing: Mutex::new(OutgoingCalls::default()),
+            accepting: Mutex::new(HashSet::new()),
+            next_seq: AtomicU64::new(0),
             auth: Arc::new(auth::GatewayAuth::new(gateway_config.api_key)),
             device_id: Arc::new(RwLock::new(None)),
             heartbeat: Arc::default(),
@@ -688,6 +816,8 @@ impl AriaMobileEngine {
         call_token: String,
         preferred_codecs: Vec<AudioCodec>,
     ) -> Result<CallInfo, MobileError> {
+        // Before anything else, so a refused accept has no side effects.
+        let _reservation = self.reserve_accept(&call_token)?;
         let rt = runtime();
         rt.block_on(async {
             let token = self.auth.token()?;
@@ -710,6 +840,59 @@ impl AriaMobileEngine {
             self.answer_offer(&token, offer, route, Some(media_session), sdp_answer)
                 .await
         })
+    }
+
+    /// Count an accept of `call_token` against [`MAX_LIVE_CALLS`].
+    ///
+    /// Refuses (`InvalidState`) when two calls are already live, and an
+    /// accept of a call that is already being accepted or is connected.
+    /// Offered calls are not counted (see [`MAX_LIVE_CALLS`]), so the app
+    /// can still show and decline a third call; it cannot answer it until
+    /// one of the others ends.
+    fn reserve_accept(&self, call_token: &str) -> Result<AcceptReservation<'_>, MobileError> {
+        // Lock order: calls, then pending_outgoing, then accepting.
+        let calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outgoing = self
+            .pending_outgoing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut accepting = self
+            .accepting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if accepting.contains(call_token) || calls.contains_key(&format!("incoming-{call_token}")) {
+            return Err(MobileError::InvalidState);
+        }
+        if live_call_count(&calls, &outgoing, &accepting) >= MAX_LIVE_CALLS {
+            log::warn!("Refusing to accept {call_token}: {MAX_LIVE_CALLS} calls are live");
+            return Err(MobileError::InvalidState);
+        }
+        accepting.insert(call_token.to_string());
+        Ok(AcceptReservation {
+            accepting: &self.accepting,
+            call_token: call_token.to_string(),
+        })
+    }
+
+    /// Start a call's RTP loops with the platform audio bridge. Without this
+    /// the media session exists but has no audio in either direction.
+    fn start_media(&self, media: Option<&media::MobileMediaSession>, call_id: &str) {
+        let Some(media) = media else { return };
+        match self
+            .audio_bridge
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            Some(bridge) => {
+                media.start_with_bridge(bridge);
+                log::info!("Started RTP media for {call_id} with the audio bridge");
+            }
+            None => log::warn!("No audio bridge set; {call_id} will have no audio"),
+        }
     }
 
     /// Send the answer for an offered call and make it the active call.
@@ -791,42 +974,36 @@ impl AriaMobileEngine {
         }
         self.clear_pending_incoming(&call_token);
 
-        // Start RTP processing with the platform audio bridge. Without this
-        // the media session is created and stored but its RX/TX threads
-        // never run, so an ANSWERED INBOUND CALL HAS NO AUDIO in either
-        // direction. (The remote RTP address is already set by
-        // `create_answer_session` from the caller's SDP offer, so unlike the
-        // outbound path there is no separate `update_remote` step here.)
-        if let Some(media_session) = &media {
-            if let Some(bridge) = self
-                .audio_bridge
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-            {
-                media_session.start_with_bridge(bridge);
-                log::info!("Started RTP media session with audio bridge (inbound)");
-            } else {
-                log::warn!("No audio bridge set — inbound call will have no audio");
-            }
-        }
-
         let poll_stop = Arc::new(AtomicBool::new(false));
         let connected = {
             let mut calls = self
                 .calls
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The call now counts as connected rather than being accepted.
+            self.accepting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&call_token);
             // Queued while the call-map lock is held, so nothing done to the
             // call afterwards can be delivered ahead of it. Refused when the
             // offer was already reported ended (the caller hung up as it
-            // was answered).
-            let connected = events.emit(&self.events, info.clone());
+            // was answered). Any other connected call is put on hold, and
+            // reported, first.
+            let connected = events.emit_after(&self.events, info.clone(), || {
+                hold_others(&mut calls, &call_id, &self.events);
+            });
             if connected {
+                // Started only now that the other calls are held, so two
+                // calls never share the speaker and microphone. (The remote
+                // RTP address was set by `create_answer_session` from the
+                // caller's SDP offer.)
+                self.start_media(media.as_ref(), &call_id);
                 calls.insert(
                     call_id.clone(),
                     ActiveCallState {
                         info: info.clone(),
+                        seq: self.next_seq.fetch_add(1, Ordering::Relaxed),
                         media,
                         call_token: Some(call_token.clone()),
                         route: route.clone(),
@@ -928,7 +1105,19 @@ impl AriaMobileEngine {
     ///
     /// Refuses an id that is malformed, in use or used recently
     /// (`InvalidState`), and one that was hung up before the call was made
-    /// (`Cancelled`; its `Ended` has already been reported).
+    /// (`Cancelled`; its `Ended` has already been reported). Also refuses,
+    /// with `InvalidState` and without using up the id, a call that would
+    /// exceed [`MAX_LIVE_CALLS`].
+    ///
+    /// While another call is live, the new call is pinned to that call's
+    /// gateway route: it is placed on the same gateway instance, with no
+    /// failover to another SRV target, and fails if that instance cannot be
+    /// reached. The PBX joins two calls in an attended transfer only when
+    /// both reach it from the same gateway (the same source IP), and the
+    /// gateway can only refer a pair of calls it holds itself, so a second
+    /// call placed through a different instance could never be transferred
+    /// to the first. Failing it is better than a consultation call that
+    /// silently cannot complete the transfer the user placed it for.
     fn reserve_outgoing(
         &self,
         call_id: &str,
@@ -937,6 +1126,16 @@ impl AriaMobileEngine {
         let client_ref = outgoing_client_ref(call_id)
             .ok_or(MobileError::InvalidState)?
             .to_string();
+        // Read before the other locks, which it is never taken under. Only
+        // used below if the call is still being accepted then.
+        let accepting_routes: Vec<(String, Route)> = self
+            .pending_incoming
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(_, p)| p.accepting)
+            .map(|(token, p)| (token.clone(), p.route.clone()))
+            .collect();
         // Lock order: calls, then pending_outgoing.
         let calls = self
             .calls
@@ -955,6 +1154,26 @@ impl AriaMobileEngine {
         }
         if calls.contains_key(call_id) || outgoing.ringing.contains_key(call_id) {
             return Err(MobileError::InvalidState);
+        }
+        let (live, pin) = {
+            let accepting = self
+                .accepting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let pin = live_call_route(&calls, &outgoing).or_else(|| {
+                accepting_routes
+                    .into_iter()
+                    .find(|(token, _)| accepting.contains(token))
+                    .map(|(_, route)| route)
+            });
+            (live_call_count(&calls, &outgoing, &accepting), pin)
+        };
+        if live >= MAX_LIVE_CALLS {
+            log::warn!("Refusing to dial {call_id}: {MAX_LIVE_CALLS} calls are live");
+            return Err(MobileError::InvalidState);
+        }
+        if let Some(route) = &pin {
+            log::info!("Dialing {call_id} on {route:?}, the route of the other live call");
         }
         let token = self.auth.token()?;
 
@@ -979,6 +1198,7 @@ impl AriaMobileEngine {
             call_id.to_string(),
             PendingOutgoing {
                 info: info.clone(),
+                seq: self.next_seq.fetch_add(1, Ordering::Relaxed),
                 events: Arc::clone(&events),
                 client_ref: client_ref.clone(),
                 dialing: false,
@@ -1000,6 +1220,7 @@ impl AriaMobileEngine {
                 outcome_rx,
                 attempt,
                 done_tx,
+                pin,
             },
         ))
     }
@@ -1032,6 +1253,7 @@ impl AriaMobileEngine {
                 outcome_rx,
                 attempt,
                 done_tx,
+                pin,
             },
         ) = self.reserve_outgoing(&call_id, &uri)?;
 
@@ -1104,8 +1326,11 @@ impl AriaMobileEngine {
                     &destination,
                     &sdp_offer,
                     &credentials,
-                    &client_ref,
-                    &attempt,
+                    gateway_client::Placement {
+                        client_ref: &client_ref,
+                        attempt: &attempt,
+                        pin: pin.as_ref(),
+                    },
                 )
                 .await;
             let _ = done_tx.send(true);
@@ -1159,14 +1384,6 @@ impl AriaMobileEngine {
             if let Err(e) = media_session.apply_remote_sdp(&sdp_answer) {
                 log::warn!("SRTP negotiation failed, continuing without it: {e:?}");
             }
-
-            // Start RTP processing with platform audio bridge
-            if let Some(bridge) = self.audio_bridge.read().unwrap().clone() {
-                media_session.start_with_bridge(bridge);
-                log::info!("Started RTP media session with audio bridge");
-            } else {
-                log::warn!("No audio bridge set — call will have no audio");
-            }
         }
 
         // Transition to connected
@@ -1185,11 +1402,17 @@ impl AriaMobileEngine {
                 .pending_outgoing
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if pending.ringing.remove(&call_id).is_some() {
+            if let Some(ringing) = pending.ringing.remove(&call_id) {
+                // Any other connected call goes on hold, and is reported,
+                // before this one connects and its media starts, so two
+                // calls never share the speaker and microphone.
+                hold_others(&mut calls, &call_id, &self.events);
+                self.start_media(media.as_ref(), &call_id);
                 calls.insert(
                     call_id.clone(),
                     ActiveCallState {
                         info: info.clone(),
+                        seq: ringing.seq,
                         media,
                         call_token: Some(call_token.clone()),
                         route: route.clone(),
@@ -1449,50 +1672,151 @@ impl AriaMobileEngine {
                 "Transfer of {} accepted by the PBX; waiting for the outcome",
                 call_id
             );
-            self.await_transfer_outcome(&call_id, &call_token, &route)
-                .await
+            let leg = TransferLeg {
+                call_id: &call_id,
+                call_token: &call_token,
+                route: &route,
+            };
+            self.await_transfer_outcome(&[leg]).await
         })
     }
 
-    /// Poll a call after its transfer was accepted until the outcome is
-    /// known. See `transfer_call`.
-    async fn await_transfer_outcome(
+    /// Attended-transfer: join the far ends of `call_id` and
+    /// `consult_call_id` (typically a call to the transfer target the user
+    /// placed while `call_id` was on hold) and drop this phone from both,
+    /// then wait for the outcome. See `transfer_call` for how the outcome is
+    /// followed; here it is followed on both calls.
+    ///
+    /// - Success: both calls end, each reported `Ended` once with reason
+    ///   `Transferred`.
+    /// - `transfer: failed`: `CallFailed` (or `Timeout` for 408), and both
+    ///   calls stay up, as they were (either may be on hold here).
+    /// - Either call ended for another reason meanwhile: `InvalidState`; that
+    ///   call is reported `Ended`, and the other stays up.
+    ///
+    /// Checked here before anything is sent, leaving both calls as they
+    /// were: `InvalidState` unless both are distinct connected
+    /// gateway-routed calls, and `TransferUnsupported` unless one is
+    /// incoming and the other outgoing (the PBX accepts the REFER only on a
+    /// call the phone received, with `Replaces` naming one it placed). Any
+    /// error from the REFER itself also leaves both calls as they were.
+    pub fn transfer_attended(
         &self,
-        call_id: &str,
-        call_token: &str,
-        route: &Route,
+        call_id: String,
+        consult_call_id: String,
     ) -> Result<(), MobileError> {
+        if call_id == consult_call_id {
+            return Err(MobileError::InvalidState);
+        }
+        let (call_token, route, consult_token, consult_route) = {
+            let calls = self
+                .calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let call = calls.get(&call_id).ok_or(MobileError::InvalidState)?;
+            let consult = calls
+                .get(&consult_call_id)
+                .ok_or(MobileError::InvalidState)?;
+            let call_token = call.call_token.clone().ok_or(MobileError::InvalidState)?;
+            let consult_token = consult
+                .call_token
+                .clone()
+                .ok_or(MobileError::InvalidState)?;
+            if call.info.direction == consult.info.direction {
+                log::warn!(
+                    "Attended transfer of {call_id} with {consult_call_id}: both are {:?}",
+                    call.info.direction
+                );
+                return Err(MobileError::TransferUnsupported);
+            }
+            (
+                call_token,
+                call.route.clone(),
+                consult_token,
+                consult.route.clone(),
+            )
+        };
+
+        let rt = runtime();
+        rt.block_on(async {
+            let token = self.auth.token()?;
+            self.gateway
+                .transfer_attended(&route, &token, &call_token, &consult_token)
+                .await?;
+            log::info!(
+                "Attended transfer of {call_id} with {consult_call_id} accepted by the PBX; \
+                 waiting for the outcome"
+            );
+            let legs = [
+                TransferLeg {
+                    call_id: &call_id,
+                    call_token: &call_token,
+                    route: &route,
+                },
+                TransferLeg {
+                    call_id: &consult_call_id,
+                    call_token: &consult_token,
+                    route: &consult_route,
+                },
+            ];
+            self.await_transfer_outcome(&legs).await
+        })
+    }
+
+    /// Poll the calls of a transfer after the PBX accepted it until the
+    /// outcome is known. See `transfer_call` and `transfer_attended`.
+    ///
+    /// The gateway reports an attended transfer's outcome on both calls, so
+    /// the first verdict on either decides. On success each call ends with
+    /// its own `Ended`; once one has, the others get
+    /// [`TRANSFER_SETTLE`] to follow before they are ended here (and hung up
+    /// at the gateway, in case they are somehow still up there).
+    async fn await_transfer_outcome(&self, legs: &[TransferLeg<'_>]) -> Result<(), MobileError> {
         let deadline = Instant::now() + self.transfer_timeout;
-        let mut gone = GoneDetector::default();
+        let mut gone: Vec<GoneDetector> = legs.iter().map(|_| GoneDetector::default()).collect();
+        let mut transferred = vec![false; legs.len()];
+        // Set once the first call is reported transferred.
+        let mut settle_by: Option<Instant> = None;
         loop {
             tokio::time::sleep(self.transfer_poll_interval).await;
             let token = self.auth.token()?;
-            let status = match self
-                .gateway
-                .get_call_status(route, &token, call_token)
-                .await
-            {
-                Ok(status) => Some(status),
-                // The call is still up; the app must fetch a new token.
-                Err(MobileError::AuthenticationError) => {
-                    return Err(MobileError::AuthenticationError)
+            for (i, leg) in legs.iter().enumerate() {
+                if transferred[i] {
+                    continue;
                 }
-                Err(e) => {
-                    log::warn!("Transfer status poll for {call_id} failed: {e}");
-                    None
-                }
-            };
-            if let Some(status) = status {
-                if gone.is_gone(&status.status) {
+                let call_id = leg.call_id;
+                let status = match self
+                    .gateway
+                    .get_call_status(leg.route, &token, leg.call_token)
+                    .await
+                {
+                    Ok(status) => status,
+                    // The calls are still up; the app must fetch a new token.
+                    Err(MobileError::AuthenticationError) => {
+                        return Err(MobileError::AuthenticationError)
+                    }
+                    Err(e) => {
+                        log::warn!("Transfer status poll for {call_id} failed: {e}");
+                        continue;
+                    }
+                };
+                let succeeded = transferred.iter().any(|t| *t);
+                if gone[i].is_gone(&status.status) {
                     // The call is over at the gateway. Whoever removes it
                     // from the map (this, the status poll, or a hangup)
-                    // reports `Ended`, once.
-                    let reason =
-                        EndReason::from_gateway(status.reason.as_deref(), EndReason::RemoteHangup);
+                    // reports `Ended`, once. After another call of the
+                    // transfer was transferred, this one ending is the
+                    // transfer completing, whatever the gateway calls it.
+                    let reason = if succeeded {
+                        EndReason::Transferred
+                    } else {
+                        EndReason::from_gateway(status.reason.as_deref(), EndReason::RemoteHangup)
+                    };
                     end_call_locally(&self.calls, &self.events, call_id, reason);
                     if reason == EndReason::Transferred {
                         log::info!("Call {call_id} transferred");
-                        return Ok(());
+                        transferred[i] = true;
+                        continue;
                     }
                     log::info!(
                         "Call {call_id} ended during its transfer (reason: {:?})",
@@ -1500,45 +1824,87 @@ impl AriaMobileEngine {
                     );
                     return Err(MobileError::InvalidState);
                 }
-                if status.status == "active" {
-                    match status.transfer.as_deref() {
-                        None => {
-                            // A gateway that does not report outcomes: the
-                            // 202 is all there is.
-                            log::info!("Gateway reports no transfer outcome; ending {call_id}");
+                // Once a call has been transferred, the transfer succeeded;
+                // the others are only waited on to end.
+                if status.status != "active" || succeeded {
+                    continue;
+                }
+                match status.transfer.as_deref() {
+                    None => {
+                        // A gateway that does not report outcomes: the 202
+                        // is all there is.
+                        log::info!("Gateway reports no transfer outcome; ending the call");
+                        for leg in legs {
                             end_call_locally(
                                 &self.calls,
                                 &self.events,
-                                call_id,
+                                leg.call_id,
                                 EndReason::Transferred,
                             );
-                            return Ok(());
                         }
-                        // 408 means no outcome: the gateway's NOTIFY
-                        // watchdog gave up, or the PBX itself timed out. The
-                        // transfer did not happen, and the call is still up.
-                        Some("failed") if status.transfer_code == Some(408) => {
-                            log::warn!("Transfer of {call_id} timed out (SIP 408)");
-                            return Err(MobileError::Timeout);
-                        }
-                        Some("failed") => {
-                            let code = status
-                                .transfer_code
-                                .map_or_else(|| "unknown".to_string(), |c| c.to_string());
-                            log::warn!("Transfer of {call_id} failed: SIP {code}");
-                            return Err(MobileError::CallFailed(format!(
-                                "the transfer failed (SIP {code}); the call is still up"
-                            )));
-                        }
-                        _ => {}
+                        return Ok(());
                     }
+                    // 408 means no outcome: the gateway's NOTIFY watchdog
+                    // gave up, or the PBX itself timed out. The transfer did
+                    // not happen, and the calls are still up.
+                    Some("failed") if status.transfer_code == Some(408) => {
+                        log::warn!("Transfer of {call_id} timed out (SIP 408)");
+                        return Err(MobileError::Timeout);
+                    }
+                    Some("failed") => {
+                        let code = status
+                            .transfer_code
+                            .map_or_else(|| "unknown".to_string(), |c| c.to_string());
+                        log::warn!("Transfer of {call_id} failed: SIP {code}");
+                        let still_up = if legs.len() > 1 {
+                            "the calls are still up"
+                        } else {
+                            "the call is still up"
+                        };
+                        return Err(MobileError::CallFailed(format!(
+                            "the transfer failed (SIP {code}); {still_up}"
+                        )));
+                    }
+                    _ => {}
                 }
             }
-            if Instant::now() >= deadline {
-                log::warn!("No transfer outcome for {call_id}; the call is still up");
+            if transferred.iter().all(|t| *t) {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if transferred.iter().any(|t| *t) {
+                let settle_by =
+                    *settle_by.get_or_insert(now + TRANSFER_SETTLE.min(self.transfer_timeout));
+                if now >= settle_by {
+                    for (leg, _) in legs.iter().zip(&transferred).filter(|(_, t)| !**t) {
+                        self.end_transferred_leg(leg);
+                    }
+                    return Ok(());
+                }
+            } else if now >= deadline {
+                log::warn!("No transfer outcome; the call is still up");
                 return Err(MobileError::Timeout);
             }
         }
+    }
+
+    /// End a call of a transfer that succeeded but which the gateway still
+    /// reports up: here at once, and at the gateway in the background.
+    fn end_transferred_leg(&self, leg: &TransferLeg<'_>) {
+        let call_id = leg.call_id.to_string();
+        log::warn!("{call_id} is still up after its transfer succeeded; hanging it up");
+        if !end_call_locally(&self.calls, &self.events, &call_id, EndReason::Transferred) {
+            return;
+        }
+        let (gateway, auth, events) = (
+            Arc::clone(&self.gateway),
+            Arc::clone(&self.auth),
+            Arc::clone(&self.events),
+        );
+        let (route, call_token) = (leg.route.clone(), leg.call_token.to_string());
+        runtime().spawn(async move {
+            hang_up_at_gateway(&gateway, &auth, &events, &route, &call_id, &call_token).await;
+        });
     }
 
     pub fn set_mute(&self, call_id: String, muted: bool) -> Result<(), MobileError> {
@@ -1556,21 +1922,57 @@ impl AriaMobileEngine {
         Ok(())
     }
 
+    /// Hold or resume a call, locally (no re-INVITE).
+    ///
+    /// Resuming a call first holds every other connected call, so at most
+    /// one is ever off hold; each call whose hold state changed is reported.
     pub fn set_hold(&self, call_id: String, on_hold: bool) -> Result<(), MobileError> {
         let mut calls = self.calls.lock().unwrap();
-        let call = calls.get_mut(&call_id).ok_or(MobileError::InvalidState)?;
-
-        if let Some(media) = &call.media {
-            media.set_hold(on_hold);
+        if !calls.contains_key(&call_id) {
+            return Err(MobileError::InvalidState);
         }
-
-        call.info.on_hold = on_hold;
-        call.info.state = if on_hold {
-            CallState::OnHold
-        } else {
-            CallState::Connected
-        };
+        if !on_hold {
+            hold_others(&mut calls, &call_id, &self.events);
+        }
+        let call = calls.get_mut(&call_id).expect("checked above");
+        apply_hold(call, on_hold);
+        // Queued under the call-map lock, so concurrent changes are
+        // delivered in the order they were applied.
         call.events.emit(&self.events, call.info.clone());
+        Ok(())
+    }
+
+    /// Put `active_call_id` on hold and resume `held_call_id`, in one step
+    /// with respect to every other call control.
+    ///
+    /// Throws `InvalidState` unless both are distinct connected calls. Each
+    /// call whose hold state changed is reported, the one going on hold
+    /// first.
+    pub fn swap_calls(
+        &self,
+        active_call_id: String,
+        held_call_id: String,
+    ) -> Result<(), MobileError> {
+        if active_call_id == held_call_id {
+            return Err(MobileError::InvalidState);
+        }
+        let mut calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !calls.contains_key(&active_call_id) || !calls.contains_key(&held_call_id) {
+            return Err(MobileError::InvalidState);
+        }
+        let active = calls.get_mut(&active_call_id).expect("checked above");
+        if apply_hold(active, true) {
+            active.events.emit(&self.events, active.info.clone());
+        }
+        hold_others(&mut calls, &held_call_id, &self.events);
+        let held = calls.get_mut(&held_call_id).expect("checked above");
+        if apply_hold(held, false) {
+            held.events.emit(&self.events, held.info.clone());
+        }
+        log::info!("Swapped calls: {active_call_id} held, {held_call_id} active");
         Ok(())
     }
 
@@ -2024,12 +2426,40 @@ impl AriaMobileEngine {
 
     // ── State Queries ───────────────────────────────────────────────
 
+    /// The connected call that is off hold, if there is one; otherwise the
+    /// most recently created live call (held, or outgoing and ringing).
     pub fn get_active_call(&self) -> Option<CallInfo> {
-        let calls = self.calls.lock().unwrap();
-        calls
-            .values()
-            .find(|c| !matches!(c.info.state, CallState::Ended | CallState::Idle))
-            .map(|c| c.info.clone())
+        // Lock order: calls, then pending_outgoing.
+        let calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(call) = calls.values().find(|c| !c.info.on_hold) {
+            return Some(call.info.clone());
+        }
+        let outgoing = self
+            .pending_outgoing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        live_calls(&calls, &outgoing).pop().map(|(_, info)| info)
+    }
+
+    /// Every live call (connected, held, or outgoing and ringing), oldest
+    /// first. Offered incoming calls are not included until accepted.
+    pub fn get_calls(&self) -> Vec<CallInfo> {
+        // Lock order: calls, then pending_outgoing.
+        let calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outgoing = self
+            .pending_outgoing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        live_calls(&calls, &outgoing)
+            .into_iter()
+            .map(|(_, info)| info)
+            .collect()
     }
 
     pub fn get_media_stats(&self, call_id: String) -> Option<MediaStats> {
@@ -2355,6 +2785,7 @@ mod tests {
                     duration_secs: 0,
                     end_reason: None,
                 },
+                seq: engine.next_seq.fetch_add(1, Ordering::Relaxed),
                 media: None,
                 call_token: Some(call_token.to_string()),
                 route: engine.gateway.primary_route(),
@@ -2367,6 +2798,349 @@ mod tests {
 
     /// An address nothing listens on, for tests that must not reach a gateway.
     const NO_GATEWAY: &str = "http://127.0.0.1:9";
+
+    /// Put a connected call in the engine, as `insert_call` does, going
+    /// `direction` and held on `route`.
+    fn insert_call_on(
+        engine: &AriaMobileEngine,
+        call_id: &str,
+        call_token: &str,
+        direction: CallDirection,
+        route: Route,
+    ) -> Arc<AtomicBool> {
+        let stop = insert_call(engine, call_id, call_token);
+        let mut calls = engine.calls.lock().unwrap();
+        let call = calls.get_mut(call_id).unwrap();
+        call.info.direction = direction;
+        call.route = route;
+        stop
+    }
+
+    /// An incoming call `incoming-tok-in` and an outgoing consultation call
+    /// `outgoing-c` (token `tok-out`), as after placing a call to the
+    /// transfer target from a call on hold. Returns their poll stop flags.
+    fn insert_attended_pair(engine: &AriaMobileEngine) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+        let route = engine.gateway.primary_route();
+        let incoming = insert_call_on(
+            engine,
+            "incoming-tok-in",
+            "tok-in",
+            CallDirection::Inbound,
+            route.clone(),
+        );
+        let consult = insert_call_on(
+            engine,
+            "outgoing-c",
+            "tok-out",
+            CallDirection::Outbound,
+            route,
+        );
+        (incoming, consult)
+    }
+
+    /// A gateway that accepts a transfer with 202 and answers each call's
+    /// status polls with that call's script in turn, repeating the last
+    /// answer: `scripts` maps a call token to its script.
+    fn attended_gateway(scripts: &[(&'static str, &[&'static str])]) -> MockGateway {
+        let scripts: HashMap<String, (Vec<&'static str>, usize)> = scripts
+            .iter()
+            .map(|(token, script)| (token.to_string(), (script.to_vec(), 0)))
+            .collect();
+        let scripts = Mutex::new(scripts);
+        MockGateway::start(move |req| {
+            if req.path.ends_with("/transfer") {
+                return (202, "{}".into());
+            }
+            let token = req
+                .path
+                .strip_prefix("/v1/calls/")
+                .and_then(|p| p.strip_suffix("/status"));
+            let mut scripts = scripts.lock().unwrap();
+            match token.and_then(|t| scripts.get_mut(t)) {
+                Some((script, n)) => {
+                    let body = script[(*n).min(script.len() - 1)];
+                    *n += 1;
+                    (200, body.into())
+                }
+                None => (200, "{}".into()),
+            }
+        })
+    }
+
+    const PENDING: &str = r#"{"status":"active","transfer":"pending"}"#;
+    const TRANSFERRED: &str = r#"{"status":"ended","reason":"transferred"}"#;
+
+    fn ended_reasons(recorder: &Recorder, call_id: &str) -> Vec<Option<EndReason>> {
+        recorder
+            .states()
+            .iter()
+            .filter(|i| i.call_id == call_id && i.state == CallState::Ended)
+            .map(|i| i.end_reason)
+            .collect()
+    }
+
+    #[test]
+    fn attended_transfer_sends_replaces_and_ends_both_calls_once() {
+        let gw = attended_gateway(&[
+            ("tok-in", &[PENDING, PENDING, TRANSFERRED]),
+            ("tok-out", &[PENDING, TRANSFERRED]),
+        ]);
+        let (engine, recorder) = engine(&gw.base_url);
+        let (in_stop, out_stop) = insert_attended_pair(&engine);
+        // The regular remote-hangup polls run too, and also see the calls
+        // end; between them and the transfer, one Ended each.
+        let route = engine.gateway.primary_route();
+        engine.start_call_status_poll(
+            "incoming-tok-in".into(),
+            "tok-in".into(),
+            route.clone(),
+            Arc::clone(&in_stop),
+        );
+        engine.start_call_status_poll(
+            "outgoing-c".into(),
+            "tok-out".into(),
+            route,
+            Arc::clone(&out_stop),
+        );
+
+        engine
+            .transfer_attended("outgoing-c".into(), "incoming-tok-in".into())
+            .unwrap();
+
+        let transfers: Vec<_> = gw
+            .requests()
+            .into_iter()
+            .filter(|r| r.path.ends_with("/transfer"))
+            .collect();
+        assert_eq!(transfers.len(), 1);
+        assert_eq!(transfers[0].method, "POST");
+        assert_eq!(transfers[0].path, "/v1/calls/tok-out/transfer");
+        assert_eq!(transfers[0].body, r#"{"replaces":"tok-in"}"#);
+
+        assert!(engine.get_calls().is_empty());
+        assert!(in_stop.load(Ordering::Relaxed) && out_stop.load(Ordering::Relaxed));
+        std::thread::sleep(Duration::from_millis(100));
+        for id in ["incoming-tok-in", "outgoing-c"] {
+            assert_eq!(
+                ended_reasons(&recorder, id),
+                [Some(EndReason::Transferred)],
+                "{id}"
+            );
+        }
+        assert_eq!(recorder.states().len(), 2);
+        // Nothing was hung up: the gateway ended both calls itself.
+        assert!(gw.requests().iter().all(|r| !r.path.ends_with("/hangup")));
+    }
+
+    #[test]
+    fn a_failed_attended_transfer_keeps_both_calls_up() {
+        let failed = r#"{"status":"active","transfer":"failed","transfer_code":503}"#;
+        let gw = attended_gateway(&[
+            ("tok-in", &[PENDING, failed]),
+            ("tok-out", &[PENDING, failed]),
+        ]);
+        let (engine, recorder) = engine(&gw.base_url);
+        let (in_stop, out_stop) = insert_attended_pair(&engine);
+
+        let err = engine
+            .transfer_attended("incoming-tok-in".into(), "outgoing-c".into())
+            .unwrap_err();
+
+        match &err {
+            MobileError::CallFailed(message) => {
+                assert!(message.contains("SIP 503"), "{message}");
+                assert!(message.contains("still up"), "{message}");
+            }
+            other => panic!("expected CallFailed, got {other:?}"),
+        }
+        assert_eq!(engine.get_calls().len(), 2);
+        assert!(!in_stop.load(Ordering::Relaxed) && !out_stop.load(Ordering::Relaxed));
+        assert!(recorder.states().is_empty());
+    }
+
+    #[test]
+    fn an_attended_transfer_failed_with_408_is_a_timeout() {
+        let failed = r#"{"status":"active","transfer":"failed","transfer_code":408}"#;
+        let gw = attended_gateway(&[("tok-in", &[PENDING, failed]), ("tok-out", &[failed])]);
+        let (engine, recorder) = engine(&gw.base_url);
+        insert_attended_pair(&engine);
+
+        let err = engine
+            .transfer_attended("incoming-tok-in".into(), "outgoing-c".into())
+            .unwrap_err();
+
+        assert!(matches!(err, MobileError::Timeout), "{err:?}");
+        assert_eq!(engine.get_calls().len(), 2);
+        assert!(recorder.states().is_empty());
+    }
+
+    /// The incoming call hangs up mid-transfer: it is reported ended, and
+    /// the consultation call (released by the gateway with 487) stays up.
+    #[test]
+    fn a_call_that_ends_otherwise_during_an_attended_transfer_leaves_the_other_up() {
+        let gw = attended_gateway(&[
+            ("tok-in", &[PENDING, r#"{"status":"ended","reason":"bye"}"#]),
+            (
+                "tok-out",
+                &[
+                    PENDING,
+                    r#"{"status":"active","transfer":"failed","transfer_code":487}"#,
+                ],
+            ),
+        ]);
+        let (engine, recorder) = engine(&gw.base_url);
+        insert_attended_pair(&engine);
+
+        let err = engine
+            .transfer_attended("incoming-tok-in".into(), "outgoing-c".into())
+            .unwrap_err();
+
+        assert!(matches!(err, MobileError::InvalidState), "{err:?}");
+        assert_eq!(
+            ended_reasons(&recorder, "incoming-tok-in"),
+            [Some(EndReason::RemoteHangup)]
+        );
+        assert_eq!(ids(&engine.get_calls()), ["outgoing-c"]);
+    }
+
+    /// A call the gateway still reports up after the other was transferred
+    /// is ended here after a short wait, and hung up at the gateway.
+    #[test]
+    fn a_call_left_up_after_a_successful_attended_transfer_is_ended() {
+        let gw = attended_gateway(&[("tok-in", &[PENDING, TRANSFERRED]), ("tok-out", &[PENDING])]);
+        let (engine, recorder) = engine(&gw.base_url);
+        insert_attended_pair(&engine);
+
+        engine
+            .transfer_attended("incoming-tok-in".into(), "outgoing-c".into())
+            .unwrap();
+
+        assert!(engine.get_calls().is_empty());
+        for id in ["incoming-tok-in", "outgoing-c"] {
+            assert_eq!(
+                ended_reasons(&recorder, id),
+                [Some(EndReason::Transferred)],
+                "{id}"
+            );
+        }
+        assert!(eventually(|| count(&gw, "/v1/calls/tok-out/hangup") == 1));
+        assert_eq!(count(&gw, "/v1/calls/tok-in/hangup"), 0);
+    }
+
+    #[test]
+    fn attended_transfer_is_checked_before_anything_is_sent() {
+        let (engine, recorder) = engine(NO_GATEWAY);
+        let route = engine.gateway.primary_route();
+        insert_call_on(
+            &engine,
+            "incoming-a",
+            "a",
+            CallDirection::Inbound,
+            route.clone(),
+        );
+        insert_call_on(
+            &engine,
+            "incoming-b",
+            "b",
+            CallDirection::Inbound,
+            route.clone(),
+        );
+        insert_call_on(
+            &engine,
+            "outgoing-c",
+            "c",
+            CallDirection::Outbound,
+            route.clone(),
+        );
+        insert_call_on(&engine, "outgoing-d", "d", CallDirection::Outbound, route);
+
+        let invalid = [
+            ("incoming-a", "incoming-a"),
+            ("incoming-a", "nope"),
+            ("nope", "outgoing-c"),
+        ];
+        for (a, b) in invalid {
+            let err = engine.transfer_attended(a.into(), b.into()).unwrap_err();
+            assert!(matches!(err, MobileError::InvalidState), "{a} {b}: {err:?}");
+        }
+        for (a, b) in [("incoming-a", "incoming-b"), ("outgoing-c", "outgoing-d")] {
+            let err = engine.transfer_attended(a.into(), b.into()).unwrap_err();
+            assert!(
+                matches!(err, MobileError::TransferUnsupported),
+                "{a} {b}: {err:?}"
+            );
+        }
+        assert_eq!(engine.get_calls().len(), 4);
+        assert!(recorder.states().is_empty());
+    }
+
+    /// A ringing outgoing call is not connected, so it cannot be one side.
+    #[test]
+    fn a_ringing_call_cannot_be_attended_transferred() {
+        let gate = Gate::default();
+        let opened = gate.clone();
+        let gw = MockGateway::start(move |req| match req.path.as_str() {
+            "/v1/calls" => {
+                opened.wait();
+                answer("ct-out")
+            }
+            _ => (200, r#"{"status":"active"}"#.into()),
+        });
+        let (engine, _) = engine(&gw.base_url);
+        let engine = Arc::new(engine);
+        answer_here(&engine, "tok-1").unwrap();
+        let ringing = dial_in_background(&engine);
+        assert!(eventually(|| engine.get_calls().len() == 2));
+        let out_id = engine.get_calls()[1].call_id.clone();
+
+        let err = engine
+            .transfer_attended("incoming-tok-1".into(), out_id)
+            .unwrap_err();
+
+        assert!(matches!(err, MobileError::InvalidState), "{err:?}");
+        assert!(gw.requests().iter().all(|r| !r.path.ends_with("/transfer")));
+        gate.open();
+        ringing.recv().unwrap().unwrap();
+    }
+
+    #[test]
+    fn attended_transfer_refusals_leave_both_calls_up() {
+        // The gateway client's mapping is tested there; this checks that
+        // every refusal leaves both calls alone.
+        let cases = [
+            (
+                409,
+                r#"{"error":"unsupported_by_pbx"}"#,
+                "TransferUnsupported",
+            ),
+            (409, r#"{"error":"call_not_established"}"#, "InvalidState"),
+            (409, "", "GatewayError"),
+            (400, r#"{"error":"same_call"}"#, "InvalidState"),
+            (404, "{}", "InvalidState"),
+            (502, "{}", "CallFailed"),
+        ];
+        for (status, body, expected) in cases {
+            let gw = MockGateway::start(move |_| (status, body.to_string()));
+            let (engine, recorder) = engine(&gw.base_url);
+            insert_attended_pair(&engine);
+
+            let err = engine
+                .transfer_attended("incoming-tok-in".into(), "outgoing-c".into())
+                .unwrap_err();
+
+            let got = match err {
+                MobileError::TransferUnsupported => "TransferUnsupported",
+                MobileError::InvalidState => "InvalidState",
+                MobileError::GatewayError => "GatewayError",
+                MobileError::CallFailed(_) => "CallFailed",
+                other => panic!("HTTP {status} {body}: {other:?}"),
+            };
+            assert_eq!(got, expected, "HTTP {status} {body}");
+            assert_eq!(engine.get_calls().len(), 2, "HTTP {status} {body}");
+            assert!(recorder.states().is_empty(), "HTTP {status} {body}");
+            assert_eq!(gw.requests().len(), 1, "HTTP {status} {body}");
+        }
+    }
 
     #[test]
     fn transfer_target_validation() {
@@ -4048,6 +4822,10 @@ mod tests {
             })
             .unwrap();
         dial(&engine).unwrap();
+        // Let the poll end that call first, so the call below is the only
+        // one up and the accept in its callback is not refused by the
+        // two-call limit before it reaches the gateway.
+        assert!(eventually(|| engine.get_calls().is_empty()));
         let stop = insert_call(&engine, "c-401", "tok-401");
         engine.start_call_status_poll(
             "c-401".into(),
@@ -4180,6 +4958,82 @@ mod tests {
         assert!(eventually(|| count(&gw, "/v1/calls/tok-pin/status") >= 2));
         engine.reject_incoming_call("tok-pin".into()).unwrap();
         assert_eq!(count(&gw, "/v1/calls/tok-pin/reject"), 1);
+    }
+
+    /// A second call goes to the gateway instance holding the first, even
+    /// when another instance comes first in the SRV order, so the two can
+    /// be joined by an attended transfer.
+    #[test]
+    fn a_call_placed_while_another_is_up_uses_the_same_gateway() {
+        let first = call_waiting_gateway();
+        let held = call_waiting_gateway();
+        let (engine, _) = engine(&first.base_url);
+        engine
+            .gateway
+            .set_test_routes(&[first.base_url.as_str(), held.base_url.as_str()]);
+        let held_route = engine.gateway.routes()[1].clone();
+        insert_call_on(
+            &engine,
+            "incoming-tok-1",
+            "tok-1",
+            CallDirection::Inbound,
+            held_route,
+        );
+
+        let out = dial(&engine).unwrap();
+
+        assert_eq!(count(&held, "/v1/calls"), 1);
+        assert_eq!(count(&first, "/v1/calls"), 0);
+        assert_eq!(
+            engine.calls.lock().unwrap()[&out.call_id].route.base_url(),
+            held.base_url
+        );
+    }
+
+    /// If the instance holding the other call cannot be reached, the new
+    /// call fails rather than going to another instance.
+    #[test]
+    fn a_call_pinned_to_an_unreachable_gateway_fails_without_failover() {
+        let other = call_waiting_gateway();
+        let (engine, recorder) = engine(&other.base_url);
+        engine
+            .gateway
+            .set_test_routes(&[NO_GATEWAY, other.base_url.as_str()]);
+        let dead_route = engine.gateway.routes()[0].clone();
+        insert_call_on(
+            &engine,
+            "incoming-tok-1",
+            "tok-1",
+            CallDirection::Inbound,
+            dead_route,
+        );
+
+        let err = dial(&engine).unwrap_err();
+
+        assert!(matches!(err, MobileError::NetworkError), "{err:?}");
+        assert_eq!(count(&other, "/v1/calls"), 0);
+        let ended: Vec<_> = recorder
+            .states()
+            .into_iter()
+            .filter(|i| i.state == CallState::Ended)
+            .collect();
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].end_reason, Some(EndReason::Failed));
+        assert_eq!(ids(&engine.get_calls()), ["incoming-tok-1"]);
+    }
+
+    /// With no other call, a call still fails over between instances.
+    #[test]
+    fn a_lone_call_still_fails_over() {
+        let gw = call_waiting_gateway();
+        let (engine, _) = engine(&gw.base_url);
+        engine
+            .gateway
+            .set_test_routes(&[NO_GATEWAY, gw.base_url.as_str()]);
+
+        dial(&engine).unwrap();
+
+        assert_eq!(count(&gw, "/v1/calls"), 1);
     }
 
     /// `make_call_with_id` with an offer (media setup) that takes `setup`.
@@ -4541,5 +5395,278 @@ mod tests {
         assert!(fired.load(Ordering::Relaxed));
         // Break the Arc cycle (engine -> handler -> engine).
         engine.events.set_handler(None);
+    }
+
+    // ── Call waiting ────────────────────────────────────────────────
+
+    /// A gateway on which every call is up and every request succeeds, and
+    /// an outgoing call is answered with `ct-out`.
+    fn call_waiting_gateway() -> MockGateway {
+        MockGateway::start(|req| match req.path.as_str() {
+            "/v1/calls" => answer("ct-out"),
+            p if p.ends_with("/status") => (200, r#"{"status":"active"}"#.into()),
+            _ => (200, "{}".into()),
+        })
+    }
+
+    /// (call_id, state, on_hold) of each call-state event, in order.
+    fn holds(recorder: &Recorder) -> Vec<(String, CallState, bool)> {
+        recorder
+            .states()
+            .into_iter()
+            .map(|i| (i.call_id, i.state, i.on_hold))
+            .collect()
+    }
+
+    fn ids(calls: &[CallInfo]) -> Vec<&str> {
+        calls.iter().map(|c| c.call_id.as_str()).collect()
+    }
+
+    #[test]
+    fn two_calls_can_be_up_at_once() {
+        let gw = call_waiting_gateway();
+        let (engine, _recorder) = engine(&gw.base_url);
+        answer_here(&engine, "tok-1").unwrap();
+        let out = dial(&engine).unwrap();
+
+        let calls = engine.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.contains_key("incoming-tok-1"));
+        assert!(calls.contains_key(&out.call_id));
+    }
+
+    #[test]
+    fn an_answered_outgoing_call_holds_the_connected_one_first() {
+        let gw = call_waiting_gateway();
+        let (engine, recorder) = engine(&gw.base_url);
+        answer_here(&engine, "tok-1").unwrap();
+        let out = dial(&engine).unwrap();
+        assert!(!out.on_hold);
+
+        assert_eq!(
+            holds(&recorder),
+            [
+                ("incoming-tok-1".to_string(), CallState::Connected, false),
+                (out.call_id.clone(), CallState::Ringing, false),
+                ("incoming-tok-1".to_string(), CallState::OnHold, true),
+                (out.call_id.clone(), CallState::Connected, false),
+            ]
+        );
+        assert_eq!(engine.get_active_call().unwrap().call_id, out.call_id);
+    }
+
+    #[test]
+    fn an_accepted_call_holds_the_connected_one_first() {
+        let gw = call_waiting_gateway();
+        let (engine, recorder) = engine(&gw.base_url);
+        let out = dial(&engine).unwrap();
+        answer_here(&engine, "tok-2").unwrap();
+
+        assert_eq!(
+            holds(&recorder)[2..],
+            [
+                (out.call_id.clone(), CallState::OnHold, true),
+                ("incoming-tok-2".to_string(), CallState::Connected, false),
+            ]
+        );
+        let calls = engine.get_calls();
+        assert_eq!(ids(&calls), [out.call_id.as_str(), "incoming-tok-2"]);
+        assert!(calls[0].on_hold && !calls[1].on_hold);
+        assert_eq!(engine.get_active_call().unwrap().call_id, "incoming-tok-2");
+    }
+
+    #[test]
+    fn an_accept_of_a_call_that_already_ended_holds_nothing() {
+        let gw = call_waiting_gateway();
+        let (engine, recorder) = engine(&gw.base_url);
+        insert_call(&engine, "c1", "tok-c1");
+        // The offer is reported ended (the caller hung up) as it is answered.
+        let entry_events =
+            engine.watch_incoming(&offer("tok-x"), engine.gateway.primary_route(), false);
+        let info = engine.pending_incoming.lock().unwrap()["tok-x"]
+            .info
+            .clone();
+        entry_events.emit_ended(&engine.events, &info, EndReason::CallerCancelled);
+
+        assert!(matches!(
+            answer_here(&engine, "tok-x"),
+            Err(MobileError::InvalidState)
+        ));
+        assert!(!engine.calls.lock().unwrap()["c1"].info.on_hold);
+        assert_eq!(holds(&recorder).len(), 1, "only the offer's Ended");
+    }
+
+    #[test]
+    fn get_calls_lists_live_calls_oldest_first() {
+        let (engine, _recorder) = engine(NO_GATEWAY);
+        assert!(engine.get_calls().is_empty());
+        assert!(engine.get_active_call().is_none());
+
+        insert_call(&engine, "c1", "tok-1");
+        let ringing = "outgoing-ringing".to_string();
+        engine.reserve_outgoing(&ringing, "1003").unwrap();
+        assert_eq!(ids(&engine.get_calls()), ["c1", ringing.as_str()]);
+        // The un-held connected call wins over a newer ringing one...
+        assert_eq!(engine.get_active_call().unwrap().call_id, "c1");
+        // ...and with every connected call held, the newest live call.
+        engine.set_hold("c1".into(), true).unwrap();
+        assert_eq!(engine.get_active_call().unwrap().call_id, ringing);
+
+        // Order is by creation, not by map order or id.
+        let (engine, _recorder) = self::engine(NO_GATEWAY);
+        for id in ["z", "a", "m"] {
+            insert_call(&engine, id, id);
+        }
+        engine.calls.lock().unwrap().remove("a");
+        insert_call(&engine, "a", "a");
+        assert_eq!(ids(&engine.get_calls()), ["z", "m", "a"]);
+    }
+
+    #[test]
+    fn a_third_call_is_refused_without_side_effects() {
+        let gw = call_waiting_gateway();
+        let (engine, recorder) = engine(&gw.base_url);
+        insert_call(&engine, "c1", "tok-1");
+        insert_call(&engine, "c2", "tok-2");
+        let before = gw.requests().len();
+
+        let id = new_outgoing_call_id();
+        assert!(matches!(
+            dial_with_id(&engine, id.clone()),
+            Err(MobileError::InvalidState)
+        ));
+        assert!(matches!(
+            engine.accept_incoming_call("tok-3".into(), vec![]),
+            Err(MobileError::InvalidState)
+        ));
+        assert_eq!(gw.requests().len(), before, "nothing sent");
+        assert!(recorder.states().is_empty(), "nothing reported");
+        assert!(engine.accepting.lock().unwrap().is_empty());
+        assert_eq!(engine.get_calls().len(), 2);
+
+        // The refused id was not used up: once a call ends it can be dialed.
+        engine.hangup("c2".into()).unwrap();
+        assert_eq!(
+            dial_with_id(&engine, id).unwrap().state,
+            CallState::Connected
+        );
+    }
+
+    #[test]
+    fn ringing_and_accepting_calls_count_against_the_cap() {
+        let (engine, _recorder) = engine(NO_GATEWAY);
+        insert_call(&engine, "c1", "tok-1");
+        engine.reserve_outgoing("outgoing-ring", "1003").unwrap();
+        assert!(matches!(
+            engine.reserve_accept("tok-3"),
+            Err(MobileError::InvalidState)
+        ));
+        assert!(matches!(
+            engine.reserve_outgoing("outgoing-third", "1004"),
+            Err(MobileError::InvalidState)
+        ));
+
+        let (engine, _recorder) = self::engine(NO_GATEWAY);
+        insert_call(&engine, "c1", "tok-1");
+        let reservation = engine.reserve_accept("tok-2").unwrap();
+        // The same call cannot be accepted twice at once.
+        assert!(engine.reserve_accept("tok-2").is_err());
+        assert!(matches!(
+            engine.reserve_outgoing("outgoing-third", "1004"),
+            Err(MobileError::InvalidState)
+        ));
+        // A failed accept gives its slot back.
+        drop(reservation);
+        assert!(engine.reserve_outgoing("outgoing-third", "1004").is_ok());
+    }
+
+    #[test]
+    fn a_third_call_can_still_be_offered() {
+        let gw = MockGateway::start(|req| {
+            match req.path.as_str() {
+            "/v1/calls/tok-3" => (
+                200,
+                r#"{"call_token":"tok-3","caller_uri":"sip:1003@pbx","caller_name":null,"sdp_offer":"v=0"}"#
+                    .into(),
+            ),
+            _ => (200, r#"{"status":"pending"}"#.into()),
+        }
+        });
+        let (engine, _recorder) = engine(&gw.base_url);
+        insert_call(&engine, "c1", "tok-1");
+        insert_call(&engine, "c2", "tok-2");
+        let offer = engine
+            .handle_push_notification(PushCallPayload {
+                call_token: "tok-3".into(),
+                caller_uri: "sip:1003@pbx".into(),
+                caller_name: None,
+                gateway_url: gw.base_url.clone(),
+            })
+            .unwrap();
+        assert_eq!(offer.call_token, "tok-3");
+        engine.clear_pending_incoming("tok-3");
+    }
+
+    #[test]
+    fn resuming_a_call_holds_the_other_first() {
+        let (engine, recorder) = engine(NO_GATEWAY);
+        insert_call(&engine, "c1", "tok-1");
+        insert_call(&engine, "c2", "tok-2");
+        engine.set_hold("c1".into(), true).unwrap();
+        engine.set_hold("c1".into(), false).unwrap();
+
+        assert_eq!(
+            holds(&recorder),
+            [
+                ("c1".to_string(), CallState::OnHold, true),
+                ("c2".to_string(), CallState::OnHold, true),
+                ("c1".to_string(), CallState::Connected, false),
+            ]
+        );
+        // A call that is already held is not reported again.
+        engine.set_hold("c1".into(), false).unwrap();
+        assert_eq!(holds(&recorder).len(), 4);
+        assert_eq!(engine.get_active_call().unwrap().call_id, "c1");
+    }
+
+    #[test]
+    fn swap_holds_one_call_and_resumes_the_other() {
+        let gw = call_waiting_gateway();
+        let (engine, recorder) = engine(&gw.base_url);
+        insert_call(&engine, "c1", "tok-1");
+        insert_call(&engine, "c2", "tok-2");
+        engine.set_hold("c1".into(), true).unwrap();
+        let skip = holds(&recorder).len();
+
+        engine.swap_calls("c2".into(), "c1".into()).unwrap();
+        assert_eq!(
+            holds(&recorder)[skip..],
+            [
+                ("c2".to_string(), CallState::OnHold, true),
+                ("c1".to_string(), CallState::Connected, false),
+            ]
+        );
+        let calls = engine.get_calls();
+        assert!(!calls[0].on_hold && calls[1].on_hold);
+        assert_eq!(engine.get_active_call().unwrap().call_id, "c1");
+
+        for (a, b) in [("c1", "c1"), ("c1", "nope"), ("nope", "c1")] {
+            assert!(matches!(
+                engine.swap_calls(a.into(), b.into()),
+                Err(MobileError::InvalidState)
+            ));
+        }
+        assert_eq!(
+            holds(&recorder).len(),
+            skip + 2,
+            "a refused swap reports nothing"
+        );
+
+        // Both hang up cleanly, with one Ended each.
+        engine.hangup("c1".into()).unwrap();
+        engine.hangup("c2".into()).unwrap();
+        assert_eq!(ended_count(&recorder, "c1"), 1);
+        assert_eq!(ended_count(&recorder, "c2"), 1);
+        assert!(engine.get_calls().is_empty());
     }
 }
