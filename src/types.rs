@@ -64,6 +64,44 @@ pub enum CallDirection {
     Outbound,
 }
 
+/// Why a call ended. Set only on the `Ended` event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndReason {
+    /// This handset hung up.
+    LocalHangup,
+    /// The far end hung up (BYE).
+    RemoteHangup,
+    /// The caller hung up an incoming call before it was answered.
+    CallerCancelled,
+    /// An incoming call was answered on another device.
+    AnsweredElsewhere,
+    /// An incoming call was rejected.
+    Rejected,
+    /// The call was blind-transferred away from this handset.
+    Transferred,
+    /// The call could not be set up: an outgoing call failed, or an accept
+    /// had an unknown outcome.
+    Failed,
+    /// An outgoing call was hung up before it was answered.
+    Cancelled,
+}
+
+impl EndReason {
+    /// Map the gateway's `/status` `reason` for an ended call, or `fallback`
+    /// when it is absent or unrecognised.
+    pub fn from_gateway(reason: Option<&str>, fallback: EndReason) -> EndReason {
+        match reason {
+            Some("transferred") => EndReason::Transferred,
+            Some("bye_from_remote" | "bye") => EndReason::RemoteHangup,
+            Some("cancelled") => EndReason::CallerCancelled,
+            Some("rejected" | "declined") => EndReason::Rejected,
+            Some("answered_elsewhere") => EndReason::AnsweredElsewhere,
+            Some("no_ack") => EndReason::Failed,
+            _ => fallback,
+        }
+    }
+}
+
 /// Information about an active call.
 #[derive(Debug, Clone)]
 pub struct CallInfo {
@@ -75,6 +113,8 @@ pub struct CallInfo {
     pub muted: bool,
     pub on_hold: bool,
     pub duration_secs: u64,
+    /// Why the call ended; set only when `state` is `Ended`.
+    pub end_reason: Option<EndReason>,
 }
 
 /// Audio codec selection.
@@ -149,6 +189,14 @@ pub struct CallStatusResponse {
     pub status: String,
     /// Reason the call ended (if status == "ended")
     pub reason: Option<String>,
+    /// On an active call after a blind transfer was accepted: "pending"
+    /// while the PBX works on it, "failed" when its NOTIFY reported a
+    /// failure. Absent on a gateway that does not report transfer outcomes.
+    #[serde(default)]
+    pub transfer: Option<String>,
+    /// The SIP status of a failed transfer.
+    #[serde(default)]
+    pub transfer_code: Option<u16>,
 }
 
 /// Errors from the mobile engine.
@@ -160,8 +208,10 @@ pub enum MobileError {
     AuthenticationError,
     #[error("Registration failed")]
     RegistrationFailed,
-    #[error("Call failed")]
-    CallFailed,
+    /// The message says why, for example the SIP status of a failed
+    /// transfer. It reaches the app as the error's message.
+    #[error("Call failed: {0}")]
+    CallFailed(String),
     #[error("Media error")]
     MediaError,
     #[error("Invalid state")]
@@ -170,6 +220,10 @@ pub enum MobileError {
     GatewayError,
     #[error("Timeout")]
     Timeout,
+    #[error("Invalid target")]
+    InvalidTarget,
+    #[error("Cancelled")]
+    Cancelled,
 }
 
 impl From<reqwest::Error> for MobileError {

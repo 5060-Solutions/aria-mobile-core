@@ -79,10 +79,7 @@ pub struct MobileMediaSession {
 
 impl MobileMediaSession {
     /// Create a new media session bound to a local UDP port.
-    pub async fn new(
-        remote_addr: SocketAddr,
-        codec: AudioCodec,
-    ) -> Result<Self, MobileError> {
+    pub async fn new(remote_addr: SocketAddr, codec: AudioCodec) -> Result<Self, MobileError> {
         let socket = UdpSocket::bind("0.0.0.0:0")
             .await
             .map_err(|_| MobileError::MediaError)?;
@@ -244,8 +241,9 @@ impl MobileMediaSession {
                         // carry a valid tag did not come from the peer.
                         let plain: Vec<u8>;
                         let payload_bytes: &[u8] = {
-                            let mut ctx =
-                                srtp_in.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let mut ctx = srtp_in
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             match ctx.as_mut() {
                                 Some(ctx) => match ctx.unprotect_rtp(&buf[..len]) {
                                     Ok(p) => {
@@ -361,39 +359,41 @@ impl MobileMediaSession {
                         }
 
                         // Get mic audio from platform
-                        let pcm = if muted.load(Ordering::Relaxed) || on_hold.load(Ordering::Relaxed) {
-                            vec![0i16; frame_samples as usize]
-                        } else {
-                            let captured = bridge.on_capture_audio(sample_rate, frame_samples);
-                            if captured.is_empty() {
+                        let pcm =
+                            if muted.load(Ordering::Relaxed) || on_hold.load(Ordering::Relaxed) {
                                 vec![0i16; frame_samples as usize]
                             } else {
-                                // Calculate TX audio level
-                                let sum: f64 = captured.iter().map(|&s| (s as f64) * (s as f64)).sum();
-                                let rms = (sum / captured.len() as f64).sqrt();
-                                tx_level.store((rms * 1000.0) as u64, Ordering::Relaxed);
+                                let captured = bridge.on_capture_audio(sample_rate, frame_samples);
+                                if captured.is_empty() {
+                                    vec![0i16; frame_samples as usize]
+                                } else {
+                                    // Calculate TX audio level
+                                    let sum: f64 =
+                                        captured.iter().map(|&s| (s as f64) * (s as f64)).sum();
+                                    let rms = (sum / captured.len() as f64).sqrt();
+                                    tx_level.store((rms * 1000.0) as u64, Ordering::Relaxed);
 
-                                // Tap the near end. Taken after the mute/hold
-                                // check above, so held or muted audio is
-                                // silence to the AI exactly as it is to the far
-                                // end — the transcript cannot contain words the
-                                // other party never heard.
-                                #[cfg(feature = "ai")]
-                                {
-                                    if let Some(tap) = ai_tap_tx
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .as_ref()
+                                    // Tap the near end. Taken after the mute/hold
+                                    // check above, so held or muted audio is
+                                    // silence to the AI exactly as it is to the far
+                                    // end — the transcript cannot contain words the
+                                    // other party never heard.
+                                    #[cfg(feature = "ai")]
                                     {
-                                        if let Err(e) = tap.push_local(&captured, sample_rate) {
-                                            log::debug!("AI tap (local) dropped a frame: {e}");
+                                        if let Some(tap) = ai_tap_tx
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                            .as_ref()
+                                        {
+                                            if let Err(e) = tap.push_local(&captured, sample_rate) {
+                                                log::debug!("AI tap (local) dropped a frame: {e}");
+                                            }
                                         }
                                     }
-                                }
 
-                                captured
-                            }
-                        };
+                                    captured
+                                }
+                            };
 
                         // Encode
                         let header = rtp_engine::rtp::RtpHeader::new(pt, seq, timestamp, ssrc);
@@ -412,7 +412,9 @@ impl MobileMediaSession {
                                 match ctx.protect_rtp(&packet) {
                                     Ok(sealed) => packet = sealed,
                                     Err(e) => {
-                                        log::warn!("SRTP: dropping frame we could not protect: {e}");
+                                        log::warn!(
+                                            "SRTP: dropping frame we could not protect: {e}"
+                                        );
                                         continue;
                                     }
                                 }
@@ -452,9 +454,18 @@ impl MobileMediaSession {
     pub fn send_dtmf(&self, digit: &str) {
         // Send RFC 2833 DTMF via the RTP socket
         let event = match digit {
-            "0" => 0u8, "1" => 1, "2" => 2, "3" => 3,
-            "4" => 4, "5" => 5, "6" => 6, "7" => 7,
-            "8" => 8, "9" => 9, "*" => 10, "#" => 11,
+            "0" => 0u8,
+            "1" => 1,
+            "2" => 2,
+            "3" => 3,
+            "4" => 4,
+            "5" => 5,
+            "6" => 6,
+            "7" => 7,
+            "8" => 8,
+            "9" => 9,
+            "*" => 10,
+            "#" => 11,
             _ => {
                 log::warn!("Unknown DTMF digit: {}", digit);
                 return;
@@ -593,8 +604,14 @@ impl MobileMediaSession {
             log::error!("SRTP: peer key material was rejected: {e}");
             MobileError::MediaError
         })?;
-        *self.srtp_out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(out);
-        *self.srtp_in.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(inbound);
+        *self
+            .srtp_out
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(out);
+        *self
+            .srtp_in
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(inbound);
         log::info!("SRTP enabled for this call");
         Ok(())
     }
@@ -670,11 +687,7 @@ fn build_sdp_offer(
     sdp
 }
 
-fn build_sdp_answer(
-    local_port: u16,
-    local_ip: &str,
-    chosen_codec: AudioCodec,
-) -> String {
+fn build_sdp_answer(local_port: u16, local_ip: &str, chosen_codec: AudioCodec) -> String {
     let pt = chosen_codec.payload_type();
     let name = chosen_codec.name();
     let rate = chosen_codec.clock_rate();
@@ -710,8 +723,8 @@ fn parse_sdp_remote(sdp: &str) -> Option<(SocketAddr, AudioCodec)> {
 
     for line in sdp.lines() {
         let line = line.trim();
-        if line.starts_with("c=IN IP4 ") {
-            remote_ip = Some(line[9..].trim().to_string());
+        if let Some(ip) = line.strip_prefix("c=IN IP4 ") {
+            remote_ip = Some(ip.trim().to_string());
         } else if line.starts_with("m=audio ") {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 4 {
@@ -770,21 +783,14 @@ pub async fn create_answer_session(
     offer_sdp: &str,
     preferred_codecs: &[AudioCodec],
 ) -> Result<(MobileMediaSession, String), MobileError> {
-    let (remote_addr, _offer_codec) =
-        parse_sdp_remote(offer_sdp).ok_or(MobileError::MediaError)?;
+    let (remote_addr, _offer_codec) = parse_sdp_remote(offer_sdp).ok_or(MobileError::MediaError)?;
 
     let chosen = negotiate_codec(offer_sdp, preferred_codecs);
 
     let session = MobileMediaSession::new(remote_addr, chosen).await?;
 
     // Use the actual RTP socket for STUN so NAT mapping matches
-    let local_ip = match rtp_engine::discover_public_address(session.rtp_socket_ref()).await {
-        Ok(result) => {
-            log::info!("STUN on RTP socket (answer): public {}:{}", result.public_ip, result.public_port);
-            result.public_ip.to_string()
-        }
-        Err(_) => discover_local_ip().await,
-    };
+    let local_ip = advertised_ip(stun_on(session.rtp_socket_ref(), "answer"), STUN_BUDGET).await;
     let answer_sdp = build_sdp_answer(session.local_port(), &local_ip, chosen);
 
     Ok((session, answer_sdp))
@@ -795,20 +801,16 @@ pub async fn create_offer_session(
     preferred_codecs: &[AudioCodec],
 ) -> Result<(MobileMediaSession, String), MobileError> {
     let placeholder: SocketAddr = "0.0.0.0:0".parse().unwrap();
-    let codec = preferred_codecs.first().copied().unwrap_or(AudioCodec::Pcmu);
+    let codec = preferred_codecs
+        .first()
+        .copied()
+        .unwrap_or(AudioCodec::Pcmu);
 
     let session = MobileMediaSession::new(placeholder, codec).await?;
 
     // Discover public IP using the ACTUAL RTP socket so the NAT mapping matches.
     // If we use a different socket, the NAT mapping won't match and RTP won't flow.
-    let local_ip = match rtp_engine::discover_public_address(session.rtp_socket_ref()).await {
-        Ok(result) => {
-            log::info!("STUN on RTP socket: public {}:{}, local port {}",
-                result.public_ip, result.public_port, session.local_port());
-            result.public_ip.to_string()
-        }
-        Err(_) => discover_local_ip().await,
-    };
+    let local_ip = advertised_ip(stun_on(session.rtp_socket_ref(), "offer"), STUN_BUDGET).await;
 
     let codecs = if preferred_codecs.is_empty() {
         vec![AudioCodec::Pcmu, AudioCodec::Pcma, AudioCodec::Opus]
@@ -831,7 +833,10 @@ pub async fn create_offer_session(
         }
         Err(e) => {
             log::warn!("SRTP: could not generate key material, offering plain RTP: {e}");
-            (None, build_sdp_offer(session.local_port(), &local_ip, &codecs, None))
+            (
+                None,
+                build_sdp_offer(session.local_port(), &local_ip, &codecs, None),
+            )
         }
     };
     session.set_offered_srtp_key(offer_key);
@@ -839,21 +844,63 @@ pub async fn create_offer_session(
     Ok((session, offer_sdp))
 }
 
-/// Best-effort local IP discovery via STUN.
-async fn discover_local_ip() -> String {
-    match rtp_engine::stun_discover(0).await {
-        Ok(result) => result.public_ip.to_string(),
+/// How long STUN discovery may take in all, for one SDP offer or answer.
+///
+/// rtp-engine's STUN resolves the server with no timeout and, on failure, a
+/// second discovery runs; unbounded, that could hold up a call for 30 s or
+/// more. Past this budget the SDP carries the local interface address.
+pub(crate) const STUN_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// The public address of `socket` by STUN, so the NAT mapping matches the
+/// RTP socket, then by a plain STUN query if that fails. `None` if neither
+/// answers.
+async fn stun_on(socket: &UdpSocket, label: &'static str) -> Option<String> {
+    match rtp_engine::discover_public_address(socket).await {
+        Ok(result) => {
+            log::info!(
+                "STUN on RTP socket ({label}): public {}:{}",
+                result.public_ip,
+                result.public_port
+            );
+            Some(result.public_ip.to_string())
+        }
+        Err(_) => rtp_engine::stun_discover(0)
+            .await
+            .ok()
+            .map(|result| result.public_ip.to_string()),
+    }
+}
+
+/// The address to advertise in SDP: what `discovery` finds within `budget`,
+/// otherwise the local interface address.
+pub(crate) async fn advertised_ip(
+    discovery: impl std::future::Future<Output = Option<String>>,
+    budget: std::time::Duration,
+) -> String {
+    match tokio::time::timeout(budget, discovery).await {
+        Ok(Some(ip)) => ip,
+        Ok(None) => {
+            log::warn!("STUN failed; advertising the local interface address");
+            local_interface_ip().await
+        }
         Err(_) => {
-            if let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await {
-                if sock.connect("8.8.8.8:80").await.is_ok() {
-                    if let Ok(addr) = sock.local_addr() {
-                        return addr.ip().to_string();
-                    }
-                }
-            }
-            "0.0.0.0".to_string()
+            log::warn!("STUN took over {budget:?}; advertising the local interface address");
+            local_interface_ip().await
         }
     }
+}
+
+/// The address of the interface that routes to the internet. Connecting a
+/// UDP socket only consults the routing table; nothing is sent.
+async fn local_interface_ip() -> String {
+    if let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await {
+        if sock.connect("8.8.8.8:80").await.is_ok() {
+            if let Ok(addr) = sock.local_addr() {
+                return addr.ip().to_string();
+            }
+        }
+    }
+    "0.0.0.0".to_string()
 }
 
 /// End-to-end proof that call audio reaches the on-device AI without crossing
@@ -897,7 +944,11 @@ mod ai_tap_tests {
                 return vec![0_i16; frame_size as usize];
             }
             // Repeat the canned tone for as long as the session asks.
-            src.iter().cycle().take(frame_size as usize).copied().collect()
+            src.iter()
+                .cycle()
+                .take(frame_size as usize)
+                .copied()
+                .collect()
         }
     }
 
@@ -921,7 +972,11 @@ mod ai_tap_tests {
     fn linear_to_ulaw(sample: i16) -> u8 {
         const BIAS: i16 = 0x84;
         const CLIP: i16 = 32635;
-        let (sign, mut mag) = if sample < 0 { (0x80_u8, -sample.max(-CLIP)) } else { (0, sample.min(CLIP)) };
+        let (sign, mut mag) = if sample < 0 {
+            (0x80_u8, -sample.max(-CLIP))
+        } else {
+            (0, sample.min(CLIP))
+        };
         mag = mag.saturating_add(BIAS);
         let exponent = match mag {
             m if m <= 0x00FF => 0,
@@ -958,12 +1013,19 @@ mod ai_tap_tests {
         let bridge = Arc::new(RecordingBridge::default());
         session.start_with_bridge(bridge.clone());
 
-        Fixture { session, ai, bridge, port }
+        Fixture {
+            session,
+            ai,
+            bridge,
+            port,
+        }
     }
 
     /// Send `n` packets of tone at the session's RTP port.
     async fn send_tone(port: u16, n: u16) {
-        let tx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let tx = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let target: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
         let ssrc = 0x1234_5678;
         for i in 0..n {
@@ -1089,7 +1151,12 @@ mod srtp_negotiation_tests {
     /// confidentiality came from "TLS transport + SRTP".
     #[test]
     fn an_offer_with_a_key_advertises_savp_and_crypto() {
-        let sdp = build_sdp_offer(10000, "203.0.113.5", &[AudioCodec::Pcmu], Some("dGVzdGtleQ=="));
+        let sdp = build_sdp_offer(
+            10000,
+            "203.0.113.5",
+            &[AudioCodec::Pcmu],
+            Some("dGVzdGtleQ=="),
+        );
         assert!(sdp.contains("RTP/SAVP"), "{sdp}");
         assert!(sdp.contains("a=crypto:"), "{sdp}");
     }
@@ -1108,7 +1175,12 @@ mod srtp_negotiation_tests {
     /// rtpmap lines — a crypto line above m= is not part of the stream.
     #[test]
     fn the_crypto_line_is_inside_the_media_section() {
-        let sdp = build_sdp_offer(10000, "203.0.113.5", &[AudioCodec::Pcmu], Some("dGVzdGtleQ=="));
+        let sdp = build_sdp_offer(
+            10000,
+            "203.0.113.5",
+            &[AudioCodec::Pcmu],
+            Some("dGVzdGtleQ=="),
+        );
         let m = sdp.find("m=audio").expect("media line");
         let crypto = sdp.find("a=crypto:").expect("crypto line");
         assert!(crypto > m, "crypto must follow the m= line:\n{sdp}");

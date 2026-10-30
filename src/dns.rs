@@ -44,6 +44,12 @@ pub struct SrvResolver {
     query_timeout: Duration,
 }
 
+impl Default for SrvResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SrvResolver {
     /// Create a new resolver using system DNS configuration.
     pub fn new() -> Self {
@@ -51,8 +57,7 @@ impl SrvResolver {
         opts.timeout = Duration::from_secs(3);
         opts.attempts = 2;
 
-        let resolver =
-            TokioAsyncResolver::tokio(ResolverConfig::default(), opts);
+        let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), opts);
 
         Self {
             resolver,
@@ -92,11 +97,7 @@ impl SrvResolver {
         }
 
         // Try SRV lookup with timeout
-        let srv_result = tokio::time::timeout(
-            self.query_timeout,
-            self.lookup_srv(&srv_name),
-        )
-        .await;
+        let srv_result = tokio::time::timeout(self.query_timeout, self.lookup_srv(&srv_name)).await;
 
         match srv_result {
             Ok(Ok(targets)) if !targets.is_empty() => {
@@ -120,7 +121,8 @@ impl SrvResolver {
                     log::debug!("SRV lookup returned no results for {}", srv_name);
                 }
 
-                self.fallback_a_record(domain, fallback_port, &srv_name).await
+                self.fallback_a_record(domain, fallback_port, &srv_name)
+                    .await
             }
         }
     }
@@ -145,16 +147,15 @@ impl SrvResolver {
         let mut targets = Vec::new();
 
         for record in &records {
-            let host = record.target().to_string().trim_end_matches('.').to_string();
+            let host = record
+                .target()
+                .to_string()
+                .trim_end_matches('.')
+                .to_string();
             let port = record.port();
 
             // Resolve the SRV target hostname to an IP address
-            match tokio::time::timeout(
-                self.query_timeout,
-                self.resolver.lookup_ip(&host),
-            )
-            .await
-            {
+            match tokio::time::timeout(self.query_timeout, self.resolver.lookup_ip(&host)).await {
                 Ok(Ok(ips)) => {
                     if let Some(ip) = ips.iter().next() {
                         targets.push(SrvTarget {
@@ -199,13 +200,10 @@ impl SrvResolver {
         log::debug!("Falling back to A/AAAA record for {}:{}", domain, port);
 
         let addr_str = format!("{}:{}", domain, port);
-        let resolved = tokio::time::timeout(
-            self.query_timeout,
-            tokio::net::lookup_host(&addr_str),
-        )
-        .await
-        .map_err(|_| format!("DNS lookup timed out for {}", addr_str))?
-        .map_err(|e| format!("DNS resolve failed for {}: {}", addr_str, e))?;
+        let resolved = tokio::time::timeout(self.query_timeout, tokio::net::lookup_host(&addr_str))
+            .await
+            .map_err(|_| format!("DNS lookup timed out for {}", addr_str))?
+            .map_err(|e| format!("DNS resolve failed for {}: {}", addr_str, e))?;
 
         let targets: Vec<SrvTarget> = resolved
             .map(|addr| SrvTarget {

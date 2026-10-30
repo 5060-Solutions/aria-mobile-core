@@ -47,26 +47,31 @@ async fn read_json_capped<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&buf).map_err(|_| MobileError::GatewayError)
 }
 
+/// The error for a failed gateway response: `AuthenticationError` when the
+/// gateway rejected the bearer token (401), otherwise `otherwise`.
+///
+/// A 401 always means the token is missing, expired or revoked, and the app
+/// must fetch a new one from the PBX, so every route reports it the same way.
+fn status_error(status: reqwest::StatusCode, otherwise: MobileError) -> MobileError {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        MobileError::AuthenticationError
+    } else {
+        otherwise
+    }
+}
+
 pub struct GatewayClient {
     base_url: String,
-    api_key: String,
     http: reqwest::Client,
     /// Resolved gateway failover targets from SRV lookup, ordered by priority.
     /// First entry is the primary; rest are failover targets.
-    resolved_targets: RwLock<Vec<ResolvedTarget>>,
-}
-
-/// A resolved SRV failover target.
-///
-/// The `url` keeps the **original gateway hostname** as its host so TLS SNI and
-/// certificate validation are performed against the domain (matching the cert's
-/// SANs), while `client` is pinned so the connection actually goes to the
-/// resolved IP address. Building the URL as `https://<ip>:<port>` instead —
-/// as the code previously did — makes rustls reject the certificate on a
-/// hostname mismatch, which silently broke HTTPS failover entirely.
-struct ResolvedTarget {
-    url: String,
-    client: reqwest::Client,
+    ///
+    /// Each keeps the **original gateway hostname** as its URL host so TLS SNI
+    /// and certificate validation are performed against the domain, while its
+    /// client is pinned so the connection goes to the resolved IP address.
+    /// Building the URL as `https://<ip>:<port>` instead makes rustls reject
+    /// the certificate on a hostname mismatch, which broke HTTPS failover.
+    resolved_targets: RwLock<Vec<Route>>,
 }
 
 /// Build a failover URL that keeps `domain` as the host (so TLS validates
@@ -80,20 +85,6 @@ fn build_target_url(scheme: &str, domain: &str, port: u16, path_prefix: &str) ->
         format!("{domain}:{port}")
     };
     format!("{scheme}://{host_port}{path_prefix}")
-}
-
-#[derive(Serialize)]
-struct TokenRequest {
-    user_id: String,
-    api_key: String,
-}
-
-#[derive(Deserialize)]
-struct TokenResponse {
-    token: String,
-    /// Token lifetime in seconds, as reported by the gateway. Used by the
-    /// caller to schedule a transparent refresh before expiry.
-    expires_in: u64,
 }
 
 #[derive(Serialize)]
@@ -143,6 +134,25 @@ struct MakeCallRequest {
     sip_port: u16,
     sip_auth_username: Option<String>,
     sip_display_name: String,
+    /// Our reference for the call, so it can be cancelled while it rings,
+    /// before the gateway has assigned a call token.
+    client_ref: String,
+}
+
+/// The JSON body of a gateway error response.
+#[derive(Deserialize)]
+struct ErrorBody {
+    error: String,
+}
+
+#[derive(Serialize)]
+struct CancelCallRequest<'a> {
+    client_ref: &'a str,
+}
+
+#[derive(Serialize)]
+struct TransferCallRequest<'a> {
+    target: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -170,10 +180,8 @@ fn enforce_https(base_url: String) -> String {
         let authority = rest.split('/').next().unwrap_or("");
         let host_port = authority.rsplit('@').next().unwrap_or("");
         let host = host_port.split(':').next().unwrap_or("");
-        let is_local = host == "localhost"
-            || host == "127.0.0.1"
-            || host == "::1"
-            || host.ends_with(".local");
+        let is_local =
+            host == "localhost" || host == "127.0.0.1" || host == "::1" || host.ends_with(".local");
         // Userinfo has no business in a gateway URL; if it is present, do not
         // grant the exemption whatever the host looks like.
         let has_userinfo = authority.contains('@');
@@ -187,16 +195,60 @@ fn enforce_https(base_url: String) -> String {
     base_url
 }
 
+/// One gateway instance: the base URL requests to it use, and a client that
+/// connects to it.
+///
+/// For an SRV target the URL keeps the gateway's domain (so TLS validates
+/// against it) while the client is pinned to the resolved address. Calls live
+/// on one gateway instance, so everything about a call after it is placed or
+/// offered (accept, reject, cancel, status, hangup, transfer) is sent on the
+/// route that placed or offered it, never re-chosen.
+#[derive(Clone)]
+pub struct Route {
+    url: String,
+    client: reqwest::Client,
+}
+
+impl std::fmt::Debug for Route {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Route").field(&self.url).finish()
+    }
+}
+
+impl Route {
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.url.trim_end_matches('/'), path)
+    }
+
+    /// The base URL this route sends to.
+    #[allow(dead_code)]
+    pub fn base_url(&self) -> &str {
+        &self.url
+    }
+}
+
+/// How long `POST /v1/calls` may take. Longer than the gateway's 30 s INVITE
+/// timeout, so the gateway, not the client, decides that an unanswered call
+/// has failed; a client that gave up first would orphan a call answered at
+/// the last moment.
+const MAKE_CALL_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// How long a hangup request may take. It runs in the background after the
+/// call has already ended locally, so it must not hang around.
+pub const HANGUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default timeout for every other request.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl GatewayClient {
-    pub fn new(base_url: String, api_key: String) -> Self {
+    pub fn new(base_url: String) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .expect("Failed to create HTTP client");
 
         Self {
             base_url: enforce_https(base_url),
-            api_key,
             http,
             resolved_targets: RwLock::new(Vec::new()),
         }
@@ -207,52 +259,85 @@ impl GatewayClient {
     /// the certificate against the original hostname (SNI + cert SANs).
     fn build_pinned_client(domain: &str, addr: std::net::SocketAddr) -> reqwest::Client {
         reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(REQUEST_TIMEOUT)
             .resolve(domain, addr)
             .build()
             .expect("Failed to create pinned HTTP client")
     }
 
-    /// Check if the api_key looks like a JWT (starts with "eyJ").
-    pub fn api_key_is_jwt(&self) -> bool {
-        self.api_key.starts_with("eyJ")
-    }
-
-    /// Get the raw api_key value.
-    pub fn api_key(&self) -> &str {
-        &self.api_key
-    }
-
-    /// Get the base URL.
-    pub fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("{}{}", self.base_url.trim_end_matches('/'), path)
-    }
-
-    /// Select the (client, url) to use for a given failover target index.
-    ///
-    /// For a resolved SRV target this returns a client pinned to that target's
-    /// IP together with a URL whose host is the original gateway domain, so TLS
-    /// validation uses the domain while the connection reaches the resolved IP.
-    /// Falls back to the base client and base_url when no targets are resolved.
-    fn target_request(&self, target_idx: usize, path: &str) -> (reqwest::Client, String) {
-        let resolved = self.resolved_targets.read().unwrap();
-        if let Some(t) = resolved.get(target_idx) {
-            (
-                t.client.clone(),
-                format!("{}{}", t.url.trim_end_matches('/'), path),
-            )
+    /// The routes to try, in priority order: the SRV targets when resolved,
+    /// otherwise the base URL alone.
+    pub fn routes(&self) -> Vec<Route> {
+        let resolved = self
+            .resolved_targets
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if resolved.is_empty() {
+            vec![self.primary_route()]
         } else {
-            (self.http.clone(), self.url(path))
+            resolved.clone()
         }
     }
 
+    /// Replace the failover routes, standing in for SRV resolution in tests.
+    #[cfg(test)]
+    pub fn set_test_routes(&self, urls: &[&str]) {
+        *self.resolved_targets.write().unwrap() = urls
+            .iter()
+            .map(|u| Route {
+                url: u.to_string(),
+                client: self.http.clone(),
+            })
+            .collect();
+    }
+
+    /// The base URL as a route, for calls whose instance is not known.
+    pub fn primary_route(&self) -> Route {
+        let resolved = self
+            .resolved_targets
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        resolved.first().cloned().unwrap_or_else(|| Route {
+            url: self.base_url.clone(),
+            client: self.http.clone(),
+        })
+    }
+
+    /// Send a request on each route in turn until one is connected to.
+    ///
+    /// Moves to the next route only when the connection could not be
+    /// established, so the request was certainly never delivered. Any later
+    /// failure (a timeout, a reset after sending) is returned as is: the
+    /// request may have reached the gateway, and sending a non-idempotent
+    /// request such as `POST /v1/calls` again could act twice, ringing the
+    /// callee twice. Returns the response and the route that produced it.
+    async fn send(
+        &self,
+        what: &str,
+        build: impl Fn(&Route) -> reqwest::RequestBuilder,
+    ) -> Result<(reqwest::Response, Route), MobileError> {
+        let mut last_err = MobileError::NetworkError;
+        for route in self.routes() {
+            match build(&route).send().await {
+                Ok(resp) => return Ok((resp, route)),
+                Err(e) if e.is_connect() => {
+                    log::warn!(
+                        "{what}: could not connect to {} ({e}); trying next",
+                        route.url
+                    );
+                    last_err = e.into();
+                }
+                Err(e) => {
+                    log::warn!("{what} to {} failed: {e}", route.url);
+                    return Err(e.into());
+                }
+            }
+        }
+        Err(last_err)
+    }
+
     /// Resolve the gateway domain via SRV records and populate the
-    /// `resolved_urls` list. Should be called once before the first API
-    /// request (typically during `register_device`).
+    /// failover routes. Called before registering.
     ///
     /// The base_url is expected to be an HTTP(S) URL like
     /// `https://gateway.example.com` or `https://gateway.example.com:8443`.
@@ -295,9 +380,9 @@ impl GatewayClient {
                 // TLS validates against it) and pin the client's DNS to the
                 // resolved IP. This is what makes HTTPS failover work: a URL
                 // with a bare IP host would fail rustls hostname verification.
-                let resolved_targets: Vec<ResolvedTarget> = targets
+                let routes: Vec<Route> = targets
                     .iter()
-                    .map(|t| ResolvedTarget {
+                    .map(|t| Route {
                         url: build_target_url(scheme, &domain, t.port, path_prefix),
                         client: Self::build_pinned_client(&domain, t.addr),
                     })
@@ -306,77 +391,31 @@ impl GatewayClient {
                 log::info!(
                     "Gateway SRV resolved {} -> {} targets (primary: {} via {})",
                     domain,
-                    resolved_targets.len(),
-                    resolved_targets[0].url,
+                    routes.len(),
+                    routes[0].url,
                     targets[0].addr,
                 );
 
-                let mut resolved = self.resolved_targets.write().unwrap();
-                *resolved = resolved_targets;
+                *self
+                    .resolved_targets
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = routes;
             }
             Ok(_) => {
                 log::debug!("No SRV targets for gateway domain {}", domain);
             }
             Err(e) => {
-                log::debug!("Gateway SRV resolution failed: {} (will use base_url directly)", e);
+                log::debug!(
+                    "Gateway SRV resolution failed: {} (will use base_url directly)",
+                    e
+                );
             }
         }
 
         Ok(())
     }
 
-    /// Get the number of resolved gateway targets available for failover.
-    #[allow(dead_code)]
-    pub fn resolved_target_count(&self) -> usize {
-        let resolved = self.resolved_targets.read().unwrap();
-        if resolved.is_empty() { 1 } else { resolved.len() }
-    }
-
-    /// Obtain a JWT auth token from the gateway, with SRV failover.
-    ///
-    /// Returns the token together with its lifetime in seconds (`expires_in`)
-    /// so the caller can schedule a transparent refresh before expiry.
-    pub async fn create_token(&self, user_id: &str) -> Result<(String, u64), MobileError> {
-        // Resolve gateway via SRV on first use
-        let _ = self.resolve_gateway().await;
-
-        let target_count = self.resolved_target_count();
-        let mut last_err = MobileError::NetworkError;
-
-        for idx in 0..target_count {
-            let (client, url) = self.target_request(idx, "/v1/auth/token");
-            match client
-                .post(&url)
-                .json(&TokenRequest {
-                    user_id: user_id.to_string(),
-                    api_key: self.api_key.clone(),
-                })
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    if !resp.status().is_success() {
-                        log::error!("Token request failed: {}", resp.status());
-                        return Err(MobileError::AuthenticationError);
-                    }
-                    let body: TokenResponse = read_json_capped(resp).await?;
-                    return Ok((body.token, body.expires_in));
-                }
-                Err(e) => {
-                    log::warn!("Token request to {} failed: {} (trying next)", url, e);
-                    last_err = e.into();
-                }
-            }
-        }
-
-        Err(last_err)
-    }
-
     /// Register a device with the push gateway, with SRV failover.
-    ///
-    /// The SIP registrar domain from the credentials is resolved via SRV
-    /// to populate the `sip_registrar` field sent to the gateway, so the
-    /// gateway knows which server to send SIP REGISTER to.
     pub async fn register_device(
         &self,
         token: &str,
@@ -398,125 +437,103 @@ impl GatewayClient {
             sip_display_name: registration.sip.display_name.clone(),
         };
 
-        let target_count = self.resolved_target_count();
-        let mut last_err = MobileError::NetworkError;
-
-        for idx in 0..target_count {
-            let (client, url) = self.target_request(idx, "/v1/devices");
-            match client
-                .post(&url)
-                .bearer_auth(token)
-                .json(&req)
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    if !resp.status().is_success() {
-                        log::error!("Device registration failed: {}", resp.status());
-                        return Err(MobileError::RegistrationFailed);
-                    }
-                    let body: RegisterDeviceResponse = read_json_capped(resp).await?;
-                    return Ok(DeviceRegistrationResponse {
-                        device_id: body.device_id,
-                        auth_token: token.to_string(),
-                    });
-                }
-                Err(e) => {
-                    log::warn!("Device registration to {} failed: {} (trying next)", url, e);
-                    last_err = e.into();
-                }
-            }
+        let (resp, _) = self
+            .send("Device registration", |r| {
+                r.client
+                    .post(r.url("/v1/devices"))
+                    .bearer_auth(token)
+                    .json(&req)
+            })
+            .await?;
+        if !resp.status().is_success() {
+            log::error!("Device registration failed: {}", resp.status());
+            return Err(status_error(resp.status(), MobileError::RegistrationFailed));
         }
-
-        Err(last_err)
+        let body: RegisterDeviceResponse = read_json_capped(resp).await?;
+        Ok(DeviceRegistrationResponse {
+            device_id: body.device_id,
+            auth_token: token.to_string(),
+        })
     }
 
-
-
     /// Send a device heartbeat — forces SIP re-registration after network change.
-    pub async fn device_heartbeat(
-        &self,
-        token: &str,
-        device_id: &str,
-    ) -> Result<(), MobileError> {
-        let target_count = self.resolved_target_count();
-        for idx in 0..target_count {
-            let (client, url) =
-                self.target_request(idx, &format!("/v1/devices/{}/heartbeat", device_id));
-            match client.post(&url).bearer_auth(token).send().await {
-                Ok(resp) if resp.status().is_success() || resp.status() == 204 => {
-                    log::info!("Device heartbeat successful for {}", device_id);
-                    return Ok(());
-                }
-                Ok(resp) => {
-                    log::warn!("Device heartbeat failed: {}", resp.status());
-                }
-                Err(e) => {
-                    log::warn!("Device heartbeat to {} failed: {}", url, e);
-                }
-            }
+    pub async fn device_heartbeat(&self, token: &str, device_id: &str) -> Result<(), MobileError> {
+        let path = format!("/v1/devices/{device_id}/heartbeat");
+        let (resp, _) = self
+            .send("Device heartbeat", |r| {
+                r.client.post(r.url(&path)).bearer_auth(token)
+            })
+            .await?;
+        if resp.status().is_success() {
+            log::info!("Device heartbeat successful for {}", device_id);
+            return Ok(());
         }
-        Err(MobileError::NetworkError)
+        log::warn!("Device heartbeat failed: {}", resp.status());
+        Err(status_error(resp.status(), MobileError::NetworkError))
     }
 
     /// Unregister a device.
-    pub async fn unregister_device(
-        &self,
-        token: &str,
-        device_id: &str,
-    ) -> Result<(), MobileError> {
-        let resp = self
-            .http
-            .delete(self.url(&format!("/v1/devices/{}", device_id)))
-            .bearer_auth(token)
-            .send()
+    pub async fn unregister_device(&self, token: &str, device_id: &str) -> Result<(), MobileError> {
+        let path = format!("/v1/devices/{device_id}");
+        let (resp, _) = self
+            .send("Device unregister", |r| {
+                r.client.delete(r.url(&path)).bearer_auth(token)
+            })
             .await?;
 
         if !resp.status().is_success() {
             log::error!("Device unregister failed: {}", resp.status());
-            return Err(MobileError::GatewayError);
+            return Err(status_error(resp.status(), MobileError::GatewayError));
         }
 
         Ok(())
     }
 
-    /// Get the call offer for a pending incoming call.
+    /// Get the call offer for a pending incoming call, together with the
+    /// route of the gateway instance that holds it.
     pub async fn get_call_offer(
         &self,
         token: &str,
         call_token: &str,
-    ) -> Result<CallOffer, MobileError> {
-        let resp = self
-            .http
-            .get(self.url(&format!("/v1/calls/{}", call_token)))
-            .bearer_auth(token)
-            .send()
+    ) -> Result<(CallOffer, Route), MobileError> {
+        let path = format!("/v1/calls/{call_token}");
+        let (resp, route) = self
+            .send("Get call offer", |r| {
+                r.client.get(r.url(&path)).bearer_auth(token)
+            })
             .await?;
 
         if !resp.status().is_success() {
             log::error!("Get call offer failed: {}", resp.status());
-            return Err(MobileError::CallFailed);
+            return Err(status_error(
+                resp.status(),
+                MobileError::CallFailed(format!("no call offer (HTTP {})", resp.status())),
+            ));
         }
 
         let body: GatewayCallOffer = read_json_capped(resp).await?;
-        Ok(CallOffer {
-            call_token: body.call_token,
-            caller_uri: body.caller_uri,
-            caller_name: body.caller_name,
-            sdp_offer: body.sdp_offer,
-        })
+        Ok((
+            CallOffer {
+                call_token: body.call_token,
+                caller_uri: body.caller_uri,
+                caller_name: body.caller_name,
+                sdp_offer: body.sdp_offer,
+            },
+            route,
+        ))
     }
 
     /// Accept an incoming call by sending the SDP answer.
     pub async fn accept_call(
         &self,
+        route: &Route,
         token: &str,
         call_token: &str,
         sdp_answer: &str,
     ) -> Result<(), MobileError> {
-        let resp = self
-            .http
-            .post(self.url(&format!("/v1/calls/{}/accept", call_token)))
+        let resp = route
+            .client
+            .post(route.url(&format!("/v1/calls/{call_token}/accept")))
             .bearer_auth(token)
             .json(&AcceptCallRequest {
                 sdp_answer: sdp_answer.to_string(),
@@ -526,7 +543,10 @@ impl GatewayClient {
 
         if !resp.status().is_success() {
             log::error!("Accept call failed: {}", resp.status());
-            return Err(MobileError::CallFailed);
+            return Err(status_error(
+                resp.status(),
+                MobileError::CallFailed(format!("accept refused (HTTP {})", resp.status())),
+            ));
         }
 
         Ok(())
@@ -535,34 +555,44 @@ impl GatewayClient {
     /// Reject an incoming call.
     pub async fn reject_call(
         &self,
+        route: &Route,
         token: &str,
         call_token: &str,
     ) -> Result<(), MobileError> {
-        let resp = self
-            .http
-            .post(self.url(&format!("/v1/calls/{}/reject", call_token)))
+        let resp = route
+            .client
+            .post(route.url(&format!("/v1/calls/{call_token}/reject")))
             .bearer_auth(token)
             .send()
             .await?;
 
         if !resp.status().is_success() {
             log::error!("Reject call failed: {}", resp.status());
-            return Err(MobileError::CallFailed);
+            return Err(status_error(
+                resp.status(),
+                MobileError::CallFailed(format!("reject refused (HTTP {})", resp.status())),
+            ));
         }
 
         Ok(())
     }
 
-    /// Initiate an outgoing call via the gateway, with SRV failover.
-    /// The gateway acts as a B2BUA — it sends the SIP INVITE on our behalf
-    /// and returns the SDP answer from the remote party.
+    /// Initiate an outgoing call via the gateway, with SRV failover on
+    /// connect errors only. The gateway acts as a B2BUA — it sends the SIP
+    /// INVITE on our behalf and returns the SDP answer from the remote party.
+    ///
+    /// `attempt` is set to each route before the request is sent on it, so a
+    /// cancel issued while this is in flight goes to the instance ringing the
+    /// call. Returns the call token, the SDP answer, and the route.
     pub async fn make_call(
         &self,
         token: &str,
         destination_uri: &str,
         sdp_offer: &str,
         credentials: &crate::types::SipCredentials,
-    ) -> Result<(String, String), MobileError> {
+        client_ref: &str,
+        attempt: &std::sync::Mutex<Option<Route>>,
+    ) -> Result<(String, String, Route), MobileError> {
         // Let the gateway handle DNS resolution — passing pre-resolved
         // IP:port breaks the gateway's DNS parser.
         let req = MakeCallRequest {
@@ -576,78 +606,181 @@ impl GatewayClient {
             sip_port: credentials.port,
             sip_auth_username: credentials.auth_username.clone(),
             sip_display_name: credentials.display_name.clone(),
+            client_ref: client_ref.to_string(),
         };
 
-        let target_count = self.resolved_target_count();
-        let mut last_err = MobileError::NetworkError;
-
-        for idx in 0..target_count {
-            let (client, url) = self.target_request(idx, "/v1/calls");
-            match client
-                .post(&url)
-                .bearer_auth(token)
-                .json(&req)
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    if !resp.status().is_success() {
-                        log::error!("Make call failed: {}", resp.status());
-                        return Err(MobileError::CallFailed);
-                    }
-                    let body: MakeCallResponse = read_json_capped(resp).await?;
-                    return Ok((body.call_token, body.sdp_answer));
+        let (resp, route) = self
+            .send("Make call", |r| {
+                *attempt
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(r.clone());
+                r.client
+                    .post(r.url("/v1/calls"))
+                    .timeout(MAKE_CALL_TIMEOUT)
+                    .bearer_auth(token)
+                    .json(&req)
+            })
+            .await?;
+        if resp.status() == reqwest::StatusCode::CONFLICT {
+            // 409 carries a reason. Only `cancelled` means the call was
+            // cancelled through `cancel_call` while it rang; anything else
+            // (such as `client_ref_in_use`) is a gateway-side refusal.
+            let body: Option<ErrorBody> = read_json_capped(resp).await.ok();
+            return Err(match body.as_ref().map(|b| b.error.as_str()) {
+                Some("cancelled") => {
+                    log::info!("Outgoing call cancelled at the gateway");
+                    MobileError::Cancelled
                 }
-                Err(e) => {
-                    log::warn!("Make call to {} failed: {} (trying next)", url, e);
-                    last_err = e.into();
+                other => {
+                    log::error!("Make call refused with 409: {:?}", other);
+                    MobileError::GatewayError
                 }
-            }
+            });
         }
+        if !resp.status().is_success() {
+            log::error!("Make call failed: {}", resp.status());
+            return Err(status_error(
+                resp.status(),
+                MobileError::CallFailed(format!(
+                    "the call did not connect (HTTP {})",
+                    resp.status()
+                )),
+            ));
+        }
+        let body: MakeCallResponse = read_json_capped(resp).await?;
+        Ok((body.call_token, body.sdp_answer, route))
+    }
 
-        Err(last_err)
+    /// Cancel an outgoing call that is still ringing, by the `client_ref` it
+    /// was placed with. The gateway sends a SIP CANCEL and the blocked
+    /// `make_call` then fails with `Cancelled` (HTTP 409).
+    ///
+    /// Returns `Ok(true)` when the gateway sent the CANCEL (202) and
+    /// `Ok(false)` when it has no ringing call with that ref (404): not
+    /// registered yet, already answered, unknown, or a gateway that predates
+    /// the route.
+    pub async fn cancel_call(
+        &self,
+        route: &Route,
+        token: &str,
+        client_ref: &str,
+    ) -> Result<bool, MobileError> {
+        let resp = route
+            .client
+            .post(route.url("/v1/calls/cancel"))
+            .bearer_auth(token)
+            .json(&CancelCallRequest { client_ref })
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(true);
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        log::error!("Cancel call failed: {}", status);
+        Err(status_error(status, MobileError::GatewayError))
     }
 
     /// Poll the status of a call. Returns "active", "ended", "cancelled", etc.
     pub async fn get_call_status(
         &self,
+        route: &Route,
         token: &str,
         call_token: &str,
     ) -> Result<CallStatusResponse, MobileError> {
-        let resp = self
-            .http
-            .get(self.url(&format!("/v1/calls/{}/status", call_token)))
+        let resp = route
+            .client
+            .get(route.url(&format!("/v1/calls/{call_token}/status")))
             .bearer_auth(token)
             .send()
             .await?;
 
         if !resp.status().is_success() {
-            return Err(MobileError::CallFailed);
+            return Err(status_error(
+                resp.status(),
+                MobileError::CallFailed(format!("no call status (HTTP {})", resp.status())),
+            ));
         }
 
         let body: CallStatusResponse = read_json_capped(resp).await?;
         Ok(body)
     }
 
-    /// Hang up an active call via the gateway.
+    /// Hang up an active call via the gateway. Bounded by [`HANGUP_TIMEOUT`].
+    ///
+    /// A 404 means the gateway has no such call and is reported as
+    /// `InvalidState`.
     pub async fn hangup_call(
         &self,
+        route: &Route,
         token: &str,
         call_token: &str,
     ) -> Result<(), MobileError> {
-        let resp = self
-            .http
-            .post(self.url(&format!("/v1/calls/{}/hangup", call_token)))
+        let resp = route
+            .client
+            .post(route.url(&format!("/v1/calls/{call_token}/hangup")))
+            .timeout(HANGUP_TIMEOUT)
             .bearer_auth(token)
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            log::error!("Hangup call failed: {}", resp.status());
-            return Err(MobileError::CallFailed);
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
         }
+        log::error!("Hangup call failed: {}", status);
+        Err(if status == reqwest::StatusCode::NOT_FOUND {
+            MobileError::InvalidState
+        } else {
+            status_error(
+                status,
+                MobileError::CallFailed(format!("hangup refused (HTTP {status})")),
+            )
+        })
+    }
 
-        Ok(())
+    /// Blind-transfer an active call via the gateway, which sends a SIP REFER
+    /// to the PBX.
+    ///
+    /// Status mapping: 202 (or any 2xx) is success; 400 means the gateway
+    /// refused the target; 404 means the gateway has no active call for the
+    /// token (unknown, or not answered yet) or, on a gateway that predates the
+    /// route, has no such route; 502 means the PBX rejected the REFER; 504
+    /// means the PBX did not answer the REFER in time.
+    ///
+    /// The gateway can hold this request for up to 8 s while it waits on the
+    /// PBX, which the client's 30 s timeout covers.
+    pub async fn transfer_call(
+        &self,
+        route: &Route,
+        token: &str,
+        call_token: &str,
+        target: &str,
+    ) -> Result<(), MobileError> {
+        let resp = route
+            .client
+            .post(route.url(&format!("/v1/calls/{call_token}/transfer")))
+            .bearer_auth(token)
+            .json(&TransferCallRequest { target })
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        log::error!("Transfer call failed: {}", status);
+        Err(match status.as_u16() {
+            400 => MobileError::InvalidTarget,
+            401 | 403 => MobileError::AuthenticationError,
+            404 => MobileError::InvalidState,
+            502 => MobileError::CallFailed("the PBX refused the transfer".into()),
+            504 => MobileError::Timeout,
+            _ => MobileError::GatewayError,
+        })
     }
 }
 
@@ -735,5 +868,214 @@ mod enforce_https_tests {
             enforce_https("https://gw.example.com/v1".to_string()),
             "https://gw.example.com/v1"
         );
+    }
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::GatewayClient;
+    use crate::mock_gateway::MockGateway;
+    use crate::types::MobileError;
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn transfer_posts_the_target_to_the_call_route() {
+        let gw = MockGateway::start(|_| (202, "{}".into()));
+        let client = GatewayClient::new(gw.base_url.clone());
+
+        block_on(client.transfer_call(
+            &client.primary_route(),
+            "jwt",
+            "tok-1",
+            "sip:1002@pbx.example.com",
+        ))
+        .unwrap();
+
+        let reqs = gw.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/v1/calls/tok-1/transfer");
+        assert_eq!(reqs[0].authorization.as_deref(), Some("Bearer jwt"));
+        let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "target": "sip:1002@pbx.example.com" })
+        );
+    }
+
+    #[test]
+    fn transfer_maps_gateway_statuses_to_errors() {
+        let cases = [
+            (400, "InvalidTarget"),
+            (401, "AuthenticationError"),
+            (404, "InvalidState"),
+            (502, "CallFailed"),
+            (504, "Timeout"),
+            (500, "GatewayError"),
+        ];
+        for (status, expected) in cases {
+            let gw = MockGateway::start(move |_| (status, "{}".into()));
+            let client = GatewayClient::new(gw.base_url.clone());
+            let err = block_on(client.transfer_call(&client.primary_route(), "jwt", "tok", "1002"))
+                .unwrap_err();
+            let got = match err {
+                MobileError::InvalidTarget => "InvalidTarget",
+                MobileError::AuthenticationError => "AuthenticationError",
+                MobileError::InvalidState => "InvalidState",
+                MobileError::CallFailed(_) => "CallFailed",
+                MobileError::GatewayError => "GatewayError",
+                MobileError::Timeout => "Timeout",
+                other => panic!("unexpected error for {status}: {other:?}"),
+            };
+            assert_eq!(got, expected, "HTTP {status}");
+        }
+    }
+
+    #[test]
+    fn a_cancelled_outgoing_call_is_a_cancelled_error() {
+        let gw = MockGateway::start(|_| (409, r#"{"error":"cancelled"}"#.into()));
+        let client = GatewayClient::new(gw.base_url.clone());
+        let creds = crate::types::SipCredentials {
+            username: "1001".into(),
+            password: "pw".into(),
+            domain: "pbx.example.com".into(),
+            registrar: None,
+            transport: "udp".into(),
+            port: 5060,
+            auth_username: None,
+            display_name: "Alice".into(),
+        };
+        let err =
+            block_on(client.make_call("jwt", "1002", "v=0", &creds, "ref1", &Default::default()))
+                .unwrap_err();
+        assert!(matches!(err, MobileError::Cancelled), "{err:?}");
+        let body: serde_json::Value = serde_json::from_str(&gw.requests()[0].body).unwrap();
+        assert_eq!(body["client_ref"], "ref1");
+    }
+
+    #[test]
+    fn cancel_posts_the_ref_and_maps_statuses() {
+        for (status, expected) in [
+            (202, Ok(true)),
+            (404, Ok(false)),
+            (401, Err("AuthenticationError")),
+            (500, Err("GatewayError")),
+        ] {
+            let gw = MockGateway::start(move |_| (status, "{}".into()));
+            let client = GatewayClient::new(gw.base_url.clone());
+            let got =
+                block_on(client.cancel_call(&client.primary_route(), "jwt", "ref1")).map_err(|e| {
+                    match e {
+                        MobileError::AuthenticationError => "AuthenticationError",
+                        MobileError::GatewayError => "GatewayError",
+                        other => panic!("unexpected error for {status}: {other:?}"),
+                    }
+                });
+            assert_eq!(got, expected, "HTTP {status}");
+            let reqs = gw.requests();
+            assert_eq!(reqs[0].path, "/v1/calls/cancel");
+            assert_eq!(reqs[0].body, r#"{"client_ref":"ref1"}"#);
+            assert_eq!(reqs[0].authorization.as_deref(), Some("Bearer jwt"));
+        }
+    }
+
+    fn creds() -> crate::types::SipCredentials {
+        crate::types::SipCredentials {
+            username: "1001".into(),
+            password: "pw".into(),
+            domain: "pbx.example.com".into(),
+            registrar: None,
+            transport: "udp".into(),
+            port: 5060,
+            auth_username: None,
+            display_name: "Alice".into(),
+        }
+    }
+
+    /// The client must outlast the gateway's 30 s INVITE timeout, or an
+    /// answer at the last moment arrives after the client has given up.
+    #[test]
+    fn make_call_outlasts_the_gateways_invite_timeout() {
+        assert!(super::MAKE_CALL_TIMEOUT > std::time::Duration::from_secs(30));
+    }
+
+    /// A route that cannot be connected to is skipped.
+    #[test]
+    fn make_call_fails_over_when_it_cannot_connect() {
+        let gw = MockGateway::start(|_| (200, r#"{"call_token":"ct","sdp_answer":""}"#.into()));
+        let client = GatewayClient::new(gw.base_url.clone());
+        client.set_test_routes(&["http://127.0.0.1:9", &gw.base_url]);
+        let attempt = std::sync::Mutex::new(None);
+
+        let (token, _, route) =
+            block_on(client.make_call("jwt", "1002", "v=0", &creds(), "ref", &attempt)).unwrap();
+
+        assert_eq!(token, "ct");
+        assert_eq!(route.base_url(), gw.base_url);
+        assert_eq!(
+            attempt.lock().unwrap().as_ref().unwrap().base_url(),
+            gw.base_url
+        );
+    }
+
+    /// Once the request may have been delivered, it is never sent to another
+    /// route: a second `POST /v1/calls` would ring the callee twice.
+    #[test]
+    fn make_call_never_resends_a_request_that_may_have_been_delivered() {
+        use std::io::Read;
+        // Accepts, reads the request, then hangs up without answering.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dropping = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+            }
+        });
+        let second = MockGateway::start(|_| (200, r#"{"call_token":"ct","sdp_answer":""}"#.into()));
+        let client = GatewayClient::new(dropping.clone());
+        client.set_test_routes(&[&dropping, &second.base_url]);
+
+        let result =
+            block_on(client.make_call("jwt", "1002", "v=0", &creds(), "ref", &Default::default()));
+
+        assert!(result.is_err());
+        assert!(second.requests().is_empty(), "the call was sent twice");
+    }
+
+    #[test]
+    fn only_a_cancelled_409_is_a_cancel() {
+        for (body, cancelled) in [
+            (r#"{"error":"cancelled"}"#, true),
+            (r#"{"error":"client_ref_in_use"}"#, false),
+            ("{}", false),
+            ("not json", false),
+        ] {
+            let body = body.to_string();
+            let gw = MockGateway::start(move |_| (409, body.clone()));
+            let client = GatewayClient::new(gw.base_url.clone());
+            let err = block_on(client.make_call(
+                "jwt",
+                "1002",
+                "v=0",
+                &creds(),
+                "ref",
+                &Default::default(),
+            ))
+            .unwrap_err();
+            if cancelled {
+                assert!(matches!(err, MobileError::Cancelled), "{err:?}");
+            } else {
+                assert!(matches!(err, MobileError::GatewayError), "{err:?}");
+            }
+        }
     }
 }
