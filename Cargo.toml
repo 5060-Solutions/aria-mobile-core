@@ -53,9 +53,6 @@ aria-ai-core = { path = "../aria-ai-core", optional = true, default-features = f
     "insights",
 ] }
 
-# Shared SIP utilities
-sip-5060 = { git = "https://github.com/5060-Solutions/5060-sip.git" }
-
 # RTP media engine (no device feature on mobile — we use platform audio)
 rtp-engine = { git = "https://github.com/5060-Solutions/rtp-engine.git", default-features = false, features = ["g711", "opus", "srtp"] }
 
@@ -78,10 +75,13 @@ hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
 # Utilities
 uuid = { version = "1", features = ["v4"] }
 log = "0.4"
-android_logger = "0.14"
 thiserror = "2"
 once_cell = "1"
 rand = "0.9"
+
+# Only init_runtime() on Android uses it, behind #[cfg(target_os = "android")].
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.14"
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }
