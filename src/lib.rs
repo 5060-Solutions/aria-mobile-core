@@ -147,13 +147,85 @@ fn report_auth_rejected(auth: &auth::GatewayAuth, events: &Dispatcher, generatio
 /// Removal is the single point that decides who ends a call: whichever of
 /// local hangup, transfer, or the remote-hangup poll removes the entry first
 /// owns the `Ended` event, so it fires exactly once per call.
-fn take_call(calls: &CallMap, call_id: &str) -> Option<ActiveCallState> {
-    let mut call = calls
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(call_id)?;
+fn take_call(calls: &CallMap, call_id: &str, events: &Dispatcher) -> Option<ActiveCallState> {
+    let mut call = remove_call(
+        &mut calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        call_id,
+        events,
+    )?;
     stop_call(&mut call);
     Some(call)
+}
+
+/// Remove a call from the map, under the call-map lock. If it was in a
+/// conference, the conference ends with it: the other call leaves the mixer,
+/// keeps its hold state (`Connected` unless the conference was on hold), and
+/// is reported with `in_conference` false, just ahead of the removed call's
+/// `Ended`.
+fn remove_call(
+    calls: &mut HashMap<String, ActiveCallState>,
+    call_id: &str,
+    events: &Dispatcher,
+) -> Option<ActiveCallState> {
+    let call = calls.remove(call_id)?;
+    if call.info.in_conference {
+        if let Some(media) = &call.media {
+            media.leave_conference();
+        }
+        for (other_id, other) in calls.iter_mut().filter(|(_, c)| c.info.in_conference) {
+            log::info!("Conference ended: {call_id} left; {other_id} stays up");
+            if let Some(media) = &other.media {
+                media.leave_conference();
+            }
+            other.info.in_conference = false;
+            other.events.emit(events, other.info.clone());
+        }
+    }
+    Some(call)
+}
+
+/// The ids of the calls in the conference that `call_id` is in, `call_id`
+/// first; empty when it is in none.
+fn conference_members(calls: &HashMap<String, ActiveCallState>, call_id: &str) -> Vec<String> {
+    if !calls.get(call_id).is_some_and(|c| c.info.in_conference) {
+        return Vec::new();
+    }
+    let mut ids = vec![call_id.to_string()];
+    ids.extend(
+        calls
+            .iter()
+            .filter(|(id, c)| id.as_str() != call_id && c.info.in_conference)
+            .map(|(id, _)| id.clone()),
+    );
+    ids
+}
+
+/// Emergency numbers, the same list as the desktop softphone's
+/// `sip::emergency`: North America, the EU and much of the world, the UK and
+/// others, and Australia.
+const EMERGENCY_NUMBERS: &[&str] = &["911", "112", "999", "000"];
+
+/// Whether `dial` is an emergency number: one of [`EMERGENCY_NUMBERS`] after
+/// trimming, stripping a `sip:`/`sips:`/`tel:` prefix and anything from `@`
+/// or `;` on, and removing spaces and dashes. `"9-1-1"`, `"sip:911@pbx"` and
+/// `"tel:112"` are; `"+1911"`, `"9111"` and `"1911"` are not. Apps must never
+/// place these through the gateway: hand them to the native dialer.
+pub fn is_emergency_number(dial: String) -> bool {
+    let t = dial.trim();
+    let t = ["sips:", "sip:", "tel:"]
+        .iter()
+        .find_map(|p| t.strip_prefix(p))
+        .unwrap_or(t);
+    let user: String = t
+        .split(['@', ';'])
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '-'))
+        .collect();
+    EMERGENCY_NUMBERS.contains(&user.as_str())
 }
 
 /// Stop a call's status poll and media once it is out of the map.
@@ -300,7 +372,7 @@ fn end_call_locally(
     call_id: &str,
     reason: EndReason,
 ) -> bool {
-    match take_call(calls, call_id) {
+    match take_call(calls, call_id, events) {
         Some(call) => {
             emit_ended(events, &call, reason);
             true
@@ -928,6 +1000,7 @@ impl AriaMobileEngine {
             on_hold: false,
             duration_secs: 0,
             end_reason: None,
+            in_conference: false,
         };
 
         // From here an `active` status is this handset answering.
@@ -1192,6 +1265,7 @@ impl AriaMobileEngine {
             on_hold: false,
             duration_secs: 0,
             end_reason: None,
+            in_conference: false,
         };
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         let (outcome_tx, outcome_rx) = tokio::sync::watch::channel(None);
@@ -1521,6 +1595,7 @@ impl AriaMobileEngine {
                         on_hold: false,
                         duration_secs: 0,
                         end_reason: None,
+                        in_conference: false,
                     },
                     EndReason::Cancelled,
                 );
@@ -1602,7 +1677,7 @@ impl AriaMobileEngine {
             .calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(mut call) = calls.remove(call_id) {
+        if let Some(mut call) = remove_call(&mut calls, call_id, &self.events) {
             drop(calls);
             stop_call(&mut call);
             return TakenCall::Active(Box::new(call));
@@ -1906,18 +1981,31 @@ impl AriaMobileEngine {
         });
     }
 
+    /// Mute or unmute the microphone on a call. On a conferenced call the
+    /// microphone is shared, so both calls are muted and reported, the named
+    /// one first.
     pub fn set_mute(&self, call_id: String, muted: bool) -> Result<(), MobileError> {
-        let mut calls = self.calls.lock().unwrap();
-        let call = calls.get_mut(&call_id).ok_or(MobileError::InvalidState)?;
-
-        if let Some(media) = &call.media {
-            media.set_mute(muted);
+        let mut calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !calls.contains_key(&call_id) {
+            return Err(MobileError::InvalidState);
         }
-
-        call.info.muted = muted;
-        // Queued under the call-map lock, so concurrent changes are
-        // delivered in the order they were applied.
-        call.events.emit(&self.events, call.info.clone());
+        let mut ids = conference_members(&calls, &call_id);
+        if ids.is_empty() {
+            ids.push(call_id);
+        }
+        for id in ids {
+            let call = calls.get_mut(&id).expect("listed from the map");
+            if let Some(media) = &call.media {
+                media.set_mute(muted);
+            }
+            call.info.muted = muted;
+            // Queued under the call-map lock, so concurrent changes are
+            // delivered in the order they were applied.
+            call.events.emit(&self.events, call.info.clone());
+        }
         Ok(())
     }
 
@@ -1926,9 +2014,24 @@ impl AriaMobileEngine {
     /// Resuming a call first holds every other connected call, so at most
     /// one is ever off hold; each call whose hold state changed is reported.
     pub fn set_hold(&self, call_id: String, on_hold: bool) -> Result<(), MobileError> {
-        let mut calls = self.calls.lock().unwrap();
+        let mut calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !calls.contains_key(&call_id) {
             return Err(MobileError::InvalidState);
+        }
+        // A conference is held and resumed as a whole: both calls, the named
+        // one reported first. It stays a conference while held.
+        let members = conference_members(&calls, &call_id);
+        if !members.is_empty() {
+            for (i, id) in members.iter().enumerate() {
+                let call = calls.get_mut(id).expect("listed from the map");
+                if apply_hold(call, on_hold) || i == 0 {
+                    call.events.emit(&self.events, call.info.clone());
+                }
+            }
+            return Ok(());
         }
         if !on_hold {
             hold_others(&mut calls, &call_id, &self.events);
@@ -1962,6 +2065,10 @@ impl AriaMobileEngine {
         if !calls.contains_key(&active_call_id) || !calls.contains_key(&held_call_id) {
             return Err(MobileError::InvalidState);
         }
+        // Conferenced calls are both active; split the conference first.
+        if calls.values().any(|c| c.info.in_conference) {
+            return Err(MobileError::InvalidState);
+        }
         let active = calls.get_mut(&active_call_id).expect("checked above");
         if apply_hold(active, true) {
             active.events.emit(&self.events, active.info.clone());
@@ -1972,6 +2079,88 @@ impl AriaMobileEngine {
             held.events.emit(&self.events, held.info.clone());
         }
         log::info!("Swapped calls: {active_call_id} held, {held_call_id} active");
+        Ok(())
+    }
+
+    /// Merge two connected calls into a local three-way conference.
+    ///
+    /// Both calls come off hold. Each far end hears the microphone plus the
+    /// other far end, and the speaker plays both far ends, mixed here (no
+    /// PBX conference bridge). Both are reported, `call_a` first, `Connected`
+    /// with `in_conference` true.
+    ///
+    /// Throws `InvalidState` unless the two are distinct connected calls
+    /// (held or not; not ringing, not ended) and neither is already in a
+    /// conference.
+    pub fn conference_merge(&self, call_a: String, call_b: String) -> Result<(), MobileError> {
+        if call_a == call_b {
+            return Err(MobileError::InvalidState);
+        }
+        let mut calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (Some(a), Some(b)) = (calls.get(&call_a), calls.get(&call_b)) else {
+            return Err(MobileError::InvalidState);
+        };
+        if a.info.in_conference || b.info.in_conference {
+            return Err(MobileError::InvalidState);
+        }
+        // Joined before either is taken off hold, so the two never read the
+        // microphone or play to the speaker each on its own.
+        if let (Some(a), Some(b)) = (&a.media, &b.media) {
+            media::MobileMediaSession::join_conference(a, b);
+        }
+        for id in [&call_a, &call_b] {
+            let call = calls.get_mut(id).expect("checked above");
+            call.info.in_conference = true;
+            apply_hold(call, false);
+            call.events.emit(&self.events, call.info.clone());
+        }
+        log::info!("Conference: {call_a} and {call_b} merged");
+        Ok(())
+    }
+
+    /// End the local conference and keep both calls: the most recently
+    /// created call stays (or becomes) `Connected`, the other goes `OnHold`.
+    /// Both are reported with `in_conference` false, the held one first.
+    /// Throws `InvalidState` when there is no conference.
+    pub fn conference_split(&self) -> Result<(), MobileError> {
+        let mut calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut members: Vec<(u64, String)> = calls
+            .iter()
+            .filter(|(_, c)| c.info.in_conference)
+            .map(|(id, c)| (c.seq, id.clone()))
+            .collect();
+        if members.is_empty() {
+            return Err(MobileError::InvalidState);
+        }
+        members.sort();
+        let (_, keep) = members.pop().expect("not empty");
+        // Held before the mixer lets go, so the two never share the
+        // microphone and speaker unmixed.
+        for (_, id) in &members {
+            let call = calls.get_mut(id).expect("listed from the map");
+            apply_hold(call, true);
+        }
+        for (_, id) in members.iter().chain(std::iter::once(&(0, keep.clone()))) {
+            let call = calls.get_mut(id).expect("listed from the map");
+            if let Some(media) = &call.media {
+                media.leave_conference();
+            }
+            call.info.in_conference = false;
+        }
+        for (_, id) in &members {
+            let call = calls.get(id).expect("listed from the map");
+            call.events.emit(&self.events, call.info.clone());
+        }
+        let call = calls.get_mut(&keep).expect("listed from the map");
+        apply_hold(call, false);
+        call.events.emit(&self.events, call.info.clone());
+        log::info!("Conference split: {keep} stays active");
         Ok(())
     }
 
@@ -2161,6 +2350,7 @@ impl AriaMobileEngine {
                         on_hold: false,
                         duration_secs: 0,
                         end_reason: None,
+                        in_conference: false,
                     },
                     events: Arc::clone(&events),
                     accepting: false,
@@ -2433,7 +2623,12 @@ impl AriaMobileEngine {
             .calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(call) = calls.values().find(|c| !c.info.on_hold) {
+        // Both calls of a conference are off hold: the newer one is reported.
+        if let Some(call) = calls
+            .values()
+            .filter(|c| !c.info.on_hold)
+            .max_by_key(|c| c.seq)
+        {
             return Some(call.info.clone());
         }
         let outgoing = self
@@ -2783,6 +2978,7 @@ mod tests {
                     on_hold: false,
                     duration_secs: 0,
                     end_reason: None,
+                    in_conference: false,
                 },
                 seq: engine.next_seq.fetch_add(1, Ordering::Relaxed),
                 media: None,
@@ -4170,6 +4366,7 @@ mod tests {
             on_hold: false,
             duration_secs: 0,
             end_reason: None,
+            in_conference: false,
         };
         assert!(events.emit(&engine.events, info(CallState::Ringing)));
         assert!(events.emit(&engine.events, info(CallState::Ended)));
@@ -5693,6 +5890,281 @@ mod tests {
         engine.hangup("c2".into()).unwrap();
         assert_eq!(ended_count(&recorder, "c1"), 1);
         assert_eq!(ended_count(&recorder, "c2"), 1);
+        assert!(engine.get_calls().is_empty());
+    }
+
+    // ── Conference ──────────────────────────────────────────────────────────
+
+    /// (call_id, state, on_hold, in_conference) of every call-state event.
+    fn conf_events(recorder: &Recorder) -> Vec<(String, CallState, bool, bool)> {
+        recorder
+            .states()
+            .into_iter()
+            .map(|i| (i.call_id, i.state, i.on_hold, i.in_conference))
+            .collect()
+    }
+
+    fn ev(
+        id: &str,
+        state: CallState,
+        on_hold: bool,
+        conf: bool,
+    ) -> (String, CallState, bool, bool) {
+        (id.to_string(), state, on_hold, conf)
+    }
+
+    /// Two connected calls, `c1` older and held, `c2` newer and active, as
+    /// after placing a second call; events so far are discarded.
+    fn conference_pair(base_url: &str) -> (AriaMobileEngine, Recorder, usize) {
+        let (engine, recorder) = engine(base_url);
+        insert_call(&engine, "c1", "tok-1");
+        insert_call(&engine, "c2", "tok-2");
+        engine.set_hold("c1".into(), true).unwrap();
+        let skip = recorder.states().len();
+        (engine, recorder, skip)
+    }
+
+    #[test]
+    fn emergency_numbers_match_the_desktop_list() {
+        for dial in [
+            "911",
+            " 112 ",
+            "999",
+            "000",
+            "9-1-1",
+            "1 1 2",
+            "sip:911@pbx.example",
+            "sips:999@pbx.example;user=phone",
+            "tel:000",
+            "tel:9 1 1",
+        ] {
+            assert!(is_emergency_number(dial.into()), "{dial}");
+        }
+        for dial in [
+            "9111",
+            "1911",
+            "+1911",
+            "+911",
+            "91",
+            "",
+            "sip:1001@pbx.example",
+            "sip:x@911",
+            "0000",
+            "1001",
+            "(911)",
+            "911#",
+        ] {
+            assert!(!is_emergency_number(dial.into()), "{dial}");
+        }
+    }
+
+    #[test]
+    fn merge_resumes_both_calls_and_marks_them_conferenced() {
+        let (engine, recorder, skip) = conference_pair(NO_GATEWAY);
+        engine.conference_merge("c1".into(), "c2".into()).unwrap();
+        assert_eq!(
+            conf_events(&recorder)[skip..],
+            [
+                ev("c1", CallState::Connected, false, true),
+                ev("c2", CallState::Connected, false, true),
+            ]
+        );
+        let calls = engine.get_calls();
+        assert!(calls
+            .iter()
+            .all(|c| c.in_conference && !c.on_hold && c.state == CallState::Connected));
+        // Both are active; the newer one is reported as the active call.
+        assert_eq!(engine.get_active_call().unwrap().call_id, "c2");
+    }
+
+    #[test]
+    fn merge_is_refused_unless_two_distinct_connected_calls_outside_a_conference() {
+        let (engine, recorder, skip) = conference_pair(NO_GATEWAY);
+        for (a, b) in [("c1", "c1"), ("c1", "nope"), ("nope", "c2")] {
+            assert!(matches!(
+                engine.conference_merge(a.into(), b.into()),
+                Err(MobileError::InvalidState)
+            ));
+        }
+        assert_eq!(recorder.states().len(), skip, "a refused merge reported");
+        engine.conference_merge("c1".into(), "c2".into()).unwrap();
+        assert!(matches!(
+            engine.conference_merge("c2".into(), "c1".into()),
+            Err(MobileError::InvalidState)
+        ));
+        // Without a conference there is nothing to split.
+        let (engine, _r, _) = conference_pair(NO_GATEWAY);
+        assert!(matches!(
+            engine.conference_split(),
+            Err(MobileError::InvalidState)
+        ));
+    }
+
+    #[test]
+    fn split_keeps_the_newest_call_connected_and_holds_the_other() {
+        let (engine, recorder, _) = conference_pair(NO_GATEWAY);
+        engine.conference_merge("c2".into(), "c1".into()).unwrap();
+        let skip = recorder.states().len();
+        engine.conference_split().unwrap();
+        assert_eq!(
+            conf_events(&recorder)[skip..],
+            [
+                ev("c1", CallState::OnHold, true, false),
+                ev("c2", CallState::Connected, false, false),
+            ]
+        );
+        assert_eq!(engine.get_active_call().unwrap().call_id, "c2");
+        assert!(matches!(
+            engine.conference_split(),
+            Err(MobileError::InvalidState)
+        ));
+        // Ordinary call waiting works again afterwards.
+        engine.swap_calls("c2".into(), "c1".into()).unwrap();
+        assert_eq!(engine.get_active_call().unwrap().call_id, "c1");
+    }
+
+    #[test]
+    fn hold_and_resume_apply_to_the_whole_conference() {
+        let (engine, recorder, _) = conference_pair(NO_GATEWAY);
+        engine.conference_merge("c1".into(), "c2".into()).unwrap();
+        let skip = recorder.states().len();
+
+        engine.set_hold("c2".into(), true).unwrap();
+        engine.set_hold("c1".into(), false).unwrap();
+        assert_eq!(
+            conf_events(&recorder)[skip..],
+            [
+                ev("c2", CallState::OnHold, true, true),
+                ev("c1", CallState::OnHold, true, true),
+                ev("c1", CallState::Connected, false, true),
+                ev("c2", CallState::Connected, false, true),
+            ]
+        );
+        // Resuming a conference holds nothing: both stay in it.
+        assert!(engine
+            .get_calls()
+            .iter()
+            .all(|c| c.in_conference && !c.on_hold));
+    }
+
+    #[test]
+    fn swapping_conferenced_calls_is_refused() {
+        let (engine, recorder, _) = conference_pair(NO_GATEWAY);
+        engine.conference_merge("c1".into(), "c2".into()).unwrap();
+        let before = recorder.states().len();
+        assert!(matches!(
+            engine.swap_calls("c1".into(), "c2".into()),
+            Err(MobileError::InvalidState)
+        ));
+        assert_eq!(recorder.states().len(), before);
+        assert!(engine.get_calls().iter().all(|c| c.in_conference));
+    }
+
+    #[test]
+    fn mute_applies_to_both_conferenced_calls() {
+        let (engine, recorder, _) = conference_pair(NO_GATEWAY);
+        engine.conference_merge("c1".into(), "c2".into()).unwrap();
+        let skip = recorder.states().len();
+        engine.set_mute("c2".into(), true).unwrap();
+        let muted: Vec<(String, bool)> = recorder.states()[skip..]
+            .iter()
+            .map(|i| (i.call_id.clone(), i.muted))
+            .collect();
+        assert_eq!(muted, [("c2".into(), true), ("c1".into(), true)]);
+        assert!(engine.get_calls().iter().all(|c| c.muted));
+    }
+
+    #[test]
+    fn hanging_up_one_party_ends_the_conference_and_keeps_the_other() {
+        let gw = MockGateway::start(|_| (200, "{}".into()));
+        let (engine, recorder, _) = conference_pair(&gw.base_url);
+        engine.conference_merge("c1".into(), "c2".into()).unwrap();
+        let skip = recorder.states().len();
+
+        engine.hangup("c1".into()).unwrap();
+        let events = conf_events(&recorder);
+        assert_eq!(
+            events[skip..],
+            [
+                ev("c2", CallState::Connected, false, false),
+                ev("c1", CallState::Ended, false, true),
+            ]
+        );
+        let calls = engine.get_calls();
+        assert_eq!(ids(&calls), ["c2"]);
+        assert!(!calls[0].in_conference && !calls[0].on_hold);
+    }
+
+    #[test]
+    fn hanging_up_a_held_conference_party_leaves_the_other_held() {
+        let gw = MockGateway::start(|_| (200, "{}".into()));
+        let (engine, recorder, _) = conference_pair(&gw.base_url);
+        engine.conference_merge("c1".into(), "c2".into()).unwrap();
+        engine.set_hold("c1".into(), true).unwrap();
+        let skip = recorder.states().len();
+        engine.hangup("c2".into()).unwrap();
+        assert_eq!(
+            conf_events(&recorder)[skip..][0],
+            ev("c1", CallState::OnHold, true, false)
+        );
+    }
+
+    #[test]
+    fn a_remote_bye_ends_the_conference_and_keeps_the_survivor() {
+        let gw = MockGateway::start(|req| {
+            if req.path == "/v1/calls/tok-2/status" {
+                (
+                    200,
+                    r#"{"status":"ended","reason":"bye_from_remote"}"#.into(),
+                )
+            } else {
+                (200, r#"{"status":"active"}"#.into())
+            }
+        });
+        let (engine, recorder, _) = conference_pair(&gw.base_url);
+        engine.conference_merge("c1".into(), "c2".into()).unwrap();
+        let skip = recorder.states().len();
+        let stop = engine.calls.lock().unwrap()["c2"].poll_stop.clone();
+        engine.start_call_status_poll(
+            "c2".into(),
+            "tok-2".into(),
+            engine.gateway.primary_route(),
+            stop,
+        );
+        let events = recorder.wait_for(skip + 2);
+        assert_eq!(
+            conf_events(&recorder)[skip..],
+            [
+                ev("c1", CallState::Connected, false, false),
+                ev("c2", CallState::Ended, false, true),
+            ]
+        );
+        assert_eq!(
+            events.last().unwrap().end_reason,
+            Some(EndReason::RemoteHangup)
+        );
+        assert!(!engine.get_calls()[0].in_conference);
+    }
+
+    #[test]
+    fn an_attended_transfer_of_a_conferenced_pair_ends_both_once() {
+        let gw = attended_gateway(&[("tok-in", &[TRANSFERRED]), ("tok-out", &[TRANSFERRED])]);
+        let (engine, recorder) = engine(&gw.base_url);
+        insert_attended_pair(&engine);
+        engine
+            .conference_merge("incoming-tok-in".into(), "outgoing-c".into())
+            .unwrap();
+        engine
+            .transfer_attended("incoming-tok-in".into(), "outgoing-c".into())
+            .unwrap();
+        assert_eq!(
+            ended_reasons(&recorder, "incoming-tok-in"),
+            [Some(EndReason::Transferred)]
+        );
+        assert_eq!(
+            ended_reasons(&recorder, "outgoing-c"),
+            [Some(EndReason::Transferred)]
+        );
         assert!(engine.get_calls().is_empty());
     }
 }
