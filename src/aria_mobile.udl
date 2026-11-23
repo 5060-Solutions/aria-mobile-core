@@ -25,6 +25,13 @@ namespace aria_mobile {
     /// Blocks for up to about 20 s; call it off the UI thread.
     [Throws=ProvisionError]
     ProvisionedAccount provision_redeem(string link);
+
+    /// Whether `dial` is an emergency number (911, 112, 999, 000; the
+    /// desktop list) after trimming, stripping a `sip:`/`sips:`/`tel:` prefix
+    /// and any `@host` or `;params`, and removing spaces and dashes. Apps
+    /// must NEVER place these through VoIP: hand them to the native dialer
+    /// (`tel:`).
+    boolean is_emergency_number(string dial);
 };
 
 /// What a setup link would add, for the confirmation screen. Nothing secret.
@@ -158,6 +165,9 @@ dictionary CallInfo {
     u64 duration_secs;
     /// Why the call ended; set only when `state` is `Ended`.
     EndReason? end_reason;
+    /// Mixed into a local three-way conference with the other live call
+    /// (`conference_merge`). See "Conference" in the README.
+    boolean in_conference = false;
 };
 
 /// Audio codec selection.
@@ -399,7 +409,8 @@ interface AriaMobileEngine {
     [Throws=MobileError]
     void transfer_attended(string call_id, string consult_call_id);
 
-    /// Set mute state.
+    /// Set mute state. On a conferenced call the microphone is shared, so
+    /// both calls are muted and reported, the named one first.
     [Throws=MobileError]
     void set_mute(string call_id, boolean muted);
 
@@ -409,14 +420,34 @@ interface AriaMobileEngine {
     /// call is ever off hold; each call whose hold state changed is reported
     /// through `on_call_state_changed`. A call that connects (answered, or an
     /// outgoing call that is answered) likewise holds the others first.
+    /// On a conferenced call it holds or resumes the whole conference (both
+    /// calls, the named one reported first), which stays a conference.
     [Throws=MobileError]
     void set_hold(string call_id, boolean on_hold);
 
     /// Put `active_call_id` on hold and resume `held_call_id` in one step.
     /// Each call whose hold state changed is reported, the one going on hold
-    /// first. Throws `InvalidState` unless both are distinct connected calls.
+    /// first. Throws `InvalidState` unless both are distinct connected calls,
+    /// and while a conference is up (`conference_split` first).
     [Throws=MobileError]
     void swap_calls(string active_call_id, string held_call_id);
+
+    /// Merge two connected calls (held or not) into a local three-way
+    /// conference: both come off hold, each far end hears the microphone
+    /// plus the other far end, and the speaker plays both. Both are
+    /// reported `Connected` with `in_conference` true, `call_a` first.
+    /// Throws `InvalidState` unless they are distinct connected calls and
+    /// neither is in a conference. See "Conference" in the README for hold,
+    /// mute, hangup and transfer while conferenced.
+    [Throws=MobileError]
+    void conference_merge(string call_a, string call_b);
+
+    /// End the conference, keeping both calls: the most recently created
+    /// one stays `Connected`, the other goes `OnHold`; both are reported with
+    /// `in_conference` false, the held one first. Throws `InvalidState` when
+    /// there is no conference.
+    [Throws=MobileError]
+    void conference_split();
 
     /// Send a DTMF digit.
     [Throws=MobileError]

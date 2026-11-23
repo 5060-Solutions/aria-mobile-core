@@ -75,7 +75,13 @@ pub struct MobileMediaSession {
     srtp_in: Arc<Mutex<Option<rtp_engine::srtp::SrtpContext>>>,
     /// The key material we advertised, held until the answer arrives.
     offered_srtp_key: Arc<Mutex<Option<String>>>,
+    /// The local conference this call is mixed into, and its leg there.
+    /// `None` outside a conference. Read per frame by both RTP threads.
+    conference: ConferenceSlot,
 }
+
+/// A session's place in a local conference: the mixer and the leg index.
+type ConferenceSlot = Arc<Mutex<Option<(Arc<Conference>, usize)>>>;
 
 impl MobileMediaSession {
     /// Create a new media session bound to a local UDP port.
@@ -111,6 +117,7 @@ impl MobileMediaSession {
             srtp_out: Arc::new(Mutex::new(None)),
             srtp_in: Arc::new(Mutex::new(None)),
             offered_srtp_key: Arc::new(Mutex::new(None)),
+            conference: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -166,6 +173,7 @@ impl MobileMediaSession {
             #[cfg(feature = "ai")]
             let ai_tap_rx = self.ai_tap.clone();
             let srtp_in = self.srtp_in.clone();
+            let conference_rx = self.conference.clone();
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -304,7 +312,16 @@ impl MobileMediaSession {
                                 }
                             }
 
-                            bridge_rx.on_playback_audio(pcm, sample_rate);
+                            // In a conference the mixer owns the speaker: it
+                            // plays the sum of both far ends, once per frame.
+                            let conference = conference_rx
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .clone();
+                            match conference {
+                                Some((conference, leg)) => conference.push_rx(leg, &pcm),
+                                None => bridge_rx.on_playback_audio(pcm, sample_rate),
+                            }
                         }
                     }
 
@@ -328,6 +345,7 @@ impl MobileMediaSession {
             #[cfg(feature = "ai")]
             let ai_tap_tx = self.ai_tap.clone();
             let srtp_out = self.srtp_out.clone();
+            let conference_tx = self.conference.clone();
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -358,9 +376,20 @@ impl MobileMediaSession {
                             continue; // no remote yet
                         }
 
+                        let conference = conference_tx
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone();
                         // Get mic audio from platform
-                        let pcm =
-                            if muted.load(Ordering::Relaxed) || on_hold.load(Ordering::Relaxed) {
+                        let pcm = if on_hold.load(Ordering::Relaxed) {
+                            vec![0i16; frame_samples as usize]
+                        } else if let Some((conference, leg @ 1..)) = &conference {
+                            // A conference's second leg sends what the mixer
+                            // made for it: the microphone and the first far
+                            // end. Only the first leg reads the microphone.
+                            conference.pop_tx(*leg, frame_samples as usize)
+                        } else {
+                            let mic = if muted.load(Ordering::Relaxed) {
                                 vec![0i16; frame_samples as usize]
                             } else {
                                 let captured = bridge.on_capture_audio(sample_rate, frame_samples);
@@ -394,6 +423,17 @@ impl MobileMediaSession {
                                     captured
                                 }
                             };
+                            match &conference {
+                                // The first leg drives the conference: one
+                                // microphone frame, mixed with both far ends.
+                                Some((conference, _)) => {
+                                    let mixed = conference.mix_frame(&mic);
+                                    bridge.on_playback_audio(mixed.speaker, sample_rate);
+                                    mixed.to_first
+                                }
+                                None => mic,
+                            }
+                        };
 
                         // Encode
                         let header = rtp_engine::rtp::RtpHeader::new(pt, seq, timestamp, ssrc);
@@ -441,6 +481,39 @@ impl MobileMediaSession {
 
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
+    }
+
+    /// Mix `first` and `second` into one local conference: each far end
+    /// hears the microphone plus the other far end, and the speaker plays
+    /// both far ends. `first` drives the mixer (it reads the microphone and
+    /// plays the speaker once per 20 ms frame) at its own codec rate;
+    /// `second`'s audio is resampled to and from that rate.
+    ///
+    /// Both sessions must be off hold for audio to flow; a held leg is
+    /// silence both ways, as outside a conference.
+    pub fn join_conference(first: &MobileMediaSession, second: &MobileMediaSession) {
+        let conference = Arc::new(Conference::new(
+            first.codec.clock_rate(),
+            second.codec.clock_rate(),
+        ));
+        *second
+            .conference
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((Arc::clone(&conference), 1));
+        *first
+            .conference
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((conference, 0));
+    }
+
+    /// Leave the local conference, if in one. From the next frame this
+    /// session plays and captures on its own again.
+    pub fn leave_conference(&self) {
+        *self
+            .conference
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     pub fn set_mute(&self, muted: bool) {
@@ -633,6 +706,183 @@ impl MobileMediaSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some()
+    }
+}
+
+// ── Local conference ────────────────────────────────────────────────────────
+
+/// How much decoded audio a conference leg may queue for the mixer, in
+/// 20 ms frames. The two legs' RTP threads run on separate clocks; a bound
+/// keeps a leg that runs ahead from building up delay (the oldest audio is
+/// dropped) instead of growing the queue without limit.
+const CONFERENCE_MAX_QUEUED_FRAMES: usize = 4;
+
+/// Add two samples without wrapping: clamp to the i16 range.
+pub(crate) fn mix_add(a: i16, b: i16) -> i16 {
+    (i32::from(a) + i32::from(b)).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+}
+
+/// One mixed conference frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MixedFrame {
+    /// Both far ends, for the speaker.
+    pub speaker: Vec<i16>,
+    /// The microphone and the second far end, sent to the first.
+    pub to_first: Vec<i16>,
+    /// The microphone and the first far end, sent to the second.
+    pub to_second: Vec<i16>,
+}
+
+/// Mix one frame of a three-way call. All three inputs are at the same rate;
+/// the frame is `mic.len()` samples, and a far end that delivered fewer
+/// (a late or lost packet) counts as silence for the rest. No far end ever
+/// hears itself, and every sum is clamped rather than wrapped.
+pub(crate) fn mix_three_way(mic: &[i16], first: &[i16], second: &[i16]) -> MixedFrame {
+    let n = mic.len();
+    let at = |v: &[i16], i: usize| v.get(i).copied().unwrap_or(0);
+    let mut frame = MixedFrame {
+        speaker: Vec::with_capacity(n),
+        to_first: Vec::with_capacity(n),
+        to_second: Vec::with_capacity(n),
+    };
+    for (i, &m) in mic.iter().enumerate() {
+        let (a, b) = (at(first, i), at(second, i));
+        frame.speaker.push(mix_add(a, b));
+        frame.to_first.push(mix_add(m, b));
+        frame.to_second.push(mix_add(m, a));
+    }
+    frame
+}
+
+/// Linear-interpolation resampling between codec rates (8 kHz and 48 kHz in
+/// practice). Good enough for speech crossing between two calls; the same
+/// rate is passed through untouched.
+pub(crate) fn resample(input: &[i16], from: u32, to: u32) -> Vec<i16> {
+    if from == to || input.is_empty() || from == 0 || to == 0 {
+        return input.to_vec();
+    }
+    let out_len = (input.len() as u64 * u64::from(to) / u64::from(from)) as usize;
+    let step = f64::from(from) / f64::from(to);
+    (0..out_len)
+        .map(|i| {
+            let pos = i as f64 * step;
+            let idx = pos as usize;
+            let frac = pos - idx as f64;
+            let a = f64::from(input[idx.min(input.len() - 1)]);
+            let b = f64::from(input[(idx + 1).min(input.len() - 1)]);
+            (a + (b - a) * frac).round() as i16
+        })
+        .collect()
+}
+
+/// Append to a bounded sample queue, dropping the oldest samples past `cap`.
+fn push_bounded(queue: &mut std::collections::VecDeque<i16>, samples: &[i16], cap: usize) {
+    queue.extend(samples.iter().copied());
+    let excess = queue.len().saturating_sub(cap);
+    queue.drain(..excess);
+}
+
+/// Take `n` samples from a queue, padding with silence when it runs short.
+fn pop_samples(queue: &mut std::collections::VecDeque<i16>, n: usize) -> Vec<i16> {
+    let take = n.min(queue.len());
+    let mut out: Vec<i16> = queue.drain(..take).collect();
+    out.resize(n, 0);
+    out
+}
+
+/// One call's audio in a conference.
+struct ConferenceLeg {
+    /// The leg's codec rate.
+    rate: u32,
+    /// Decoded far-end audio waiting for the mixer, at the mixer's rate.
+    rx: Mutex<std::collections::VecDeque<i16>>,
+    /// Mixed audio waiting to be sent on this leg, at the leg's rate. Only
+    /// the second leg uses it; the first sends what the mixer returns.
+    tx: Mutex<std::collections::VecDeque<i16>>,
+}
+
+/// The local mixer of a two-call conference. Leg 0 drives it.
+pub(crate) struct Conference {
+    /// The mixer's rate: leg 0's codec rate.
+    rate: u32,
+    legs: [ConferenceLeg; 2],
+}
+
+impl Conference {
+    pub(crate) fn new(first_rate: u32, second_rate: u32) -> Self {
+        let leg = |rate| ConferenceLeg {
+            rate,
+            rx: Mutex::new(std::collections::VecDeque::new()),
+            tx: Mutex::new(std::collections::VecDeque::new()),
+        };
+        Self {
+            rate: first_rate,
+            legs: [leg(first_rate), leg(second_rate)],
+        }
+    }
+
+    fn frame_len(rate: u32) -> usize {
+        (rate / 50) as usize
+    }
+
+    /// Queue a leg's decoded far-end audio (at the leg's rate) for mixing.
+    pub(crate) fn push_rx(&self, leg: usize, pcm: &[i16]) {
+        let Some(l) = self.legs.get(leg) else { return };
+        let pcm = resample(pcm, l.rate, self.rate);
+        let cap = Self::frame_len(self.rate) * CONFERENCE_MAX_QUEUED_FRAMES;
+        push_bounded(
+            &mut l
+                .rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            &pcm,
+            cap,
+        );
+    }
+
+    /// Mix one frame around `mic` (at the mixer's rate): take a frame of
+    /// each far end, queue the second leg's share for its TX thread, and
+    /// return the frame (the first leg's share and the speaker's).
+    pub(crate) fn mix_frame(&self, mic: &[i16]) -> MixedFrame {
+        let n = mic.len();
+        let take = |l: &ConferenceLeg| {
+            pop_samples(
+                &mut l
+                    .rx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                n,
+            )
+        };
+        let (first, second) = (take(&self.legs[0]), take(&self.legs[1]));
+        let frame = mix_three_way(mic, &first, &second);
+        let out = &self.legs[1];
+        let to_second = resample(&frame.to_second, self.rate, out.rate);
+        let cap = Self::frame_len(out.rate) * CONFERENCE_MAX_QUEUED_FRAMES;
+        push_bounded(
+            &mut out
+                .tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            &to_second,
+            cap,
+        );
+        frame
+    }
+
+    /// The next `n` samples to send on `leg` (silence if the mixer has not
+    /// produced them yet).
+    pub(crate) fn pop_tx(&self, leg: usize, n: usize) -> Vec<i16> {
+        match self.legs.get(leg) {
+            Some(l) => pop_samples(
+                &mut l
+                    .tx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                n,
+            ),
+            None => vec![0; n],
+        }
     }
 }
 
@@ -1315,5 +1565,204 @@ mod srtp_negotiation_tests {
         let m = sdp.find("m=audio").expect("media line");
         let crypto = sdp.find("a=crypto:").expect("crypto line");
         assert!(crypto > m, "crypto must follow the m= line:\n{sdp}");
+    }
+}
+
+#[cfg(test)]
+mod conference_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn mix_add_clamps_instead_of_wrapping() {
+        assert_eq!(mix_add(1000, 2000), 3000);
+        assert_eq!(mix_add(30000, 30000), i16::MAX);
+        assert_eq!(mix_add(-30000, -30000), i16::MIN);
+        assert_eq!(mix_add(i16::MIN, i16::MAX), -1);
+        assert_eq!(mix_add(-5, 5), 0);
+    }
+
+    #[test]
+    fn nobody_hears_themselves_and_everyone_hears_the_rest() {
+        let mic = [100_i16; 4];
+        let first = [10_i16; 4];
+        let second = [1_i16; 4];
+        let f = mix_three_way(&mic, &first, &second);
+        assert_eq!(f.speaker, [11; 4], "speaker: both far ends, not the mic");
+        assert_eq!(f.to_first, [101; 4], "first: mic + second");
+        assert_eq!(f.to_second, [110; 4], "second: mic + first");
+    }
+
+    #[test]
+    fn a_short_far_end_frame_counts_as_silence_and_loud_sums_clip() {
+        let mic = [20000_i16, 20000, -20000, 0];
+        let first = [20000_i16, -20000];
+        let second: [i16; 0] = [];
+        let f = mix_three_way(&mic, &first, &second);
+        assert_eq!(f.speaker, [20000, -20000, 0, 0]);
+        assert_eq!(f.to_first, [20000, 20000, -20000, 0]);
+        assert_eq!(f.to_second, [i16::MAX, 0, -20000, 0]);
+        assert_eq!(f.to_second.len(), mic.len());
+    }
+
+    #[test]
+    fn resampling_keeps_duration_and_level() {
+        let narrow = vec![1000_i16; 160];
+        let wide = resample(&narrow, 8000, 48000);
+        assert_eq!(wide.len(), 960);
+        assert!(wide.iter().all(|&s| s == 1000));
+        let back = resample(&wide, 48000, 8000);
+        assert_eq!(back.len(), 160);
+        assert!(back.iter().all(|&s| s == 1000));
+        assert_eq!(resample(&narrow, 8000, 8000), narrow);
+        // A ramp stays monotonic through upsampling.
+        let ramp: Vec<i16> = (0..160).map(|i| i * 10).collect();
+        let up = resample(&ramp, 8000, 48000);
+        assert!(up.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn the_mixer_routes_each_legs_audio_and_bounds_its_queues() {
+        let conf = Conference::new(8000, 48000);
+        conf.push_rx(0, &[300; 160]);
+        conf.push_rx(1, &[20; 960]); // 48 kHz leg, resampled to 8 kHz
+        let f = conf.mix_frame(&[1000; 160]);
+        assert_eq!(f.speaker, vec![320; 160]);
+        assert_eq!(f.to_first, vec![1020; 160]);
+        // The second leg's share is queued at its own rate.
+        assert_eq!(conf.pop_tx(1, 960), vec![1300; 960]);
+        // Nothing queued: silence, not stale audio.
+        assert_eq!(conf.pop_tx(1, 960), vec![0; 960]);
+        let f = conf.mix_frame(&[0; 160]);
+        assert_eq!(f.speaker, vec![0; 160]);
+
+        // A leg that runs ahead is capped, oldest audio dropped.
+        for i in 0..20 {
+            conf.push_rx(0, &[i; 160]);
+        }
+        let queued = conf.legs[0].rx.lock().unwrap().len();
+        assert_eq!(queued, 160 * CONFERENCE_MAX_QUEUED_FRAMES);
+        assert_eq!(conf.legs[0].rx.lock().unwrap()[0], 16);
+    }
+
+    /// Mic at a fixed level; records what reaches the speaker.
+    #[derive(Default)]
+    struct MicBridge {
+        played: Mutex<Vec<i16>>,
+        captures: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PlatformAudioBridge for MicBridge {
+        fn on_playback_audio(&self, samples: Vec<i16>, _sample_rate: u32) {
+            self.played.lock().unwrap().extend(samples);
+        }
+
+        fn on_capture_audio(&self, _sample_rate: u32, frame_size: u32) -> Vec<i16> {
+            self.captures.fetch_add(1, Ordering::Relaxed);
+            vec![2000; frame_size as usize]
+        }
+    }
+
+    fn pcmu_packet(seq: u16, level: i16) -> Vec<u8> {
+        let mut pkt =
+            rtp_engine::rtp::RtpHeader::new(0, seq, u32::from(seq) * 160, 0x55).to_bytes();
+        let mut enc = rtp_engine::codec::create_encoder(rtp_engine::CodecType::Pcmu).unwrap();
+        enc.encode(&[level; 160], &mut pkt);
+        pkt
+    }
+
+    /// Decode every PCMU packet a far end received, as average levels.
+    async fn received_levels(peer: &UdpSocket) -> Vec<i32> {
+        let mut dec = rtp_engine::codec::create_decoder(rtp_engine::CodecType::Pcmu).unwrap();
+        let mut levels = Vec::new();
+        let mut buf = [0_u8; 2048];
+        while let Ok(Ok((len, _))) =
+            tokio::time::timeout(Duration::from_millis(50), peer.recv_from(&mut buf)).await
+        {
+            let mut pcm = Vec::new();
+            dec.decode(&buf[12..len], &mut pcm);
+            if !pcm.is_empty() {
+                levels.push(pcm.iter().map(|&s| i32::from(s)).sum::<i32>() / pcm.len() as i32);
+            }
+        }
+        levels
+    }
+
+    fn near(level: i32, want: i32) -> bool {
+        (level - want).abs() <= want / 20 + 40
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_live_sessions_are_mixed_both_ways_and_to_the_speaker() {
+        let peer_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a = MobileMediaSession::new(peer_a.local_addr().unwrap(), AudioCodec::Pcmu)
+            .await
+            .unwrap();
+        let b = MobileMediaSession::new(peer_b.local_addr().unwrap(), AudioCodec::Pcmu)
+            .await
+            .unwrap();
+        MobileMediaSession::join_conference(&a, &b);
+        let bridge = Arc::new(MicBridge::default());
+        a.start_with_bridge(bridge.clone());
+        b.start_with_bridge(bridge.clone());
+
+        let to_a: SocketAddr = format!("127.0.0.1:{}", a.local_port()).parse().unwrap();
+        let to_b: SocketAddr = format!("127.0.0.1:{}", b.local_port()).parse().unwrap();
+        for seq in 0..40 {
+            peer_a.send_to(&pcmu_packet(seq, 1000), to_a).await.unwrap();
+            peer_b.send_to(&pcmu_packet(seq, 4000), to_b).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        a.stop();
+        b.stop();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // Each far end hears the mic (2000) plus the other far end.
+        let at_a = received_levels(&peer_a).await;
+        let at_b = received_levels(&peer_b).await;
+        assert!(at_a.iter().any(|&l| near(l, 6000)), "A heard {at_a:?}");
+        assert!(at_b.iter().any(|&l| near(l, 3000)), "B heard {at_b:?}");
+        // Never itself on top: A never hears 2000 + 1000 + ...
+        assert!(!at_a.iter().any(|&l| l > 6500), "A heard itself: {at_a:?}");
+        assert!(!at_b.iter().any(|&l| l > 3500), "B heard itself: {at_b:?}");
+
+        // The speaker plays both far ends (1000 + 4000), and never the mic
+        // or a far end on its own after the mixer filled.
+        let played = bridge.played.lock().unwrap().clone();
+        let frames: Vec<i32> = played
+            .chunks(160)
+            .map(|c| c.iter().map(|&s| i32::from(s)).sum::<i32>() / c.len() as i32)
+            .collect();
+        assert!(frames.iter().any(|&l| near(l, 5000)), "speaker {frames:?}");
+        // One microphone reader: the second leg never asks the platform.
+        let captures = bridge.captures.load(Ordering::Relaxed);
+        assert!(captures > 0 && captures <= 45, "{captures} captures");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_leaving_a_session_plays_and_captures_on_its_own() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a = MobileMediaSession::new(peer.local_addr().unwrap(), AudioCodec::Pcmu)
+            .await
+            .unwrap();
+        let other = MobileMediaSession::new(peer.local_addr().unwrap(), AudioCodec::Pcmu)
+            .await
+            .unwrap();
+        MobileMediaSession::join_conference(&other, &a);
+        a.leave_conference();
+        let bridge = Arc::new(MicBridge::default());
+        a.start_with_bridge(bridge.clone());
+        let to_a: SocketAddr = format!("127.0.0.1:{}", a.local_port()).parse().unwrap();
+        for seq in 0..10 {
+            peer.send_to(&pcmu_packet(seq, 1000), to_a).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        a.stop();
+        assert!(bridge.captures.load(Ordering::Relaxed) > 0);
+        let played = bridge.played.lock().unwrap().clone();
+        assert!(!played.is_empty());
+        let level = played.iter().map(|&s| i32::from(s)).sum::<i32>() / played.len() as i32;
+        assert!(near(level, 1000), "{level}");
     }
 }

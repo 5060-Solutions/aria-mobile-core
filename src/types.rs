@@ -115,6 +115,9 @@ pub struct CallInfo {
     pub duration_secs: u64,
     /// Why the call ended; set only when `state` is `Ended`.
     pub end_reason: Option<EndReason>,
+    /// Mixed into a local three-way conference with the other live call
+    /// (`conference_merge`).
+    pub in_conference: bool,
 }
 
 /// Audio codec selection.

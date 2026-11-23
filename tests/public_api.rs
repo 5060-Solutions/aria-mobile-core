@@ -47,6 +47,7 @@ fn public_types_are_reachable() {
         on_hold: false,
         duration_secs: 0,
         end_reason: None,
+        in_conference: false,
     };
     assert_eq!(info.state, CallState::Ringing);
 
