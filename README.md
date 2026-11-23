@@ -80,6 +80,19 @@ The core never mints gateway tokens and never calls the gateway's `/v1/auth/toke
 
 An engine constructed with an empty `api_key` has no token: methods that need the gateway throw `AuthenticationError` without sending a request until `set_gateway_token` is called.
 
+## Version 0.2.0
+
+- The reliability work below ("Gateway failover", "Network changes") and the
+  `current_gateway()` and `CallInfo.codec` APIs.
+- Hardening from the 2026-07-27 audit (status per finding in
+  `docs/reviews/audit-2026-07-27.md`):
+  - gateway requests never follow redirects, so the SIP password is never
+    re-sent elsewhere;
+  - no engine lock panics across the FFI boundary when poisoned;
+  - the runtime starts on first use even without `init_runtime()`;
+  - Android logs at Info in release builds;
+  - the STUN fallback address is the interface towards the media peer.
+
 ## Gateway failover
 
 **Which name.** For an `https://` base URL the core looks up the SRV record `_sips._tcp.<gateway host>` (for `http://`, `_sip._tcp.<host>`) through `register_device`. For production that is `_sips._tcp.push.ariaroute.com`. With no SRV records, it uses the base URL's own A/AAAA records on its port (443). Each SRV target becomes one gateway *instance*. Requests to it keep the gateway's domain in the URL, so TLS is checked against `push.ariaroute.com`, while the connection goes to the target's address. So every instance must serve a certificate for the gateway domain. Targets are ordered by priority, and the first one is the *preferred* instance.

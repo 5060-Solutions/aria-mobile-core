@@ -6,6 +6,8 @@
 //! - RTP media session management (codec encode/decode, SRTP)
 //! - UniFFI bindings for Swift (iOS) and Kotlin (Android)
 
+#[cfg(test)]
+mod audit_tests;
 mod auth;
 pub mod dns;
 mod events;
@@ -55,17 +57,16 @@ fn init_runtime() {
     #[cfg(target_os = "android")]
     android_logger::init_once(
         android_logger::Config::default()
-            .with_max_level(log::LevelFilter::Debug)
+            // Debug logs (SIP and gateway detail) only in debug builds.
+            .with_max_level(if cfg!(debug_assertions) {
+                log::LevelFilter::Debug
+            } else {
+                log::LevelFilter::Info
+            })
             .with_tag("aria_mobile"),
     );
 
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime")
-    });
+    RUNTIME.get_or_init(new_runtime);
     log::info!("Aria mobile core initialized");
 }
 
@@ -75,10 +76,19 @@ fn shutdown_runtime() {
     // OnceCell doesn't support take, runtime will drop on process exit
 }
 
+/// The shared runtime, started on first use if the host did not call
+/// `init_runtime()` (an exported method must never panic across the FFI
+/// boundary for that).
 fn runtime() -> &'static tokio::runtime::Runtime {
-    RUNTIME
-        .get()
-        .expect("Runtime not initialized — call init_runtime() first")
+    RUNTIME.get_or_init(new_runtime)
+}
+
+fn new_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime")
 }
 
 // ── Event Handler ───────────────────────────────────────────────────────────
@@ -811,7 +821,10 @@ impl AriaMobileEngine {
     }
 
     pub fn set_audio_bridge(&self, bridge: Box<dyn media::PlatformAudioBridge>) {
-        let mut ab = self.audio_bridge.write().unwrap();
+        let mut ab = self
+            .audio_bridge
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *ab = Some(Arc::from(bridge));
     }
 
@@ -983,7 +996,10 @@ impl AriaMobileEngine {
 
             // Start local media and generate SDP answer
             let codecs = if preferred_codecs.is_empty() {
-                self.codec_prefs.read().unwrap().clone()
+                self.codec_prefs
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
             } else {
                 preferred_codecs
             };
@@ -1243,7 +1259,10 @@ impl AriaMobileEngine {
         preferred_codecs: Vec<AudioCodec>,
     ) -> Result<CallInfo, MobileError> {
         let codecs = if preferred_codecs.is_empty() {
-            self.codec_prefs.read().unwrap().clone()
+            self.codec_prefs
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         } else {
             preferred_codecs
         };
@@ -2334,7 +2353,10 @@ impl AriaMobileEngine {
     }
 
     pub fn send_dtmf(&self, call_id: String, digit: String) -> Result<(), MobileError> {
-        let calls = self.calls.lock().unwrap();
+        let calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let call = calls.get(&call_id).ok_or(MobileError::InvalidState)?;
 
         if let Some(media) = &call.media {
@@ -2870,7 +2892,10 @@ impl AriaMobileEngine {
     }
 
     pub fn get_media_stats(&self, call_id: String) -> Option<MediaStats> {
-        let calls = self.calls.lock().unwrap();
+        let calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         calls
             .get(&call_id)
             .and_then(|c| c.media.as_ref())
@@ -2879,7 +2904,10 @@ impl AriaMobileEngine {
 
     /// Get RX audio level (0.0 = silence, ~4000+ = loud speech).
     pub fn get_rx_audio_level(&self, call_id: String) -> f32 {
-        let calls = self.calls.lock().unwrap();
+        let calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         calls
             .get(&call_id)
             .and_then(|c| c.media.as_ref())
@@ -2889,7 +2917,10 @@ impl AriaMobileEngine {
 
     /// Get TX audio level (0.0 = silence, ~4000+ = loud speech).
     pub fn get_tx_audio_level(&self, call_id: String) -> f32 {
-        let calls = self.calls.lock().unwrap();
+        let calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         calls
             .get(&call_id)
             .and_then(|c| c.media.as_ref())
@@ -2898,7 +2929,10 @@ impl AriaMobileEngine {
     }
 
     pub fn set_codec_preferences(&self, codecs: Vec<AudioCodec>) {
-        let mut prefs = self.codec_prefs.write().unwrap();
+        let mut prefs = self
+            .codec_prefs
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *prefs = codecs;
     }
 
@@ -5634,6 +5668,7 @@ mod tests {
         let ip = runtime().block_on(media::advertised_ip(
             std::future::pending(),
             Duration::from_millis(100),
+            None,
         ));
         assert!(started.elapsed() < Duration::from_millis(1000));
         assert!(ip.parse::<std::net::IpAddr>().is_ok(), "{ip}");
@@ -5642,11 +5677,13 @@ mod tests {
         let ip = runtime().block_on(media::advertised_ip(
             async { None },
             Duration::from_millis(100),
+            None,
         ));
         assert!(ip.parse::<std::net::IpAddr>().is_ok(), "{ip}");
         let ip = runtime().block_on(media::advertised_ip(
             async { Some("203.0.113.7".to_string()) },
             Duration::from_millis(100),
+            None,
         ));
         assert_eq!(ip, "203.0.113.7");
         assert!(media::STUN_BUDGET <= Duration::from_secs(4));

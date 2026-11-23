@@ -342,6 +342,7 @@ impl GatewayClient {
     pub fn new(base_url: String) -> Self {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("Failed to create HTTP client");
 
@@ -359,6 +360,10 @@ impl GatewayClient {
     fn build_pinned_client(domain: &str, addr: std::net::SocketAddr) -> reqwest::Client {
         reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            // Never follow a redirect: a 307/308 would re-send the body,
+            // SIP password included, to wherever it points, cleartext
+            // `http://` too. The gateway never redirects.
+            .redirect(reqwest::redirect::Policy::none())
             .resolve(domain, addr)
             .build()
             .expect("Failed to create pinned HTTP client")
