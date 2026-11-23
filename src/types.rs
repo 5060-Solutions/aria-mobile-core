@@ -118,6 +118,8 @@ pub struct CallInfo {
     /// Mixed into a local three-way conference with the other live call
     /// (`conference_merge`).
     pub in_conference: bool,
+    /// This call is being recorded (`start_recording`).
+    pub recording: bool,
 }
 
 /// Audio codec selection.

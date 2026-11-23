@@ -78,7 +78,12 @@ pub struct MobileMediaSession {
     /// The local conference this call is mixed into, and its leg there.
     /// `None` outside a conference. Read per frame by both RTP threads.
     conference: ConferenceSlot,
+    /// The WAV recorder for this call, if it is being recorded. Fed by both
+    /// RTP threads; see [`CallRecorder`].
+    recorder: RecorderSlot,
 }
+
+type RecorderSlot = Arc<Mutex<Option<Arc<CallRecorder>>>>;
 
 /// A session's place in a local conference: the mixer and the leg index.
 type ConferenceSlot = Arc<Mutex<Option<(Arc<Conference>, usize)>>>;
@@ -118,6 +123,7 @@ impl MobileMediaSession {
             srtp_in: Arc::new(Mutex::new(None)),
             offered_srtp_key: Arc::new(Mutex::new(None)),
             conference: Arc::new(Mutex::new(None)),
+            recorder: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -174,6 +180,7 @@ impl MobileMediaSession {
             let ai_tap_rx = self.ai_tap.clone();
             let srtp_in = self.srtp_in.clone();
             let conference_rx = self.conference.clone();
+            let recorder_rx = self.recorder.clone();
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -312,6 +319,14 @@ impl MobileMediaSession {
                                 }
                             }
 
+                            if let Some(recorder) = recorder_rx
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .as_ref()
+                            {
+                                recorder.push_rx(&pcm);
+                            }
+
                             // In a conference the mixer owns the speaker: it
                             // plays the sum of both far ends, once per frame.
                             let conference = conference_rx
@@ -346,6 +361,7 @@ impl MobileMediaSession {
             let ai_tap_tx = self.ai_tap.clone();
             let srtp_out = self.srtp_out.clone();
             let conference_tx = self.conference.clone();
+            let recorder_tx = self.recorder.clone();
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -435,6 +451,16 @@ impl MobileMediaSession {
                             }
                         };
 
+                        // The TX loop is the recording's clock: each frame
+                        // sent is written, mixed with what the far end said.
+                        if let Some(recorder) = recorder_tx
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .as_ref()
+                        {
+                            recorder.write_frame(&pcm);
+                        }
+
                         // Encode
                         let header = rtp_engine::rtp::RtpHeader::new(pt, seq, timestamp, ssrc);
                         let mut packet = header.to_bytes();
@@ -505,6 +531,20 @@ impl MobileMediaSession {
             .conference
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((conference, 0));
+    }
+
+    /// The codec's sample rate: what the RTP loops decode to and encode from.
+    pub fn sample_rate(&self) -> u32 {
+        self.codec.clock_rate()
+    }
+
+    /// Attach (or with `None`, detach) a call recorder. Audio reaches it from
+    /// the next frame.
+    pub fn set_recorder(&self, recorder: Option<Arc<CallRecorder>>) {
+        *self
+            .recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = recorder;
     }
 
     /// Leave the local conference, if in one. From the next frame this
@@ -883,6 +923,155 @@ impl Conference {
             ),
             None => vec![0; n],
         }
+    }
+}
+
+// ── Call recording ──────────────────────────────────────────────────────────
+
+/// How much far-end audio the recorder may hold for the next frame, in
+/// 20 ms frames, so the RX and TX threads' clocks cannot drift into delay.
+const RECORDER_MAX_QUEUED_FRAMES: usize = 4;
+
+/// The 44-byte header of a 16-bit PCM mono WAV file with `data_bytes` of
+/// samples.
+pub(crate) fn wav_header(sample_rate: u32, data_bytes: u32) -> [u8; 44] {
+    let mut h = [0_u8; 44];
+    h[0..4].copy_from_slice(b"RIFF");
+    h[4..8].copy_from_slice(&data_bytes.saturating_add(36).to_le_bytes());
+    h[8..12].copy_from_slice(b"WAVE");
+    h[12..16].copy_from_slice(b"fmt ");
+    h[16..20].copy_from_slice(&16_u32.to_le_bytes());
+    h[20..22].copy_from_slice(&1_u16.to_le_bytes()); // PCM
+    h[22..24].copy_from_slice(&1_u16.to_le_bytes()); // mono
+    h[24..28].copy_from_slice(&sample_rate.to_le_bytes());
+    h[28..32].copy_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate
+    h[32..34].copy_from_slice(&2_u16.to_le_bytes()); // block align
+    h[34..36].copy_from_slice(&16_u16.to_le_bytes()); // bits per sample
+    h[36..40].copy_from_slice(b"data");
+    h[40..44].copy_from_slice(&data_bytes.to_le_bytes());
+    h
+}
+
+struct RecorderState {
+    /// `None` once finished.
+    file: Option<std::io::BufWriter<std::fs::File>>,
+    data_bytes: u32,
+    /// Far-end audio waiting for the next frame.
+    rx: std::collections::VecDeque<i16>,
+    failed: bool,
+}
+
+/// Records one call to a WAV file: 16-bit PCM mono at the codec's rate.
+///
+/// The RX thread queues decoded far-end audio with [`CallRecorder::push_rx`];
+/// the TX thread, once per 20 ms frame, mixes it with the frame it sends and
+/// writes the result ([`CallRecorder::write_frame`]). What is sent already
+/// carries the microphone and, in a conference, the other far end, so the
+/// recording holds everyone the user hears or is heard by. Held or muted
+/// time is silence, as it is on the wire.
+pub struct CallRecorder {
+    path: String,
+    sample_rate: u32,
+    state: Mutex<RecorderState>,
+}
+
+impl CallRecorder {
+    /// Create (or replace) the file at `path` and write a header.
+    pub fn create(path: &str, sample_rate: u32) -> std::io::Result<Self> {
+        use std::io::Write;
+        let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+        file.write_all(&wav_header(sample_rate, 0))?;
+        Ok(Self {
+            path: path.to_string(),
+            sample_rate,
+            state: Mutex::new(RecorderState {
+                file: Some(file),
+                data_bytes: 0,
+                rx: std::collections::VecDeque::new(),
+                failed: false,
+            }),
+        })
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RecorderState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Queue decoded far-end audio for the next frame.
+    pub fn push_rx(&self, pcm: &[i16]) {
+        let cap = (self.sample_rate / 50) as usize * RECORDER_MAX_QUEUED_FRAMES;
+        let mut state = self.lock();
+        if state.file.is_some() {
+            push_bounded(&mut state.rx, pcm, cap);
+        }
+    }
+
+    /// Mix one sent frame with the queued far-end audio and append it.
+    /// A write error stops the recording (logged once); the call goes on.
+    pub fn write_frame(&self, tx: &[i16]) {
+        use std::io::Write;
+        let mut state = self.lock();
+        if state.file.is_none() || state.failed {
+            return;
+        }
+        let rx = pop_samples(&mut state.rx, tx.len());
+        let bytes: Vec<u8> = tx
+            .iter()
+            .zip(&rx)
+            .flat_map(|(&t, &r)| mix_add(t, r).to_le_bytes())
+            .collect();
+        // A RIFF size is 32 bits: about 12 hours at 48 kHz. Past that the
+        // file is complete as it stands.
+        let Some(total) = u32::try_from(bytes.len())
+            .ok()
+            .and_then(|n| state.data_bytes.checked_add(n))
+            .filter(|t| t.checked_add(36).is_some())
+        else {
+            return;
+        };
+        let result = state
+            .file
+            .as_mut()
+            .expect("checked above")
+            .write_all(&bytes);
+        match result {
+            Ok(()) => state.data_bytes = total,
+            Err(e) => {
+                log::warn!("Call recording stopped: write failed: {e}");
+                state.failed = true;
+            }
+        }
+    }
+
+    /// Finish the file: flush it and write the final sizes into the header.
+    /// Later frames are ignored. Idempotent; errors only the first time.
+    pub fn finish(&self) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut state = self.lock();
+        let Some(writer) = state.file.take() else {
+            return Ok(());
+        };
+        state.rx.clear();
+        let mut file = writer.into_inner().map_err(|e| e.into_error())?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&wav_header(self.sample_rate, state.data_bytes))?;
+        file.sync_all()?;
+        if state.failed {
+            return Err(std::io::Error::other("a write failed during the recording"));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CallRecorder {
+    fn drop(&mut self) {
+        let _ = self.finish();
     }
 }
 
@@ -1764,5 +1953,201 @@ mod conference_tests {
         assert!(!played.is_empty());
         let level = played.iter().map(|&s| i32::from(s)).sum::<i32>() / played.len() as i32;
         assert!(near(level, 1000), "{level}");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod recording_tests {
+    use super::*;
+    use std::time::Duration;
+
+    pub(crate) fn temp_wav(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("aria-rec-{name}-{}.wav", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Check a WAV file's header against its length and return
+    /// (sample rate, samples).
+    pub(crate) fn read_wav(path: &str) -> (u32, Vec<i16>) {
+        let bytes = std::fs::read(path).expect("read wav");
+        assert!(bytes.len() >= 44, "shorter than a header");
+        let u32_at = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
+        let u16_at = |i: usize| u16::from_le_bytes(bytes[i..i + 2].try_into().unwrap());
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(u32_at(4) as usize, bytes.len() - 8, "RIFF size");
+        assert_eq!(&bytes[8..16], b"WAVEfmt ");
+        assert_eq!(u32_at(16), 16);
+        assert_eq!(u16_at(20), 1, "PCM");
+        assert_eq!(u16_at(22), 1, "mono");
+        let rate = u32_at(24);
+        assert_eq!(u32_at(28), rate * 2, "byte rate");
+        assert_eq!(u16_at(32), 2, "block align");
+        assert_eq!(u16_at(34), 16, "bits");
+        assert_eq!(&bytes[36..40], b"data");
+        assert_eq!(u32_at(40) as usize, bytes.len() - 44, "data size");
+        let samples = bytes[44..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| i16::from_le_bytes(*c))
+            .collect();
+        (rate, samples)
+    }
+
+    #[test]
+    fn the_header_describes_16_bit_mono_pcm() {
+        let h = wav_header(48000, 1000);
+        assert_eq!(&h[0..4], b"RIFF");
+        assert_eq!(u32::from_le_bytes(h[4..8].try_into().unwrap()), 1036);
+        assert_eq!(u32::from_le_bytes(h[24..28].try_into().unwrap()), 48000);
+        assert_eq!(u32::from_le_bytes(h[28..32].try_into().unwrap()), 96000);
+        assert_eq!(u32::from_le_bytes(h[40..44].try_into().unwrap()), 1000);
+    }
+
+    #[test]
+    fn frames_mix_the_far_end_with_what_is_sent() {
+        let path = temp_wav("mix");
+        let rec = CallRecorder::create(&path, 8000).unwrap();
+        rec.push_rx(&[100; 160]);
+        rec.write_frame(&[1000; 160]);
+        // No far-end audio for this frame: what was sent alone.
+        rec.write_frame(&[-30000; 160]);
+        rec.push_rx(&[-30000; 160]);
+        rec.write_frame(&[-30000; 160]); // clamps
+        rec.finish().unwrap();
+        // Finished: further audio is ignored and finishing again is fine.
+        rec.write_frame(&[5; 160]);
+        rec.finish().unwrap();
+
+        let (rate, samples) = read_wav(&path);
+        assert_eq!(rate, 8000);
+        assert_eq!(samples.len(), 480);
+        assert!(samples[..160].iter().all(|&s| s == 1100));
+        assert!(samples[160..320].iter().all(|&s| s == -30000));
+        assert!(samples[320..].iter().all(|&s| s == i16::MIN));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_empty_recording_is_still_a_valid_file() {
+        let path = temp_wav("empty");
+        CallRecorder::create(&path, 8000).unwrap().finish().unwrap();
+        let (_, samples) = read_wav(&path);
+        assert!(samples.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_recorder_dropped_unfinished_still_leaves_a_valid_file() {
+        let path = temp_wav("drop");
+        {
+            let rec = CallRecorder::create(&path, 48000).unwrap();
+            rec.write_frame(&[7; 960]);
+        }
+        let (rate, samples) = read_wav(&path);
+        assert_eq!((rate, samples.len()), (48000, 960));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_path_that_cannot_be_created_is_an_error() {
+        assert!(CallRecorder::create("/nonexistent-dir/x/y.wav", 8000).is_err());
+    }
+
+    struct Mic;
+    impl PlatformAudioBridge for Mic {
+        fn on_playback_audio(&self, _: Vec<i16>, _: u32) {}
+        fn on_capture_audio(&self, _: u32, frame_size: u32) -> Vec<i16> {
+            vec![2000; frame_size as usize]
+        }
+    }
+
+    fn pcmu_packet(seq: u16, level: i16) -> Vec<u8> {
+        let mut pkt =
+            rtp_engine::rtp::RtpHeader::new(0, seq, u32::from(seq) * 160, 0x77).to_bytes();
+        let mut enc = rtp_engine::codec::create_encoder(rtp_engine::CodecType::Pcmu).unwrap();
+        enc.encode(&[level; 160], &mut pkt);
+        pkt
+    }
+
+    fn frame_levels(samples: &[i16], n: usize) -> Vec<i32> {
+        samples
+            .chunks(n)
+            .map(|c| c.iter().map(|&s| i32::from(s)).sum::<i32>() / c.len() as i32)
+            .collect()
+    }
+
+    fn near(level: i32, want: i32) -> bool {
+        (level - want).abs() <= want / 20 + 40
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_live_session_records_both_ends_mixed() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let session = MobileMediaSession::new(peer.local_addr().unwrap(), AudioCodec::Pcmu)
+            .await
+            .unwrap();
+        let path = temp_wav("live");
+        let rec = Arc::new(CallRecorder::create(&path, session.sample_rate()).unwrap());
+        session.set_recorder(Some(Arc::clone(&rec)));
+        session.start_with_bridge(Arc::new(Mic));
+        let to: SocketAddr = format!("127.0.0.1:{}", session.local_port())
+            .parse()
+            .unwrap();
+        for seq in 0..25 {
+            peer.send_to(&pcmu_packet(seq, 1000), to).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        session.set_recorder(None);
+        session.stop();
+        rec.finish().unwrap();
+
+        let (rate, samples) = read_wav(&path);
+        assert_eq!(rate, 8000);
+        assert!(samples.len() >= 160 * 10, "{} samples", samples.len());
+        let levels = frame_levels(&samples, 160);
+        assert!(levels.iter().any(|&l| near(l, 3000)), "{levels:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recording_a_conferenced_call_includes_the_other_far_end() {
+        let peer_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a = MobileMediaSession::new(peer_a.local_addr().unwrap(), AudioCodec::Pcmu)
+            .await
+            .unwrap();
+        let b = MobileMediaSession::new(peer_b.local_addr().unwrap(), AudioCodec::Pcmu)
+            .await
+            .unwrap();
+        MobileMediaSession::join_conference(&a, &b);
+        // Record each leg: both must hold mic + A + B.
+        let (path_a, path_b) = (temp_wav("conf-a"), temp_wav("conf-b"));
+        let rec_a = Arc::new(CallRecorder::create(&path_a, 8000).unwrap());
+        let rec_b = Arc::new(CallRecorder::create(&path_b, 8000).unwrap());
+        a.set_recorder(Some(Arc::clone(&rec_a)));
+        b.set_recorder(Some(Arc::clone(&rec_b)));
+        let mic = Arc::new(Mic);
+        a.start_with_bridge(mic.clone());
+        b.start_with_bridge(mic);
+        let to_a: SocketAddr = format!("127.0.0.1:{}", a.local_port()).parse().unwrap();
+        let to_b: SocketAddr = format!("127.0.0.1:{}", b.local_port()).parse().unwrap();
+        for seq in 0..40 {
+            peer_a.send_to(&pcmu_packet(seq, 1000), to_a).await.unwrap();
+            peer_b.send_to(&pcmu_packet(seq, 4000), to_b).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        a.stop();
+        b.stop();
+        rec_a.finish().unwrap();
+        rec_b.finish().unwrap();
+        for path in [path_a, path_b] {
+            let (_, samples) = read_wav(&path);
+            let levels = frame_levels(&samples, 160);
+            assert!(levels.iter().any(|&l| near(l, 7000)), "{path}: {levels:?}");
+            let _ = std::fs::remove_file(path);
+        }
     }
 }

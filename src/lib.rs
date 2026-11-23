@@ -232,7 +232,15 @@ pub fn is_emergency_number(dial: String) -> bool {
 fn stop_call(call: &mut ActiveCallState) {
     call.poll_stop.store(true, Ordering::Relaxed);
     if let Some(media) = call.media.take() {
+        media.set_recorder(None);
         media.stop();
+    }
+    // A recording stops with its call, finished before `Ended` is queued.
+    if let Some(recorder) = call.recorder.take() {
+        if let Err(e) = recorder.finish() {
+            log::warn!("Recording of {} ended badly: {e}", call.info.call_id);
+        }
+        call.info.recording = false;
     }
 }
 
@@ -731,6 +739,8 @@ struct ActiveCallState {
     poll_stop: Arc<AtomicBool>,
     /// Orders this call's events and stops anything after `Ended`.
     events: Arc<CallEvents>,
+    /// The call's WAV recorder while `start_recording` is in effect.
+    recorder: Option<Arc<media::CallRecorder>>,
 }
 
 impl AriaMobileEngine {
@@ -1001,6 +1011,7 @@ impl AriaMobileEngine {
             duration_secs: 0,
             end_reason: None,
             in_conference: false,
+            recording: false,
         };
 
         // From here an `active` status is this handset answering.
@@ -1086,6 +1097,7 @@ impl AriaMobileEngine {
                         route: route.clone(),
                         poll_stop: poll_stop.clone(),
                         events: Arc::clone(&events),
+                        recorder: None,
                     },
                 );
             } else if let Some(media) = &media {
@@ -1266,6 +1278,7 @@ impl AriaMobileEngine {
             duration_secs: 0,
             end_reason: None,
             in_conference: false,
+            recording: false,
         };
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         let (outcome_tx, outcome_rx) = tokio::sync::watch::channel(None);
@@ -1496,6 +1509,7 @@ impl AriaMobileEngine {
                         route: route.clone(),
                         poll_stop: poll_stop.clone(),
                         events: Arc::clone(&events),
+                        recorder: None,
                     },
                 );
                 // Queued under the lock: a hold or hangup that finds the call
@@ -1596,6 +1610,7 @@ impl AriaMobileEngine {
                         duration_secs: 0,
                         end_reason: None,
                         in_conference: false,
+                        recording: false,
                     },
                     EndReason::Cancelled,
                 );
@@ -2082,6 +2097,70 @@ impl AriaMobileEngine {
         Ok(())
     }
 
+    /// Start recording a connected call to a new WAV file at `path`.
+    ///
+    /// 16-bit PCM mono at the call's codec rate. What the far end says is
+    /// mixed with what is sent to it (the microphone and, in a conference,
+    /// the other far end). Reports the call with `recording` true.
+    pub fn start_recording(&self, call_id: String, path: String) -> Result<(), MobileError> {
+        let mut calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let call = calls.get_mut(&call_id).ok_or(MobileError::InvalidState)?;
+        if call.recorder.is_some() {
+            return Err(MobileError::InvalidState);
+        }
+        let rate = call
+            .media
+            .as_ref()
+            .map_or(8000, media::MobileMediaSession::sample_rate);
+        let recorder = media::CallRecorder::create(&path, rate).map_err(|e| {
+            log::warn!("Cannot record {call_id}: {e}");
+            MobileError::MediaError
+        })?;
+        let recorder = Arc::new(recorder);
+        if let Some(media) = &call.media {
+            media.set_recorder(Some(Arc::clone(&recorder)));
+        }
+        call.recorder = Some(recorder);
+        call.info.recording = true;
+        call.events.emit(&self.events, call.info.clone());
+        log::info!("Recording {call_id} at {rate} Hz");
+        Ok(())
+    }
+
+    /// Stop recording a call, finish its WAV file and return the path.
+    pub fn stop_recording(&self, call_id: String) -> Result<String, MobileError> {
+        let mut calls = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let call = calls.get_mut(&call_id).ok_or(MobileError::InvalidState)?;
+        let recorder = call.recorder.take().ok_or(MobileError::InvalidState)?;
+        if let Some(media) = &call.media {
+            media.set_recorder(None);
+        }
+        call.info.recording = false;
+        call.events.emit(&self.events, call.info.clone());
+        drop(calls);
+        recorder.finish().map_err(|e| {
+            log::warn!("Recording of {call_id} could not be finished: {e}");
+            MobileError::MediaError
+        })?;
+        log::info!("Stopped recording {call_id}");
+        Ok(recorder.path().to_string())
+    }
+
+    /// Whether a call is being recorded.
+    pub fn is_recording(&self, call_id: String) -> bool {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&call_id)
+            .is_some_and(|c| c.recorder.is_some())
+    }
+
     /// Merge two connected calls into a local three-way conference.
     ///
     /// Both calls come off hold. Each far end hears the microphone plus the
@@ -2351,6 +2430,7 @@ impl AriaMobileEngine {
                         duration_secs: 0,
                         end_reason: None,
                         in_conference: false,
+                        recording: false,
                     },
                     events: Arc::clone(&events),
                     accepting: false,
@@ -2979,6 +3059,7 @@ mod tests {
                     duration_secs: 0,
                     end_reason: None,
                     in_conference: false,
+                    recording: false,
                 },
                 seq: engine.next_seq.fetch_add(1, Ordering::Relaxed),
                 media: None,
@@ -2986,6 +3067,7 @@ mod tests {
                 route: engine.gateway.primary_route(),
                 poll_stop: Arc::clone(&poll_stop),
                 events: Arc::default(),
+                recorder: None,
             },
         );
         poll_stop
@@ -4367,6 +4449,7 @@ mod tests {
             duration_secs: 0,
             end_reason: None,
             in_conference: false,
+            recording: false,
         };
         assert!(events.emit(&engine.events, info(CallState::Ringing)));
         assert!(events.emit(&engine.events, info(CallState::Ended)));
@@ -6166,5 +6249,109 @@ mod tests {
             [Some(EndReason::Transferred)]
         );
         assert!(engine.get_calls().is_empty());
+    }
+
+    // ── Recording ───────────────────────────────────────────────────────────
+
+    use crate::media::recording_tests::{read_wav, temp_wav};
+
+    fn recording_flags(recorder: &Recorder, call_id: &str) -> Vec<(CallState, bool)> {
+        recorder
+            .states()
+            .into_iter()
+            .filter(|i| i.call_id == call_id)
+            .map(|i| (i.state, i.recording))
+            .collect()
+    }
+
+    #[test]
+    fn start_and_stop_recording_report_the_flag_and_return_the_path() {
+        let (engine, recorder) = engine(NO_GATEWAY);
+        insert_call(&engine, "c1", "tok-1");
+        let path = temp_wav("engine");
+        assert!(!engine.is_recording("c1".into()));
+        engine.start_recording("c1".into(), path.clone()).unwrap();
+        assert!(engine.is_recording("c1".into()));
+        assert!(engine.get_calls()[0].recording);
+        assert_eq!(engine.stop_recording("c1".into()).unwrap(), path);
+        assert!(!engine.is_recording("c1".into()));
+        assert_eq!(
+            recording_flags(&recorder, "c1"),
+            [(CallState::Connected, true), (CallState::Connected, false)]
+        );
+        let (rate, _) = read_wav(&path);
+        assert_eq!(rate, 8000);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recording_refusals_report_nothing() {
+        let (engine, recorder) = engine(NO_GATEWAY);
+        insert_call(&engine, "c1", "tok-1");
+        let path = temp_wav("refused");
+        assert!(matches!(
+            engine.start_recording("nope".into(), path.clone()),
+            Err(MobileError::InvalidState)
+        ));
+        assert!(matches!(
+            engine.stop_recording("c1".into()),
+            Err(MobileError::InvalidState)
+        ));
+        assert!(matches!(
+            engine.start_recording("c1".into(), "/nonexistent-dir/x.wav".into()),
+            Err(MobileError::MediaError)
+        ));
+        assert!(recorder.states().is_empty());
+        engine.start_recording("c1".into(), path.clone()).unwrap();
+        assert!(matches!(
+            engine.start_recording("c1".into(), temp_wav("second")),
+            Err(MobileError::InvalidState)
+        ));
+        assert!(!engine.is_recording("nope".into()));
+        engine.stop_recording("c1".into()).unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recording_stops_by_itself_when_the_call_ends() {
+        let gw = MockGateway::start(|_| (200, "{}".into()));
+        let (engine, recorder) = engine(&gw.base_url);
+        insert_call(&engine, "c1", "tok-1");
+        let path = temp_wav("auto");
+        engine.start_recording("c1".into(), path.clone()).unwrap();
+        engine.hangup("c1".into()).unwrap();
+        assert_eq!(
+            recording_flags(&recorder, "c1"),
+            [(CallState::Connected, true), (CallState::Ended, false)]
+        );
+        // Finished before `Ended` was queued: the header is final.
+        read_wav(&path);
+        assert!(matches!(
+            engine.stop_recording("c1".into()),
+            Err(MobileError::InvalidState)
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_remote_end_stops_the_recording_too() {
+        let gw = MockGateway::start(|_| (200, r#"{"status":"ended","reason":"bye"}"#.into()));
+        let (engine, recorder) = engine(&gw.base_url);
+        let stop = insert_call(&engine, "c1", "tok-1");
+        let path = temp_wav("remote");
+        engine.start_recording("c1".into(), path.clone()).unwrap();
+        engine.start_call_status_poll(
+            "c1".into(),
+            "tok-1".into(),
+            engine.gateway.primary_route(),
+            stop,
+        );
+        recorder.wait_for(2);
+        assert_eq!(
+            recording_flags(&recorder, "c1"),
+            [(CallState::Connected, true), (CallState::Ended, false)]
+        );
+        read_wav(&path);
+        let _ = std::fs::remove_file(path);
     }
 }

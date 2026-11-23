@@ -168,6 +168,9 @@ dictionary CallInfo {
     /// Mixed into a local three-way conference with the other live call
     /// (`conference_merge`). See "Conference" in the README.
     boolean in_conference = false;
+    /// This call is being recorded to a WAV file (`start_recording`).
+    /// False on the `Ended` event: recording stops when the call ends.
+    boolean recording = false;
 };
 
 /// Audio codec selection.
@@ -448,6 +451,28 @@ interface AriaMobileEngine {
     /// there is no conference.
     [Throws=MobileError]
     void conference_split();
+
+    /// Start recording a connected call to a new WAV file at `path`
+    /// (replaced if it exists): 16-bit PCM mono at the call's codec rate
+    /// (8000 Hz, or 48000 Hz for Opus), the far end and this end mixed, plus
+    /// the other far end while the call is in a conference. Held time is
+    /// recorded as silence. Reports the call with `recording` true. Throws
+    /// `InvalidState` for an unknown, ringing or already recorded call, and
+    /// `MediaError` when the file cannot be created. Recording stops by
+    /// itself when the call ends; the file is complete by the time `Ended`
+    /// is delivered. Consent and disclosure are the app's responsibility.
+    [Throws=MobileError]
+    void start_recording(string call_id, string path);
+
+    /// Stop recording a call and finish the WAV file. Returns its path.
+    /// Reports the call with `recording` false. Throws `InvalidState` when
+    /// the call is not being recorded, and `MediaError` when the file could
+    /// not be finished (it may be truncated).
+    [Throws=MobileError]
+    string stop_recording(string call_id);
+
+    /// Whether a call is being recorded.
+    boolean is_recording(string call_id);
 
     /// Send a DTMF digit.
     [Throws=MobileError]
