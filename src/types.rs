@@ -96,7 +96,7 @@ impl EndReason {
             Some("cancelled") => EndReason::CallerCancelled,
             Some("rejected" | "declined") => EndReason::Rejected,
             Some("answered_elsewhere") => EndReason::AnsweredElsewhere,
-            Some("no_ack") => EndReason::Failed,
+            Some("no_ack" | "gateway_lost") => EndReason::Failed,
             _ => fallback,
         }
     }
@@ -120,6 +120,9 @@ pub struct CallInfo {
     pub in_conference: bool,
     /// This call is being recorded (`start_recording`).
     pub recording: bool,
+    /// The negotiated audio codec by its SDP name (`PCMU`, `PCMA`, `opus`,
+    /// `G729`), once the call has media.
+    pub codec: Option<String>,
 }
 
 /// Audio codec selection.
