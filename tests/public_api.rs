@@ -49,6 +49,7 @@ fn public_types_are_reachable() {
         end_reason: None,
         in_conference: false,
         recording: false,
+        codec: None,
     };
     assert_eq!(info.state, CallState::Ringing);
 

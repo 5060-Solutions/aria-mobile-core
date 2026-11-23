@@ -9,7 +9,7 @@
 //! - Platform audio I/O via the PlatformAudioBridge callback
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::UdpSocket;
 
@@ -43,10 +43,12 @@ pub type AiTap = std::sync::Arc<aria_ai_core::session::CallSession>;
 
 /// A media session for mobile — processes RTP with platform audio bridge.
 pub struct MobileMediaSession {
-    rtp_socket: Arc<UdpSocket>,
+    /// The RTP socket. Replaced by [`Rebinder::rebind`] after a network
+    /// change; both RTP threads read it per packet, so they move with it.
+    rtp_socket: SocketSlot,
     /// Shared remote address — updated by update_remote() and symmetric RTP
     remote_addr: Arc<Mutex<SocketAddr>>,
-    local_port: u16,
+    local_port: Arc<AtomicU16>,
     codec: AudioCodec,
     muted: Arc<AtomicBool>,
     on_hold: Arc<AtomicBool>,
@@ -75,6 +77,8 @@ pub struct MobileMediaSession {
     srtp_in: Arc<Mutex<Option<rtp_engine::srtp::SrtpContext>>>,
     /// The key material we advertised, held until the answer arrives.
     offered_srtp_key: Arc<Mutex<Option<String>>>,
+    /// Our SRTP key once SRTP is on, offered again in a re-offer.
+    local_srtp_key: Arc<Mutex<Option<String>>>,
     /// The local conference this call is mixed into, and its leg there.
     /// `None` outside a conference. Read per frame by both RTP threads.
     conference: ConferenceSlot,
@@ -84,6 +88,91 @@ pub struct MobileMediaSession {
 }
 
 type RecorderSlot = Arc<Mutex<Option<Arc<CallRecorder>>>>;
+
+/// The current RTP socket of a session.
+type SocketSlot = Arc<std::sync::RwLock<Arc<UdpSocket>>>;
+
+fn current_socket(slot: &SocketSlot) -> Arc<UdpSocket> {
+    slot.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Moves a running session to a new local socket after a network change
+/// (Wi-Fi to cellular, a new IP): see [`MobileMediaSession::rebinder`].
+/// Holds only shared handles, so it is used without the call map locked.
+#[derive(Clone)]
+pub struct Rebinder {
+    socket: SocketSlot,
+    local_port: Arc<AtomicU16>,
+    remote_addr: Arc<Mutex<SocketAddr>>,
+    codec: AudioCodec,
+    local_srtp_key: Arc<Mutex<Option<String>>>,
+}
+
+impl Rebinder {
+    /// Bind a new RTP socket on whatever interface now routes, find its
+    /// public address by STUN on that socket (within `stun_budget`; the
+    /// interface address after that, or `advertise` when given), and swap
+    /// it in. The RTP threads send their next frame from it and listen on it
+    /// from then on. Returns the new port and the address to advertise.
+    ///
+    /// # Errors
+    /// [`MobileError::MediaError`] if no socket can be bound.
+    pub async fn rebind(
+        &self,
+        stun_budget: std::time::Duration,
+        advertise: Option<String>,
+    ) -> Result<(u16, String), MobileError> {
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|_| MobileError::MediaError)?;
+        let port = socket
+            .local_addr()
+            .map_err(|_| MobileError::MediaError)?
+            .port();
+        let ip = match advertise {
+            Some(ip) => ip,
+            None => advertised_ip(stun_on(&socket, "rebind"), stun_budget).await,
+        };
+        let old = std::mem::replace(
+            &mut *self
+                .socket
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Arc::new(socket),
+        );
+        self.local_port.store(port, Ordering::Relaxed);
+        log::info!(
+            "RTP rebound from port {} to {port} (advertising {ip})",
+            old.local_addr().map(|a| a.port()).unwrap_or(0)
+        );
+        Ok((port, ip))
+    }
+
+    /// An SDP offer for the session's current socket: its codec only (the
+    /// call has one), and its SRTP key again if SRTP is on.
+    pub fn reoffer_sdp(&self, ip: &str, port: u16) -> String {
+        let key = self
+            .local_srtp_key
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        build_sdp_offer(port, ip, &[self.codec], key.as_deref())
+    }
+
+    /// Apply the answer to a re-offer: send to the address it gives.
+    pub fn apply_answer(&self, sdp: &str) {
+        if let Some((addr, _)) = parse_sdp_remote(sdp) {
+            if !addr.ip().is_unspecified() && addr.port() != 0 {
+                *self
+                    .remote_addr
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = addr;
+            }
+        }
+    }
+}
 
 /// A session's place in a local conference: the mixer and the leg index.
 type ConferenceSlot = Arc<Mutex<Option<(Arc<Conference>, usize)>>>;
@@ -103,9 +192,9 @@ impl MobileMediaSession {
         let ssrc: u32 = ::rand::random();
 
         Ok(Self {
-            rtp_socket: Arc::new(socket),
+            rtp_socket: Arc::new(std::sync::RwLock::new(Arc::new(socket))),
             remote_addr: Arc::new(Mutex::new(remote_addr)),
-            local_port,
+            local_port: Arc::new(AtomicU16::new(local_port)),
             codec,
             muted: Arc::new(AtomicBool::new(false)),
             on_hold: Arc::new(AtomicBool::new(false)),
@@ -122,6 +211,7 @@ impl MobileMediaSession {
             srtp_out: Arc::new(Mutex::new(None)),
             srtp_in: Arc::new(Mutex::new(None)),
             offered_srtp_key: Arc::new(Mutex::new(None)),
+            local_srtp_key: Arc::new(Mutex::new(None)),
             conference: Arc::new(Mutex::new(None)),
             recorder: Arc::new(Mutex::new(None)),
         })
@@ -143,12 +233,28 @@ impl MobileMediaSession {
 
     /// Local RTP port for SDP.
     pub fn local_port(&self) -> u16 {
-        self.local_port
+        self.local_port.load(Ordering::Relaxed)
     }
 
-    /// Get a reference to the RTP socket (for STUN discovery).
-    pub fn rtp_socket_ref(&self) -> &UdpSocket {
-        &self.rtp_socket
+    /// The current RTP socket (for STUN discovery).
+    pub fn rtp_socket(&self) -> Arc<UdpSocket> {
+        current_socket(&self.rtp_socket)
+    }
+
+    /// A handle that moves this session to a new socket (see [`Rebinder`]).
+    pub fn rebinder(&self) -> Rebinder {
+        Rebinder {
+            socket: Arc::clone(&self.rtp_socket),
+            local_port: Arc::clone(&self.local_port),
+            remote_addr: Arc::clone(&self.remote_addr),
+            codec: self.codec,
+            local_srtp_key: Arc::clone(&self.local_srtp_key),
+        }
+    }
+
+    /// The negotiated codec, by its SDP name (`PCMU`, `PCMA`, `opus`, `G729`).
+    pub fn codec_name(&self) -> String {
+        self.codec.name().to_string()
     }
 
     /// Update the remote RTP address (e.g., after receiving SDP answer).
@@ -201,9 +307,12 @@ impl MobileMediaSession {
                     log::info!("RTP RX thread started");
 
                     while running.load(Ordering::Relaxed) {
+                        // The socket may have been replaced by a rebind; a
+                        // receive on the old one ends within 100 ms.
+                        let sock = current_socket(&socket);
                         let recv = tokio::time::timeout(
                             std::time::Duration::from_millis(100),
-                            socket.recv_from(&mut buf),
+                            sock.recv_from(&mut buf),
                         )
                         .await;
 
@@ -487,8 +596,9 @@ impl MobileMediaSession {
                             }
                         }
 
-                        // Send
-                        if let Err(e) = socket.send_to(&packet, remote).await {
+                        // Send, from the current socket (a rebind takes
+                        // effect from the next frame).
+                        if let Err(e) = current_socket(&socket).send_to(&packet, remote).await {
                             log::warn!("RTP send error: {}", e);
                         } else {
                             pkts_tx.fetch_add(1, Ordering::Relaxed);
@@ -592,7 +702,7 @@ impl MobileMediaSession {
         };
 
         let digit_owned = digit.to_string();
-        let socket = self.rtp_socket.clone();
+        let socket = current_socket(&self.rtp_socket);
         let remote_addr = self.remote_addr.clone();
         let ssrc = self.ssrc;
 
@@ -731,6 +841,10 @@ impl MobileMediaSession {
             .srtp_in
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(inbound);
+        *self
+            .local_srtp_key
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(local_key.to_string());
         log::info!("SRTP enabled for this call");
         Ok(())
     }
@@ -1235,7 +1349,7 @@ pub async fn create_answer_session(
     let session = MobileMediaSession::new(remote_addr, chosen).await?;
 
     // Use the actual RTP socket for STUN so NAT mapping matches
-    let local_ip = advertised_ip(stun_on(session.rtp_socket_ref(), "answer"), STUN_BUDGET).await;
+    let local_ip = advertised_ip(stun_on(&session.rtp_socket(), "answer"), STUN_BUDGET).await;
     let answer_sdp = build_sdp_answer(session.local_port(), &local_ip, chosen);
 
     Ok((session, answer_sdp))
@@ -1255,7 +1369,7 @@ pub async fn create_offer_session(
 
     // Discover public IP using the ACTUAL RTP socket so the NAT mapping matches.
     // If we use a different socket, the NAT mapping won't match and RTP won't flow.
-    let local_ip = advertised_ip(stun_on(session.rtp_socket_ref(), "offer"), STUN_BUDGET).await;
+    let local_ip = advertised_ip(stun_on(&session.rtp_socket(), "offer"), STUN_BUDGET).await;
 
     let codecs = if preferred_codecs.is_empty() {
         vec![AudioCodec::Pcmu, AudioCodec::Pcma, AudioCodec::Opus]

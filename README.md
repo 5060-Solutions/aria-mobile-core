@@ -82,9 +82,47 @@ An engine constructed with an empty `api_key` has no token: methods that need th
 
 ## Gateway failover
 
-When the gateway domain has SRV records, `register_device` resolves them into an ordered list of gateway instances. A request moves to the next instance only when it could not connect, so it was certainly never delivered. A timeout or a reset after sending is returned as an error instead, so a non-idempotent request such as `POST /v1/calls` is never sent twice and the callee never rings twice. A call lives on one instance. Everything after it is placed or offered (accept, reject, cancel, status polls, hangup, transfer) goes to that instance, never to whichever one is first. `POST /v1/calls` may take up to 45 s, longer than the gateway's 30 s INVITE timeout, so the gateway rather than the client decides that an unanswered call has failed.
+**Which name.** For an `https://` base URL the core looks up the SRV record `_sips._tcp.<gateway host>` (for `http://`, `_sip._tcp.<host>`) through `register_device`. For production that is `_sips._tcp.push.ariaroute.com`. With no SRV records, it uses the base URL's own A/AAAA records on its port (443). Each SRV target becomes one gateway *instance*. Requests to it keep the gateway's domain in the URL, so TLS is checked against `push.ariaroute.com`, while the connection goes to the target's address. So every instance must serve a certificate for the gateway domain. Targets are ordered by priority, and the first one is the *preferred* instance.
 
-A call dialed while another call is live (connected, ringing, or being accepted) is pinned to that call's instance: it is placed there only, with no failover, and fails if that instance cannot be reached. The PBX joins two calls in an attended transfer only when both reach it from the same gateway (the same source IP), and the gateway can only refer a pair of calls it holds itself, so a consultation call placed through another instance could never complete the transfer.
+**One instance holds the device.** An instance pushes, and places calls for, only devices registered on it, and instances share no state. So the device is registered on exactly one instance at a time. `current_gateway()` returns that instance as `host:port`.
+
+- New calls, incoming-call offers (`handle_push_notification`) and network-change heartbeats go to that instance first. An offer the instance does not know (404) is looked up on the other instances in turn. The registration may have moved after the push was sent.
+- **Failover.** When that instance cannot be connected to, the device is registered on the next instance in SRV order, and `on_registration_changed` reports `registered` with the new `device_id`. This happens when a new call is placed, where the call then goes to the new instance, or on a network-change heartbeat. Connect failures are the only trigger, so a request that may have been delivered is never sent twice.
+- **Failback.** While the device is on a lower-priority instance, the preferred one is probed with `GET /health`: after 30 s, then 60 s, and so on up to 5 min, each ±20 %. Once it answers and no call is live (connected, ringing or being answered), the device registers there again. The registration on the instance it leaves is then removed (`DELETE /v1/devices/{id}`), and `registered` is reported with the new `device_id`.
+- **A live call never moves.** A call lives on one instance. Everything after it is placed or offered (accept, reject, cancel, status polls, hangup, transfer, media updates) goes to that instance, never to whichever is first. A call dialed while another is live is pinned to that call's instance with no failover. The PBX joins two calls in an attended transfer only when both reach it from the same gateway. If a live call's instance stops answering, the call is ended once, with `Ended` and reason `Failed`. That happens after 15 s if another instance answers meanwhile (the instance is gone), or after 60 s in any case. A phone that is itself offline reaches no instance, so a handover or a short outage does not end the call.
+
+`POST /v1/calls` may take up to 45 s, longer than the gateway's 30 s INVITE timeout, so the gateway rather than the client decides that an unanswered call has failed.
+
+## Network changes
+
+Call `notify_network_change()` on every network path change: Wi-Fi to cellular or back, a new IP address, connectivity regained, and when the app returns to the foreground. It returns at once and recovers in the background. A burst of changes is coalesced: one pass runs, then one more if changes arrived meanwhile.
+
+1. **Live calls move first, at once.** For each connected call, held or not:
+   - The RTP socket is rebound on the interface that now routes.
+   - STUN on the new socket finds its public address. This takes at most 1.5 s; after that the interface address is used.
+   - Audio goes out from the new socket from the next 20 ms frame.
+   - The core sends the new SDP offer (`POST /v1/calls/{token}/media`) to the call's gateway instance, which re-INVITEs the PBX. The PBX's media relay then sends to and accepts from the new address. The PBX relay does this only from the release with the re-point on re-INVITE; with an older PBX, audio does not resume after a mid-call address change.
+
+   The call is never ended by this, whatever the outcome. A gateway without the route (404) or a PBX refusal is logged, and the call stays up.
+2. **The gateway SRV name is looked up again.**
+3. **The registration is checked.** The core sends a heartbeat to the instance holding the device, and the gateway re-registers SIP with a fresh flow:
+   - If the instance no longer knows the device (404/410), the device registers again.
+   - If the instance cannot be reached, the registration fails over (see above).
+   - If the token is refused (401), `on_auth_required` fires, and recovery resumes by itself when `set_gateway_token` is called.
+
+Progress is reported through `on_registration_changed(device_id, status, error)`. Apps no longer need to re-register to verify the link.
+
+| `status` | Meaning | Suggested UI |
+|---|---|---|
+| `recovering` | A network change is being recovered from | "Reconnecting..." (amber), calls continue |
+| `registered` | Registered (again). `device_id` is current, and may be new after a move | normal |
+| `failed` | Recovery failed; `error` says why. Incoming calls may not arrive until the next network change or `register_device` | "Offline" (red), retry on the next path change |
+| `auth_required` | The gateway refused the token. Fetch a new one and call `set_gateway_token` | as `recovering` while the token is fetched |
+| `unregistered` | After `unregister_device` | |
+
+Push stays the incoming path in every case. The gateway keeps the SIP registration and wakes the phone through APNs/FCM, so an incoming call reaches a phone whose own sockets are dead or suspended.
+
+`CallInfo.codec` carries the negotiated codec's SDP name (`PCMU`, `PCMA`, `opus`, `G729`) once the call has media.
 
 ## One-click setup links
 
@@ -204,11 +242,11 @@ Apps can be fully event-driven: install a `MobileEventHandler` with `set_event_h
 
 **Not carried by events.** `duration_secs` is not maintained by the core, so time calls from the `Connected` event.
 
-**Other callbacks.** `on_registration_changed` reports `"registered"` after `register_device` or `update_push_token` succeeds and `"unregistered"` after `unregister_device`. `on_auth_required` is described below. `on_error` fires with context `"hangup"` when a call has ended locally but the gateway did not confirm hanging it up, even after one retry on the call's own gateway instance. A 404 is the usual cause: the gateway does not know the call, because it lost it or was asked with the wrong token. The message names the call_id, and the other party may still be connected. `on_media_stats` is not currently emitted; read `get_media_stats` when stats are needed.
+**Other callbacks.** `on_registration_changed` reports `"registered"` after `register_device` or `update_push_token` succeeds and `"unregistered"` after `unregister_device`, and the network-change statuses described under "Network changes". `on_auth_required` is described below. `on_error` fires with context `"hangup"` when a call has ended locally but the gateway did not confirm hanging it up, even after one retry on the call's own gateway instance. A 404 is the usual cause: the gateway does not know the call, because it lost it or was asked with the wrong token. The message names the call_id, and the other party may still be connected. `on_media_stats` is not currently emitted; read `get_media_stats` when stats are needed.
 
 **Hangup never blocks.** `hangup` tears the call down locally, queues `Ended` and returns. The gateway hangup, bounded by a 5 s timeout, or the cancel for a ringing call runs in the background. `hangup` throws `AuthenticationError` only when there is no gateway token at all, after ending the call locally and without sending anything.
 
-**Token expiry (`on_auth_required`).** A gateway 401 means the gateway token is missing, expired or revoked. Engine methods that wait on the gateway report it by throwing `AuthenticationError`. Background work cannot throw, so it calls `on_auth_required()` instead. That covers the call-status polls, the caller-cancel watch on an offered incoming call, the network-change heartbeat, `hangup`'s gateway hangup or cancel, and hanging up an outgoing call that was answered after it was cancelled. `on_auth_required` fires at most once per token. It fires again only after `set_gateway_token` has been called and the new token is rejected as well, and a 401 for a token that has already been replaced is ignored. The app should fetch a new token from the PBX (`POST /api/v1/devices/{id}/gateway-token`) and call `set_gateway_token`. A rejected poll never ends a call: the call stays up, polling continues, and it uses the new token once one is set. Until then a remote hangup cannot be detected.
+**Token expiry (`on_auth_required`).** A gateway 401 means the gateway token is missing, expired or revoked. Engine methods that wait on the gateway report it by throwing `AuthenticationError`. Background work cannot throw, so it calls `on_auth_required()` instead. That covers the call-status polls, the caller-cancel watch on an offered incoming call, the network-change heartbeat and media update, `hangup`'s gateway hangup or cancel, and hanging up an outgoing call that was answered after it was cancelled. `on_auth_required` fires at most once per token. It fires again only after `set_gateway_token` has been called and the new token is rejected as well, and a 401 for a token that has already been replaced is ignored. The app should fetch a new token from the PBX (`POST /api/v1/devices/{id}/gateway-token`) and call `set_gateway_token`. A rejected poll never ends a call: the call stays up, polling continues, and it uses the new token once one is set. Until then a remote hangup cannot be detected.
 
 **Call waiting.** Up to two calls can be live at once: connected (held or not), outgoing and ringing, or incoming and being accepted. Outside a conference (below), at most one connected call is off hold; only that call plays to the speaker, reads the microphone and feeds the AI tap, while a held call's RTP keeps flowing (silence out, inbound dropped). Hold is local: no re-INVITE is sent. A third `make_call`, `make_call_with_id` or `accept_incoming_call` throws `InvalidState` without sending or reporting anything, and a refused `make_call_with_id` does not use up its id. Incoming offers are not limited: `handle_push_notification` still returns a third call so the app can show it and `reject_incoming_call` it. When the active call ends, a held call stays held until the app resumes it. `get_calls` lists the live calls, oldest first.
 

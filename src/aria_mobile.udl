@@ -171,6 +171,9 @@ dictionary CallInfo {
     /// This call is being recorded to a WAV file (`start_recording`).
     /// False on the `Ended` event: recording stops when the call ends.
     boolean recording = false;
+    /// The negotiated audio codec by its SDP name (`PCMU`, `PCMA`, `opus`,
+    /// `G729`), once the call has media; null before then.
+    string? codec = null;
 };
 
 /// Audio codec selection.
@@ -220,7 +223,15 @@ callback interface PlatformAudioBridge {
 /// blocking ones, but should not block for long themselves. See the
 /// "Event contract" section of the README for the guaranteed sequence.
 callback interface MobileEventHandler {
-    /// Called when registration state changes.
+    /// Called when registration state changes. `status` is one of:
+    /// `registered` (after `register_device`, `update_push_token`, a
+    /// network-change recovery, or a move to another gateway instance; the
+    /// `device_id` may then be new: use the latest one), `unregistered`,
+    /// `recovering` (a network change is being recovered from), `failed`
+    /// (`error` says why; incoming calls may not arrive until the next
+    /// network change or `register_device` succeeds), and `auth_required`
+    /// (the token was refused: `on_auth_required` has fired; recovery
+    /// resumes by itself after `set_gateway_token`).
     void on_registration_changed(string device_id, string status, string? error);
 
     /// Called when an incoming call arrives (via push notification).
@@ -268,8 +279,16 @@ interface AriaMobileEngine {
 
     /// Replace the bearer token used for all gateway requests, including the
     /// background call-status polls. Pass a token fetched from the PBX
-    /// (`POST /api/v1/devices/{id}/gateway-token`). Does not re-register.
+    /// (`POST /api/v1/devices/{id}/gateway-token`). Does not re-register,
+    /// except that a network-change recovery that stopped at a 401
+    /// (`auth_required`) resumes with the new token.
     void set_gateway_token(string token);
+
+    /// The gateway instance holding this device's registration, as
+    /// `host:port` (the SRV target, e.g. `gw2.ariaroute.com:443`), or null
+    /// before `register_device`. For diagnostics: it changes on failover and
+    /// failback.
+    string? current_gateway();
 
     // ── Device Registration ─────────────────────────────────────────
 
@@ -505,11 +524,16 @@ interface AriaMobileEngine {
     /// Set the preferred audio codec order.
     void set_codec_preferences(sequence<AudioCodec> codecs);
 
-    /// Notify the core of a network connectivity change.
-    /// Call this from the platform when WiFi/cellular changes, or after reconnect.
-    /// Returns at once. The gateway heartbeat it triggers runs in the
-    /// background, and a burst of changes is coalesced: at most one heartbeat
-    /// is in flight, followed by one more if changes arrived meanwhile.
+    /// Notify the core of a network path change: Wi-Fi/cellular switch, a
+    /// new IP, back online, and on returning to the foreground. Returns at
+    /// once; recovery runs in the background (README "Network changes"):
+    /// live calls move their media to the new network at once (new RTP
+    /// socket, STUN, re-INVITE through the gateway) and are never ended by
+    /// it; the gateway SRV name is looked up again; the registration is
+    /// heartbeated, re-registered or moved to another gateway instance.
+    /// Progress is reported through `on_registration_changed`
+    /// (`recovering`, then `registered`, `failed` or `auth_required`).
+    /// A burst of changes is coalesced.
     void notify_network_change();
 
     // ── On-device AI ────────────────────────────────────────────────────────

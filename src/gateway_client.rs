@@ -72,7 +72,57 @@ pub struct GatewayClient {
     /// Building the URL as `https://<ip>:<port>` instead makes rustls reject
     /// the certificate on a hostname mismatch, which broke HTTPS failover.
     resolved_targets: RwLock<Vec<Route>>,
+    /// The instance holding this device's registration. New calls, offers
+    /// and heartbeats go there first: an instance only places calls for, and
+    /// pushes, devices registered on it.
+    registered: RwLock<Option<Route>>,
 }
+
+/// `host:port` of a URL (the URL itself if it does not parse).
+fn authority_of(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(u) => match (u.host_str(), u.port_or_known_default()) {
+            (Some(h), Some(p)) => format!("{h}:{p}"),
+            (Some(h), None) => h.to_string(),
+            _ => url.to_string(),
+        },
+        Err(_) => url.to_string(),
+    }
+}
+
+/// How a device heartbeat went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeartbeatOutcome {
+    /// The instance re-registered the device's SIP binding.
+    Ok,
+    /// The instance does not know the device (404/410): register again.
+    UnknownDevice,
+    /// The token was refused (401).
+    Unauthorized,
+    /// The instance could not be connected to: it is down or unreachable.
+    Unreachable,
+    /// Anything else (a timeout, a 5xx).
+    Failed(String),
+}
+
+/// Why `POST /v1/calls` failed.
+#[derive(Debug)]
+pub enum MakeCallFailure {
+    /// The instance could not be connected to, so the request was never
+    /// delivered and may be sent elsewhere.
+    NotDelivered,
+    /// Anything else.
+    Error(MobileError),
+}
+
+impl From<MobileError> for MakeCallFailure {
+    fn from(e: MobileError) -> Self {
+        Self::Error(e)
+    }
+}
+
+/// Timeout of a `/health` probe.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Build a failover URL that keeps `domain` as the host (so TLS validates
 /// against it) using the target `port`. The port is omitted when it is the
@@ -213,15 +263,32 @@ fn enforce_https(base_url: String) -> String {
 pub struct Route {
     url: String,
     client: reqwest::Client,
+    /// Which instance this is: the SRV target `host:port` (several routes
+    /// share one URL, since each keeps the gateway's domain), or the base
+    /// URL's authority when there is no SRV.
+    target: String,
 }
 
 impl std::fmt::Debug for Route {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Route").field(&self.url).finish()
+        f.debug_tuple("Route")
+            .field(&self.url)
+            .field(&self.target)
+            .finish()
     }
 }
 
 impl Route {
+    /// Whether both name the same gateway instance.
+    pub fn same(&self, other: &Route) -> bool {
+        self.url == other.url && self.target == other.target
+    }
+
+    /// The instance, as `host:port`.
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.url.trim_end_matches('/'), path)
     }
@@ -282,6 +349,7 @@ impl GatewayClient {
             base_url: enforce_https(base_url),
             http,
             resolved_targets: RwLock::new(Vec::new()),
+            registered: RwLock::new(None),
         }
     }
 
@@ -299,6 +367,18 @@ impl GatewayClient {
     /// The routes to try, in priority order: the SRV targets when resolved,
     /// otherwise the base URL alone.
     pub fn routes(&self) -> Vec<Route> {
+        let mut routes = self.srv_routes();
+        if let Some(reg) = self.registered_route() {
+            if let Some(i) = routes.iter().position(|r| r.same(&reg)) {
+                let r = routes.remove(i);
+                routes.insert(0, r);
+            }
+        }
+        routes
+    }
+
+    /// The routes in SRV order (the first is the preferred instance).
+    pub fn srv_routes(&self) -> Vec<Route> {
         let resolved = self
             .resolved_targets
             .read()
@@ -310,14 +390,74 @@ impl GatewayClient {
         }
     }
 
+    /// The instance holding the device registration, if any.
+    pub fn registered_route(&self) -> Option<Route> {
+        self.registered
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn set_registered_route(&self, route: Option<Route>) {
+        *self
+            .registered
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = route;
+    }
+
+    /// After a new SRV answer: point the registration at the route object
+    /// of the same instance in the new list (fresh pinned client), if it is
+    /// still there.
+    fn reconcile_registered(&self) {
+        let Some(reg) = self.registered_route() else {
+            return;
+        };
+        if let Some(fresh) = self.srv_routes().into_iter().find(|r| r.same(&reg)) {
+            self.set_registered_route(Some(fresh));
+        }
+    }
+
+    /// Whether the registration is on the preferred (first SRV) instance.
+    pub fn registered_on_preferred(&self) -> bool {
+        match (self.registered_route(), self.srv_routes().first()) {
+            (Some(reg), Some(first)) => reg.same(first),
+            _ => true,
+        }
+    }
+
+    /// `GET /health` on `route`: whether the instance answers.
+    pub async fn health(&self, route: &Route) -> bool {
+        matches!(
+            route
+                .client
+                .get(route.url("/health"))
+                .timeout(HEALTH_TIMEOUT)
+                .send()
+                .await,
+            Ok(r) if r.status().is_success()
+        )
+    }
+
+    /// Whether any instance other than `except` answers `/health`.
+    pub async fn another_instance_up(&self, except: &Route) -> bool {
+        for r in self.srv_routes() {
+            if !r.same(except) && self.health(&r).await {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Replace the failover routes, standing in for SRV resolution in tests.
     #[cfg(test)]
     pub fn set_test_routes(&self, urls: &[&str]) {
+        self.set_registered_route(None);
         *self.resolved_targets.write().unwrap() = urls
             .iter()
             .map(|u| Route {
                 url: u.to_string(),
                 client: self.http.clone(),
+                target: authority_of(u),
             })
             .collect();
     }
@@ -331,6 +471,7 @@ impl GatewayClient {
         resolved.first().cloned().unwrap_or_else(|| Route {
             url: self.base_url.clone(),
             client: self.http.clone(),
+            target: authority_of(&self.base_url),
         })
     }
 
@@ -425,6 +566,7 @@ impl GatewayClient {
                     .map(|t| Route {
                         url: build_target_url(scheme, &domain, t.port, path_prefix),
                         client: Self::build_pinned_client(&domain, t.addr),
+                        target: format!("{}:{}", t.host, t.port),
                     })
                     .collect();
 
@@ -440,6 +582,7 @@ impl GatewayClient {
                     .resolved_targets
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = routes;
+                self.reconcile_registered();
             }
             Ok(_) => {
                 log::debug!("No SRV targets for gateway domain {}", domain);
@@ -455,12 +598,14 @@ impl GatewayClient {
         Ok(())
     }
 
-    /// Register a device with the push gateway, with SRV failover.
-    pub async fn register_device(
+    /// Register on the first of `routes` that can be connected to; the
+    /// route that took it becomes the registered instance.
+    pub async fn register_device_on(
         &self,
+        routes: Vec<Route>,
         token: &str,
         registration: &DeviceRegistration,
-    ) -> Result<DeviceRegistrationResponse, MobileError> {
+    ) -> Result<(DeviceRegistrationResponse, Route), MobileError> {
         // Let the gateway handle SIP registrar resolution itself —
         // passing a resolved IP:port can break the gateway's DNS parser.
         let req = RegisterDeviceRequest {
@@ -477,39 +622,111 @@ impl GatewayClient {
             sip_display_name: registration.sip.display_name.clone(),
         };
 
-        let (resp, _) = self
-            .send("Device registration", |r| {
-                r.client
-                    .post(r.url("/v1/devices"))
-                    .bearer_auth(token)
-                    .json(&req)
-            })
-            .await?;
+        let (resp, route) = Self::send_on(routes, "Device registration", |r| {
+            r.client
+                .post(r.url("/v1/devices"))
+                .bearer_auth(token)
+                .json(&req)
+        })
+        .await?;
         if !resp.status().is_success() {
             log::error!("Device registration failed: {}", resp.status());
             return Err(status_error(resp.status(), MobileError::RegistrationFailed));
         }
         let body: RegisterDeviceResponse = read_json_capped(resp).await?;
-        Ok(DeviceRegistrationResponse {
-            device_id: body.device_id,
-            auth_token: token.to_string(),
-        })
+        log::info!("Device registered on gateway instance {}", route.target);
+        self.set_registered_route(Some(route.clone()));
+        Ok((
+            DeviceRegistrationResponse {
+                device_id: body.device_id,
+                auth_token: token.to_string(),
+            },
+            route,
+        ))
     }
 
-    /// Send a device heartbeat — forces SIP re-registration after network change.
-    pub async fn device_heartbeat(&self, token: &str, device_id: &str) -> Result<(), MobileError> {
+    /// Heartbeat on the instance holding the registration (no failover:
+    /// another instance does not know the device).
+    pub async fn heartbeat_on(
+        &self,
+        route: &Route,
+        token: &str,
+        device_id: &str,
+    ) -> HeartbeatOutcome {
         let path = format!("/v1/devices/{device_id}/heartbeat");
-        let (resp, _) = self
-            .send("Device heartbeat", |r| {
-                r.client.post(r.url(&path)).bearer_auth(token)
-            })
-            .await?;
-        if resp.status().is_success() {
-            log::info!("Device heartbeat successful for {}", device_id);
-            return Ok(());
+        match route
+            .client
+            .post(route.url(&path))
+            .bearer_auth(token)
+            .send()
+            .await
+        {
+            Ok(resp) => match resp.status().as_u16() {
+                s if (200..300).contains(&s) => HeartbeatOutcome::Ok,
+                401 => HeartbeatOutcome::Unauthorized,
+                404 | 410 => HeartbeatOutcome::UnknownDevice,
+                s => HeartbeatOutcome::Failed(format!("heartbeat refused (HTTP {s})")),
+            },
+            Err(e) if e.is_connect() => HeartbeatOutcome::Unreachable,
+            Err(e) => HeartbeatOutcome::Failed(e.to_string()),
         }
-        log::warn!("Device heartbeat failed: {}", resp.status());
-        Err(status_error(resp.status(), MobileError::NetworkError))
+    }
+
+    /// Unregister on one instance, best effort (after moving the device).
+    pub async fn unregister_device_on(&self, route: &Route, token: &str, device_id: &str) {
+        let path = format!("/v1/devices/{device_id}");
+        match route
+            .client
+            .delete(route.url(&path))
+            .bearer_auth(token)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() || r.status() == reqwest::StatusCode::NOT_FOUND => {}
+            Ok(r) => log::warn!("Unregister on {} answered {}", route.target, r.status()),
+            Err(e) => log::warn!("Unregister on {} failed: {e}", route.target),
+        }
+    }
+
+    /// Ask the instance holding the call to move its media: the gateway
+    /// re-INVITEs the PBX with `sdp` and returns the PBX's answer.
+    ///
+    /// 404 (unknown call, or a gateway without the route) is
+    /// `InvalidState`; 409 `GatewayError`; 502 `CallFailed`; 504 `Timeout`.
+    pub async fn update_media(
+        &self,
+        route: &Route,
+        token: &str,
+        call_token: &str,
+        sdp: &str,
+    ) -> Result<String, MobileError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            sdp: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct Answer {
+            sdp_answer: String,
+        }
+        let resp = route
+            .client
+            .post(route.url(&format!("/v1/calls/{call_token}/media")))
+            .bearer_auth(token)
+            .json(&Body { sdp })
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            let a: Answer = read_json_capped(resp).await?;
+            return Ok(a.sdp_answer);
+        }
+        Err(match status.as_u16() {
+            401 => MobileError::AuthenticationError,
+            404 => MobileError::InvalidState,
+            502 => MobileError::CallFailed("the PBX refused the new media address".into()),
+            504 => MobileError::Timeout,
+            _ => MobileError::GatewayError,
+        })
     }
 
     /// Unregister a device.
@@ -537,11 +754,32 @@ impl GatewayClient {
         call_token: &str,
     ) -> Result<(CallOffer, Route), MobileError> {
         let path = format!("/v1/calls/{call_token}");
-        let (resp, route) = self
-            .send("Get call offer", |r| {
-                r.client.get(r.url(&path)).bearer_auth(token)
-            })
-            .await?;
+        // The instance holding the registration offered the call, so it is
+        // asked first. A GET is safe to repeat, so a 404 (or a connect
+        // failure) moves on to the other instances: the registration may
+        // have moved after the push was sent.
+        let routes = self.routes();
+        let last = routes.len().saturating_sub(1);
+        let mut found = None;
+        for (i, r) in routes.into_iter().enumerate() {
+            match r.client.get(r.url(&path)).bearer_auth(token).send().await {
+                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND && i < last => {
+                    log::info!("Call offer not on {}; asking the next instance", r.target);
+                }
+                Ok(resp) => {
+                    found = Some((resp, r));
+                    break;
+                }
+                Err(e) if e.is_connect() && i < last => {
+                    log::warn!(
+                        "Get call offer: could not connect to {}; trying next",
+                        r.target
+                    );
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let (resp, route) = found.ok_or(MobileError::NetworkError)?;
 
         if !resp.status().is_success() {
             log::error!("Get call offer failed: {}", resp.status());
@@ -623,6 +861,7 @@ impl GatewayClient {
     ///
     /// See [`Placement`] for where the call goes. Returns the call token, the
     /// SDP answer, and the route.
+    #[cfg(test)]
     pub async fn make_call(
         &self,
         token: &str,
@@ -631,6 +870,25 @@ impl GatewayClient {
         credentials: &crate::types::SipCredentials,
         placement: Placement<'_>,
     ) -> Result<(String, String, Route), MobileError> {
+        self.make_call_detailed(token, destination_uri, sdp_offer, credentials, placement)
+            .await
+            .map_err(|e| match e {
+                MakeCallFailure::NotDelivered => MobileError::NetworkError,
+                MakeCallFailure::Error(e) => e,
+            })
+    }
+
+    /// [`Self::make_call`], telling a request that was never delivered (no
+    /// instance could be connected to) from other failures, so the caller
+    /// can move the registration and try again.
+    pub async fn make_call_detailed(
+        &self,
+        token: &str,
+        destination_uri: &str,
+        sdp_offer: &str,
+        credentials: &crate::types::SipCredentials,
+        placement: Placement<'_>,
+    ) -> Result<(String, String, Route), MakeCallFailure> {
         let Placement {
             client_ref,
             attempt,
@@ -652,46 +910,66 @@ impl GatewayClient {
             client_ref: client_ref.to_string(),
         };
 
-        let routes = match pin {
-            Some(route) => vec![route.clone()],
-            None => self.routes(),
+        // An instance places calls only for devices registered on it, so a
+        // call goes to the registered instance alone; if it cannot be
+        // reached the caller moves the registration and asks again.
+        let routes = match (pin, self.registered_route()) {
+            (Some(route), _) => vec![route.clone()],
+            (None, Some(reg)) => vec![reg],
+            (None, None) => self.routes(),
         };
-        let (resp, route) = Self::send_on(routes, "Make call", |r| {
+        let mut delivered = None;
+        for r in routes {
             *attempt
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(r.clone());
-            r.client
+            match r
+                .client
                 .post(r.url("/v1/calls"))
                 .timeout(MAKE_CALL_TIMEOUT)
                 .bearer_auth(token)
                 .json(&req)
-        })
-        .await?;
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    delivered = Some((resp, r));
+                    break;
+                }
+                Err(e) if e.is_connect() => {
+                    log::warn!("Make call: could not connect to {} ({e})", r.target);
+                }
+                Err(e) => return Err(MakeCallFailure::Error(e.into())),
+            }
+        }
+        let (resp, route) = delivered.ok_or(MakeCallFailure::NotDelivered)?;
         if resp.status() == reqwest::StatusCode::CONFLICT {
             // 409 carries a reason. Only `cancelled` means the call was
             // cancelled through `cancel_call` while it rang; anything else
             // (such as `client_ref_in_use`) is a gateway-side refusal.
             let body: Option<ErrorBody> = read_json_capped(resp).await.ok();
-            return Err(match body.as_ref().map(|b| b.error.as_str()) {
-                Some("cancelled") => {
-                    log::info!("Outgoing call cancelled at the gateway");
-                    MobileError::Cancelled
-                }
-                other => {
-                    log::error!("Make call refused with 409: {:?}", other);
-                    MobileError::GatewayError
-                }
-            });
+            return Err(MakeCallFailure::Error(
+                match body.as_ref().map(|b| b.error.as_str()) {
+                    Some("cancelled") => {
+                        log::info!("Outgoing call cancelled at the gateway");
+                        MobileError::Cancelled
+                    }
+                    other => {
+                        log::error!("Make call refused with 409: {:?}", other);
+                        MobileError::GatewayError
+                    }
+                },
+            ));
         }
         if !resp.status().is_success() {
             log::error!("Make call failed: {}", resp.status());
-            return Err(status_error(
+            return Err(MakeCallFailure::Error(status_error(
                 resp.status(),
                 MobileError::CallFailed(format!(
                     "the call did not connect (HTTP {})",
                     resp.status()
                 )),
-            ));
+            )));
         }
         let body: MakeCallResponse = read_json_capped(resp).await?;
         Ok((body.call_token, body.sdp_answer, route))

@@ -11,7 +11,10 @@ pub mod dns;
 mod events;
 mod gateway_client;
 mod media;
+#[cfg(test)]
+mod net_tests;
 mod provision;
+mod registration;
 mod types;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -132,6 +135,17 @@ struct TransferLeg<'a> {
 
 /// How often a call's status is polled at the gateway.
 const CALL_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// STUN budget when a live call's media moves to a new socket after a
+/// network change: shorter than at call setup, since audio is waiting.
+const REBIND_STUN_BUDGET: Duration = Duration::from_millis(1500);
+
+/// A live call whose gateway instance cannot be reached is ended (once,
+/// `Failed`) after this long if another instance answers meanwhile (the
+/// instance is gone, not this phone's network)...
+const INSTANCE_LOST_AFTER: Duration = Duration::from_secs(15);
+/// ...or after this long whatever else answers.
+const INSTANCE_LOST_ALONE_AFTER: Duration = Duration::from_secs(60);
 
 /// Tell the app that background work had the gateway token of `generation`
 /// rejected, unless it has already been told about this token.
@@ -528,7 +542,7 @@ pub struct AriaMobileEngine {
     /// Outgoing calls that are ringing, keyed by call_id. A call moves from
     /// here to `calls` when it is answered. When both locks are held, `calls`
     /// is taken first.
-    pending_outgoing: Mutex<OutgoingCalls>,
+    pending_outgoing: Arc<Mutex<OutgoingCalls>>,
     /// Call tokens `accept_incoming_call` is accepting, counted against
     /// [`MAX_LIVE_CALLS`] until the call is in `calls` or the accept failed.
     /// Lock order: `calls`, then `pending_outgoing`, then this.
@@ -538,8 +552,19 @@ pub struct AriaMobileEngine {
     /// The PBX-issued gateway token. Shared with the status-poll threads so
     /// they pick up a token replaced by `set_gateway_token`.
     auth: Arc<auth::GatewayAuth>,
-    /// Registered device ID
+    /// Registered device ID (shared with `registrar`)
     device_id: Arc<RwLock<Option<String>>>,
+    /// Which gateway instance holds the registration; failover, failback
+    /// and network-change recovery.
+    registrar: Arc<registration::Registrar>,
+    /// How long STUN may take when a live call's media is moved to a new
+    /// socket after a network change. A field so tests can shorten it.
+    rebind_stun_budget: Duration,
+    /// (`INSTANCE_LOST_AFTER`, `INSTANCE_LOST_ALONE_AFTER`); fields so tests
+    /// can shorten them.
+    instance_lost_after: (Duration, Duration),
+    /// Advertise this address in a re-offer instead of asking STUN (tests).
+    advertise_override: Option<String>,
     /// Network-change heartbeats: at most one in flight, latest wins.
     heartbeat: Arc<Mutex<HeartbeatState>>,
     /// On-device AI, created by `ai_init`. `None` until a host asks for it, so
@@ -550,7 +575,7 @@ pub struct AriaMobileEngine {
     /// The most recent device registration, retained so `update_push_token`
     /// can re-register with a rotated push token without the app re-supplying
     /// the full SIP credentials.
-    last_registration: RwLock<Option<DeviceRegistration>>,
+    last_registration: Arc<RwLock<Option<DeviceRegistration>>>,
     /// Call IDs that were ended by the remote party (detected via polling).
     /// Kept for apps that still poll `check_remote_hangup()`; the `Ended`
     /// event has already been emitted by the time an ID lands here.
@@ -745,26 +770,40 @@ struct ActiveCallState {
 
 impl AriaMobileEngine {
     pub fn new(gateway_config: GatewayConfig) -> Self {
-        Self {
-            gateway: Arc::new(gateway_client::GatewayClient::new(gateway_config.base_url)),
-            events: Arc::new(Dispatcher::new()),
+        let gateway = Arc::new(gateway_client::GatewayClient::new(gateway_config.base_url));
+        let events = Arc::new(Dispatcher::new());
+        let auth = Arc::new(auth::GatewayAuth::new(gateway_config.api_key));
+        let registrar = registration::Registrar::new(
+            Arc::clone(&gateway),
+            Arc::clone(&auth),
+            Arc::clone(&events),
+        );
+        let engine = Self {
+            gateway,
+            events,
+            device_id: Arc::clone(&registrar.device_id),
+            last_registration: Arc::clone(&registrar.last),
+            registrar,
+            rebind_stun_budget: REBIND_STUN_BUDGET,
+            instance_lost_after: (INSTANCE_LOST_AFTER, INSTANCE_LOST_ALONE_AFTER),
+            advertise_override: None,
             audio_bridge: RwLock::new(None),
             calls: Arc::new(Mutex::new(HashMap::new())),
             pending_incoming: Arc::new(Mutex::new(HashMap::new())),
-            pending_outgoing: Mutex::new(OutgoingCalls::default()),
+            pending_outgoing: Arc::new(Mutex::new(OutgoingCalls::default())),
             accepting: Mutex::new(HashSet::new()),
             next_seq: AtomicU64::new(0),
-            auth: Arc::new(auth::GatewayAuth::new(gateway_config.api_key)),
-            device_id: Arc::new(RwLock::new(None)),
+            auth,
             heartbeat: Arc::default(),
             ai: RwLock::new(None),
             codec_prefs: RwLock::new(vec![AudioCodec::Opus, AudioCodec::Pcmu, AudioCodec::Pcma]),
-            last_registration: RwLock::new(None),
             remote_ended: Arc::new(Mutex::new(Vec::new())),
             poll_interval: CALL_STATUS_POLL_INTERVAL,
             transfer_poll_interval: TRANSFER_POLL_INTERVAL,
             transfer_timeout: TRANSFER_TIMEOUT,
-        }
+        };
+        engine.registrar.set_busy(engine.busy_check());
+        engine
     }
 
     pub fn set_event_handler(&self, handler: Box<dyn MobileEventHandler>) {
@@ -789,6 +828,42 @@ impl AriaMobileEngine {
     /// one. Background polls pick the new token up on their next request.
     pub fn set_gateway_token(&self, token: String) {
         self.auth.set(token);
+        // A network-change recovery that stopped at a 401 resumes with it.
+        if self.registrar.auth_blocked.swap(false, Ordering::SeqCst) {
+            log::info!("New gateway token: resuming registration recovery");
+            self.request_recovery(false);
+        }
+    }
+
+    /// The gateway instance holding this device's registration, as
+    /// `host:port` (the SRV target), or `None` before `register_device`.
+    pub fn current_gateway(&self) -> Option<String> {
+        self.gateway
+            .registered_route()
+            .map(|r| r.target().to_string())
+    }
+
+    /// Whether any call is live or being set up (a registration is never
+    /// moved then).
+    fn busy_check(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        let calls = Arc::clone(&self.calls);
+        let incoming = Arc::clone(&self.pending_incoming);
+        let outgoing = Arc::clone(&self.pending_outgoing);
+        move || {
+            !calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+                || !incoming
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty()
+                || !outgoing
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .ringing
+                    .is_empty()
+        }
     }
 
     // ── Device Registration ─────────────────────────────────────────
@@ -803,32 +878,18 @@ impl AriaMobileEngine {
             // or `set_gateway_token`. The core does not mint tokens.
             let token = self.auth.token()?;
 
+            let _ = token;
+
             // Pick up SRV failover targets before the first request.
             let _ = self.gateway.resolve_gateway().await;
 
-            // Register the device
-            let resp = self.gateway.register_device(&token, &registration).await?;
-
-            // Retain the registration so a later push-token rotation can
+            // Register on the instance already holding the device, else the
+            // first in SRV order that can be connected to. The registration
+            // is retained so a push-token rotation or a failover can
             // re-register without the app re-supplying SIP credentials.
-            {
-                let mut last = self
-                    .last_registration
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                *last = Some(registration.clone());
-            }
-
-            {
-                let mut d = self.device_id.write().unwrap();
-                *d = Some(resp.device_id.clone());
-            }
-
-            let device_id = resp.device_id.clone();
-            self.events
-                .registration_changed(device_id, "registered".to_string(), None);
-
-            Ok(resp)
+            self.registrar
+                .register_on(self.gateway.routes(), &registration)
+                .await
         })
     }
 
@@ -839,12 +900,19 @@ impl AriaMobileEngine {
             self.gateway.unregister_device(&token, &device_id).await?;
 
             {
-                let mut d = self.device_id.write().unwrap();
+                let mut d = self
+                    .device_id
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 *d = None;
             }
+            self.gateway.set_registered_route(None);
 
-            self.events
-                .registration_changed(device_id, "unregistered".to_string(), None);
+            self.events.registration_changed(
+                device_id,
+                registration::status::UNREGISTERED.to_string(),
+                None,
+            );
 
             Ok(())
         })
@@ -1012,6 +1080,7 @@ impl AriaMobileEngine {
             end_reason: None,
             in_conference: false,
             recording: false,
+            codec: media.as_ref().map(media::MobileMediaSession::codec_name),
         };
 
         // From here an `active` status is this handset answering.
@@ -1279,6 +1348,7 @@ impl AriaMobileEngine {
             end_reason: None,
             in_conference: false,
             recording: false,
+            codec: None,
         };
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         let (outcome_tx, outcome_rx) = tokio::sync::watch::channel(None);
@@ -1409,10 +1479,11 @@ impl AriaMobileEngine {
         // 409; but a gateway without the cancel route, or a call answered
         // first, means the call can only be hung up once its token arrives.
         let gateway = Arc::clone(&self.gateway);
+        let registrar = Arc::clone(&self.registrar);
         let destination = uri.clone();
         let mut request = tokio::spawn(async move {
-            let result = gateway
-                .make_call(
+            let place = || {
+                gateway.make_call_detailed(
                     &token,
                     &destination,
                     &sdp_offer,
@@ -1423,9 +1494,26 @@ impl AriaMobileEngine {
                         pin: pin.as_ref(),
                     },
                 )
-                .await;
+            };
+            let mut result = place().await;
+            // The registered instance could not be connected to, so the
+            // request was never delivered: move the registration to another
+            // instance and place the call there. Not for a call pinned to
+            // another live call's instance, which must not move.
+            if matches!(result, Err(gateway_client::MakeCallFailure::NotDelivered)) && pin.is_none()
+            {
+                if let Some(dead) = gateway.registered_route() {
+                    match registrar.move_off(&dead).await {
+                        Ok(()) => result = place().await,
+                        Err(e) => log::warn!("Could not move the registration: {e}"),
+                    }
+                }
+            }
             let _ = done_tx.send(true);
-            result
+            result.map_err(|e| match e {
+                gateway_client::MakeCallFailure::NotDelivered => MobileError::NetworkError,
+                gateway_client::MakeCallFailure::Error(e) => e,
+            })
         });
 
         let answer = tokio::select! {
@@ -1479,6 +1567,7 @@ impl AriaMobileEngine {
 
         // Transition to connected
         info.state = CallState::Connected;
+        info.codec = media.as_ref().map(media::MobileMediaSession::codec_name);
         let poll_stop = Arc::new(AtomicBool::new(false));
 
         // Move the call from pending to active in one step with respect to
@@ -1611,6 +1700,7 @@ impl AriaMobileEngine {
                         end_reason: None,
                         in_conference: false,
                         recording: false,
+                        codec: None,
                     },
                     EndReason::Cancelled,
                 );
@@ -2263,12 +2353,20 @@ impl AriaMobileEngine {
     /// The thread reads the current gateway token on every poll, so a token
     /// replaced by `set_gateway_token` is picked up rather than polling with
     /// an expired one.
+    ///
+    /// With `watch_instance`, an instance that stops answering is treated as
+    /// gone: once it has been unreachable for [`INSTANCE_LOST_AFTER`] while
+    /// another instance answers (or [`INSTANCE_LOST_ALONE_AFTER`] in any
+    /// case), `on_status` gets `ended` with reason `gateway_lost`. A phone
+    /// that is itself offline reaches no instance, so a short outage or a
+    /// network handover does not end the call.
     fn spawn_status_poll(
         &self,
         route: Route,
         call_token: String,
         stop: Arc<AtomicBool>,
         max_age: Option<Duration>,
+        watch_instance: bool,
         mut on_status: impl FnMut(&CallStatusResponse) -> PollAction + Send + 'static,
     ) {
         let started = Instant::now();
@@ -2276,6 +2374,8 @@ impl AriaMobileEngine {
         let auth = Arc::clone(&self.auth);
         let handler = Arc::clone(&self.events);
         let interval = self.poll_interval;
+        let (lost_after, lost_alone_after) = self.instance_lost_after;
+        let mut unreachable_since: Option<Instant> = None;
 
         // A task on the shared runtime rather than a thread with its own: no
         // thread per call, and the request goes out on the call's own route
@@ -2297,7 +2397,39 @@ impl AriaMobileEngine {
                 // With no token at all the request goes out unauthenticated,
                 // so the gateway's 401 reaches the app the same way.
                 let (token, generation) = auth.snapshot();
-                match gateway.get_call_status(&route, &token, &call_token).await {
+                let polled = gateway.get_call_status(&route, &token, &call_token).await;
+                let polled = match polled {
+                    Err(MobileError::NetworkError | MobileError::Timeout) if watch_instance => {
+                        let since = *unreachable_since.get_or_insert_with(Instant::now);
+                        let down = since.elapsed();
+                        if down >= lost_alone_after
+                            || (down >= lost_after && gateway.another_instance_up(&route).await)
+                        {
+                            log::warn!(
+                                "Gateway instance {} holding {} has been unreachable for {:?}; \
+                                 ending the call",
+                                route.target(),
+                                call_token,
+                                down
+                            );
+                            Ok(CallStatusResponse {
+                                status: "ended".into(),
+                                reason: Some("gateway_lost".into()),
+                                transfer: None,
+                                transfer_code: None,
+                            })
+                        } else {
+                            Err(MobileError::NetworkError)
+                        }
+                    }
+                    other => {
+                        if other.is_ok() {
+                            unreachable_since = None;
+                        }
+                        other
+                    }
+                };
+                match polled {
                     Ok(status) => match on_status(&status) {
                         PollAction::Continue => {}
                         PollAction::Stop => {
@@ -2355,7 +2487,7 @@ impl AriaMobileEngine {
         let remote_ended = Arc::clone(&self.remote_ended);
         let mut gone = GoneDetector::default();
 
-        self.spawn_status_poll(route, call_token, stop, None, move |status| {
+        self.spawn_status_poll(route, call_token, stop, None, true, move |status| {
             if !gone.is_gone(&status.status) {
                 return PollAction::Continue;
             }
@@ -2431,6 +2563,7 @@ impl AriaMobileEngine {
                         end_reason: None,
                         in_conference: false,
                         recording: false,
+                        codec: None,
                     },
                     events: Arc::clone(&events),
                     accepting: false,
@@ -2450,7 +2583,7 @@ impl AriaMobileEngine {
         let mut gone = GoneDetector::default();
 
         let deadline = Some(PENDING_INCOMING_MAX_WATCH);
-        self.spawn_status_poll(route, call_token, stop, deadline, move |status| {
+        self.spawn_status_poll(route, call_token, stop, deadline, false, move |status| {
             // Decided under the pending lock, against accept, reject and
             // abandonment.
             let mut pending = pending
@@ -2769,50 +2902,108 @@ impl AriaMobileEngine {
         *prefs = codecs;
     }
 
-    /// Notify the core that the network has changed (WiFi→cellular, reconnect, etc.).
+    /// Notify the core that the network path changed (Wi-Fi to cellular, a
+    /// new IP address, back online, the app returning to the foreground).
     ///
-    /// Called by the platform (Android/iOS) when it detects a connectivity change.
-    /// Re-registers the device with the push gateway if a device_id is set,
-    /// and notifies active media sessions to rebind their sockets.
+    /// Recovery runs in the background, coalesced (a burst of changes runs
+    /// it once more after the current pass, not once per change):
+    ///
+    /// 1. Every live call is moved at once: its RTP socket is rebound on the
+    ///    interface that now routes, STUN finds its public address (1.5 s at
+    ///    most), audio is sent from the new socket from the next 20 ms frame,
+    ///    and the gateway is asked (`POST /v1/calls/{token}/media`) to
+    ///    re-INVITE the PBX with the new address. The call is never ended by
+    ///    this, whatever the outcome.
+    /// 2. The gateway's SRV name is looked up again.
+    /// 3. The registration is checked with a heartbeat on the instance
+    ///    holding it: registered again if that instance no longer knows the
+    ///    device, moved to another instance if it cannot be reached.
+    ///    `on_registration_changed` reports `recovering`, then `registered`,
+    ///    `failed` (with the reason) or `auth_required` (after
+    ///    `on_auth_required`; recovery resumes by itself on
+    ///    `set_gateway_token`).
     pub fn notify_network_change(&self) {
         log::info!("Network change detected by platform");
+        self.request_recovery(true);
+    }
 
-        // Send a heartbeat to the push gateway, which re-registers SIP with a
-        // fresh socket. Network changes come in bursts, so heartbeats are
-        // coalesced: at most one is in flight, and changes during it lead to
-        // one more afterwards, using the device and token current then.
-        {
-            let mut heartbeat = self
-                .heartbeat
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            heartbeat.requested = true;
-            if heartbeat.running {
-                log::debug!("Heartbeat already in flight; coalescing");
-            } else {
-                heartbeat.running = true;
-                self.spawn_heartbeats();
-            }
+    /// Run (or queue one more) recovery pass; `media` also moves live calls.
+    fn request_recovery(&self, media: bool) {
+        if media {
+            self.move_live_media();
         }
+        let mut heartbeat = self
+            .heartbeat
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        heartbeat.requested = true;
+        if heartbeat.running {
+            log::debug!("Recovery already in flight; coalescing");
+        } else {
+            heartbeat.running = true;
+            self.spawn_recovery();
+        }
+    }
 
-        let active_count = self.calls.lock().unwrap().len();
-        if active_count > 0 {
-            log::info!(
-                "Network change with {} active call(s) — media sockets will rebind on next packet",
-                active_count
-            );
+    /// Rebind every live call's media and send its new address to the
+    /// gateway, each call in its own task.
+    fn move_live_media(&self) {
+        let live: Vec<(String, media::Rebinder, Route, String)> = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter_map(|c| {
+                Some((
+                    c.info.call_id.clone(),
+                    c.media.as_ref()?.rebinder(),
+                    c.route.clone(),
+                    c.call_token.clone()?,
+                ))
+            })
+            .collect();
+        for (call_id, rebinder, route, call_token) in live {
+            let gateway = Arc::clone(&self.gateway);
+            let auth = Arc::clone(&self.auth);
+            let events = Arc::clone(&self.events);
+            let budget = self.rebind_stun_budget;
+            let advertise = self.advertise_override.clone();
+            runtime().spawn(async move {
+                let (port, ip) = match rebinder.rebind(budget, advertise).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::warn!("Could not rebind media of {call_id}: {e}");
+                        return;
+                    }
+                };
+                let sdp = rebinder.reoffer_sdp(&ip, port);
+                let (token, generation) = auth.snapshot();
+                match gateway
+                    .update_media(&route, &token, &call_token, &sdp)
+                    .await
+                {
+                    Ok(answer) => {
+                        rebinder.apply_answer(&answer);
+                        log::info!("Media of {call_id} moved to {ip}:{port}");
+                    }
+                    Err(MobileError::AuthenticationError) => {
+                        report_auth_rejected(&auth, &events, generation);
+                    }
+                    Err(e) => log::warn!(
+                        "Gateway did not move the media of {call_id} ({e}); \
+                         audio continues if the PBX follows the new source"
+                    ),
+                }
+            });
         }
     }
 }
 
 impl AriaMobileEngine {
-    /// Send heartbeats until no network change is waiting for one.
-    fn spawn_heartbeats(&self) {
+    /// Recover until no network change is waiting.
+    fn spawn_recovery(&self) {
         let state = Arc::clone(&self.heartbeat);
-        let device_id = Arc::clone(&self.device_id);
-        let gateway = Arc::clone(&self.gateway);
-        let auth = Arc::clone(&self.auth);
-        let handler = Arc::clone(&self.events);
+        let registrar = Arc::clone(&self.registrar);
         runtime().spawn(async move {
             loop {
                 {
@@ -2825,20 +3016,10 @@ impl AriaMobileEngine {
                     }
                     state.requested = false;
                 }
-                let did = device_id
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                let Some(did) = did else { continue };
-                let (tok, generation) = auth.snapshot();
-                log::info!("Sending heartbeat for device {} after network change", did);
-                match gateway.device_heartbeat(&tok, &did).await {
-                    Ok(()) => log::info!("Gateway heartbeat successful after network change"),
-                    Err(MobileError::AuthenticationError) => {
-                        report_auth_rejected(&auth, &handler, generation);
-                    }
-                    Err(e) => log::warn!("Gateway heartbeat failed: {}", e),
+                if let Err(e) = registrar.recover().await {
+                    log::warn!("Registration recovery failed: {e}");
                 }
+                registrar.ensure_failback();
             }
         });
     }
@@ -3060,6 +3241,7 @@ mod tests {
                     end_reason: None,
                     in_conference: false,
                     recording: false,
+                    codec: None,
                 },
                 seq: engine.next_seq.fetch_add(1, Ordering::Relaxed),
                 media: None,
@@ -4450,6 +4632,7 @@ mod tests {
             end_reason: None,
             in_conference: false,
             recording: false,
+            codec: None,
         };
         assert!(events.emit(&engine.events, info(CallState::Ringing)));
         assert!(events.emit(&engine.events, info(CallState::Ended)));
