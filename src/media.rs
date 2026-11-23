@@ -133,7 +133,13 @@ impl Rebinder {
             .port();
         let ip = match advertise {
             Some(ip) => ip,
-            None => advertised_ip(stun_on(&socket, "rebind"), stun_budget).await,
+            None => {
+                let peer = *self
+                    .remote_addr
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                advertised_ip(stun_on(&socket, "rebind"), stun_budget, Some(peer)).await
+            }
         };
         let old = std::mem::replace(
             &mut *self
@@ -259,7 +265,10 @@ impl MobileMediaSession {
 
     /// Update the remote RTP address (e.g., after receiving SDP answer).
     pub fn update_remote(&self, addr: SocketAddr) {
-        *self.remote_addr.lock().unwrap() = addr;
+        *self
+            .remote_addr
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = addr;
         log::info!("Remote RTP address updated to {}", addr);
     }
 
@@ -341,7 +350,9 @@ impl MobileMediaSession {
                         // rtp-engine's own session latches correctly; this loop
                         // was reimplemented by hand and dropped it.
                         {
-                            let mut addr = remote_addr.lock().unwrap();
+                            let mut addr = remote_addr
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             if addr.port() == 0 {
                                 log::info!("Learned remote RTP address: {src}");
                                 *addr = src;
@@ -496,7 +507,9 @@ impl MobileMediaSession {
                     while running.load(Ordering::Relaxed) {
                         tokio::time::sleep(frame_duration).await;
 
-                        let remote = *remote_addr.lock().unwrap();
+                        let remote = *remote_addr
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         if remote.port() == 0 {
                             continue; // no remote yet
                         }
@@ -714,7 +727,9 @@ impl MobileMediaSession {
                 .unwrap();
 
             rt.block_on(async move {
-                let remote = *remote_addr.lock().unwrap();
+                let remote = *remote_addr
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if remote.port() == 0 {
                     log::warn!("Cannot send DTMF: no remote address");
                     return;
@@ -1349,7 +1364,12 @@ pub async fn create_answer_session(
     let session = MobileMediaSession::new(remote_addr, chosen).await?;
 
     // Use the actual RTP socket for STUN so NAT mapping matches
-    let local_ip = advertised_ip(stun_on(&session.rtp_socket(), "answer"), STUN_BUDGET).await;
+    let local_ip = advertised_ip(
+        stun_on(&session.rtp_socket(), "answer"),
+        STUN_BUDGET,
+        Some(remote_addr),
+    )
+    .await;
     let answer_sdp = build_sdp_answer(session.local_port(), &local_ip, chosen);
 
     Ok((session, answer_sdp))
@@ -1369,7 +1389,7 @@ pub async fn create_offer_session(
 
     // Discover public IP using the ACTUAL RTP socket so the NAT mapping matches.
     // If we use a different socket, the NAT mapping won't match and RTP won't flow.
-    let local_ip = advertised_ip(stun_on(&session.rtp_socket(), "offer"), STUN_BUDGET).await;
+    let local_ip = advertised_ip(stun_on(&session.rtp_socket(), "offer"), STUN_BUDGET, None).await;
 
     let codecs = if preferred_codecs.is_empty() {
         vec![AudioCodec::Pcmu, AudioCodec::Pcma, AudioCodec::Opus]
@@ -1435,25 +1455,30 @@ async fn stun_on(socket: &UdpSocket, label: &'static str) -> Option<String> {
 pub(crate) async fn advertised_ip(
     discovery: impl std::future::Future<Output = Option<String>>,
     budget: std::time::Duration,
+    towards: Option<SocketAddr>,
 ) -> String {
     match tokio::time::timeout(budget, discovery).await {
         Ok(Some(ip)) => ip,
         Ok(None) => {
             log::warn!("STUN failed; advertising the local interface address");
-            local_interface_ip().await
+            local_interface_ip_towards(towards).await
         }
         Err(_) => {
             log::warn!("STUN took over {budget:?}; advertising the local interface address");
-            local_interface_ip().await
+            local_interface_ip_towards(towards).await
         }
     }
 }
 
-/// The address of the interface that routes to the internet. Connecting a
-/// UDP socket only consults the routing table; nothing is sent.
-async fn local_interface_ip() -> String {
+/// The address of the interface that routes to `towards` (the media peer,
+/// when known), else to the internet at large. Connecting a UDP socket only
+/// consults the routing table; nothing is sent.
+pub(crate) async fn local_interface_ip_towards(towards: Option<SocketAddr>) -> String {
+    let target = towards
+        .filter(|a| !a.ip().is_unspecified() && a.port() != 0)
+        .unwrap_or_else(|| SocketAddr::from(([8, 8, 8, 8], 80)));
     if let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await {
-        if sock.connect("8.8.8.8:80").await.is_ok() {
+        if sock.connect(target).await.is_ok() {
             if let Ok(addr) = sock.local_addr() {
                 return addr.ip().to_string();
             }

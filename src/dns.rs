@@ -87,7 +87,10 @@ impl SrvResolver {
 
         // Check cache first
         {
-            let cache = self.cache.lock().unwrap();
+            let cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(entry) = cache.get(&srv_name) {
                 if entry.expires > Instant::now() {
                     log::debug!("SRV cache hit for {}", srv_name);
@@ -229,7 +232,10 @@ impl SrvResolver {
 
     /// Store targets in the cache with a given TTL.
     fn cache_targets(&self, key: &str, targets: &[SrvTarget], ttl: Duration) {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.insert(
             key.to_string(),
             CacheEntry {
@@ -239,10 +245,19 @@ impl SrvResolver {
         );
     }
 
-    /// Clear the DNS cache (useful after network changes).
-    #[allow(dead_code)]
+    /// Poison the cache lock, as a panic while holding it would (tests).
+    #[cfg(test)]
+    pub fn poison_cache_for_test(&self) {
+        let _guard = self.cache.lock();
+        panic!("poisoning the DNS cache lock");
+    }
+
+    /// Clear the DNS cache (after a network change).
     pub fn clear_cache(&self) {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.clear();
         log::debug!("DNS SRV cache cleared");
     }
