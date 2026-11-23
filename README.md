@@ -86,6 +86,18 @@ When the gateway domain has SRV records, `register_device` resolves them into an
 
 A call dialed while another call is live (connected, ringing, or being accepted) is pinned to that call's instance: it is placed there only, with no failover, and fails if that instance cannot be reached. The PBX joins two calls in an attended transfer only when both reach it from the same gateway (the same source IP), and the gateway can only refer a pair of calls it holds itself, so a consultation call placed through another instance could never complete the transfer.
 
+## One-click setup links
+
+`provision_preview(link)` and `provision_redeem(link)` implement the desktop softphone's setup-link contract, so the same link works on every platform. They are namespace functions: no engine is needed, and they block (call them off the UI thread).
+
+A link is `aria://provision?v=1&url=<percent-encoded https://HOST/provision/softphone/<token>>`. The prefix is matched case-insensitively with an optional `/`; there must be exactly one `v`, equal to `1`, and exactly one non-empty `url`. A legacy QR link (`aria://provision?server=...&user=...`, no `v`) throws `InvalidLink`, so the app falls back to its own parser for it.
+
+1. `provision_preview(link)` sends `GET` to the URL and returns `ProvisionPreview` (tenant, extension, display name, domain, optional expiry, and `server_host`, the `host[:port]` of the setup server). It does not use the link up. Show it, including `server_host`, and ask the user to confirm.
+2. Only after the user confirms, `provision_redeem(link)` sends `POST` to the same URL, which uses the link up, and returns `ProvisionedAccount` (username, optional auth username, password, domain, transport, port, optional outbound proxy, voicemail and SRTP mode, tenant and display name, `server_host`). The returned username and domain must equal the previewed extension and domain (domain case-insensitively), or it throws `Mismatch` and nothing should be saved. If the link was not previewed in this process, a preview is fetched first and the redeem is held to that.
+3. The app then logs in with `POST /api/v1/auth/extension-login` using `username`, `password` and `domain`, as after a QR scan. Keep the password in the Keychain / Keystore.
+
+Rules, refused before any request with `InvalidLink`: the URL must be `https` (never plain http, not even to localhost), carry no userinfo, and have the path `/provision/softphone/` followed by a non-empty token. While fetching: redirects are not followed (a 3xx is `Server`), each request times out after 10 s (`Network`), replies over 16 KB are refused (`Server`), a 404 means the link expired or was already used (`Expired`), and any other non-200, non-JSON reply, `v` other than 1, or unusable field is `Server`. Fields that end up in SIP headers are checked (extension and username: SIP user characters, at most 64; domain and proxy: host names; password: no control characters); display text has quotes, backslashes, angle brackets and control characters removed. `transport` defaults to `tls`; a `port` of 0 or none means DNS SRV; `outbound_proxy` is normalised to `host` or `host:port` (its own port, else the top-level one). Error messages are written for the user and never contain the link or token; the core never logs them either.
+
 ## Call Flows
 
 ### Incoming (via push)

@@ -65,6 +65,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Streaming response bodies with a size cap (prevents OOM from a hostile gateway)
 futures-util = { version = "0.3", default-features = false }
 
+# Query decoding for setup links (already in the tree through reqwest)
+url = "2"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
