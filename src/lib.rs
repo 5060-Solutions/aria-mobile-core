@@ -11,6 +11,7 @@ pub mod dns;
 mod events;
 mod gateway_client;
 mod media;
+mod provision;
 mod types;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -23,6 +24,9 @@ pub mod ai;
 use events::{CallEvents, Dispatcher};
 use gateway_client::Route;
 pub use media::PlatformAudioBridge;
+pub use provision::{
+    provision_preview, provision_redeem, ProvisionError, ProvisionPreview, ProvisionedAccount,
+};
 /// The API's public types (`CallInfo`, `MobileError`, `SipCredentials`, ...),
 /// re-exported so Rust crates can use the engine directly, not only through
 /// the generated bindings.

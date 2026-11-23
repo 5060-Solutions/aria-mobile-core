@@ -7,6 +7,60 @@ namespace aria_mobile {
 
     /// A fresh `outgoing-<uuid>` call_id for `make_call_with_id`.
     string new_outgoing_call_id();
+
+    /// Fetch the preview of a one-click setup link
+    /// (`aria://provision?v=1&url=<https://HOST/provision/softphone/TOKEN>`)
+    /// with `GET`. Does not use the link up. Show it and ask the user to
+    /// confirm before `provision_redeem`. Blocks for up to about 10 s; call it
+    /// off the UI thread. A legacy QR link (no `v=1`) throws `InvalidLink`:
+    /// parse those as before.
+    [Throws=ProvisionError]
+    ProvisionPreview provision_preview(string link);
+
+    /// Redeem a setup link with `POST`, using it up, after the user confirmed
+    /// its preview. Throws `Mismatch` when the server returns a different
+    /// extension or domain than the preview showed (if the link was not
+    /// previewed in this process, a preview is fetched first). Then log in
+    /// with `extension-login` using `username`, `password` and `domain`.
+    /// Blocks for up to about 20 s; call it off the UI thread.
+    [Throws=ProvisionError]
+    ProvisionedAccount provision_redeem(string link);
+};
+
+/// What a setup link would add, for the confirmation screen. Nothing secret.
+dictionary ProvisionPreview {
+    string tenant_name;
+    string extension;
+    string display_name;
+    string domain;
+    string? expires_at;
+    /// `host[:port]` of the setup server: who is setting the line up.
+    string server_host;
+};
+
+/// The credentials a redeemed setup link returned. Store `password` in the
+/// Keychain / Keystore; never log it.
+dictionary ProvisionedAccount {
+    string username;
+    string? auth_username;
+    string password;
+    /// Lower-cased.
+    string domain;
+    /// "udp", "tcp", "tls" or "auto"; "tls" when the server sent none.
+    string transport;
+    /// 0 when the server sent none (resolve through DNS SRV).
+    u16 port;
+    /// `host` or `host:port`, lower-cased, without a `sip:` prefix.
+    string? outbound_proxy;
+    /// Digits and `*#+` only.
+    string? voicemail;
+    /// "sdes" or "disabled"; absent otherwise.
+    string? srtp;
+    string tenant_name;
+    /// The username when the server sent no display name.
+    string display_name;
+    /// `host[:port]` of the setup server.
+    string server_host;
 };
 
 /// Configuration for connecting to the push gateway.
@@ -571,4 +625,22 @@ enum MobileError {
     /// both incoming or both outgoing. It needs one call this phone received
     /// and one it placed. Both calls stay up.
     "TransferUnsupported",
+};
+
+/// Why a setup link could not be used. The message is written for the user
+/// and never contains the link or its token.
+[Error]
+enum ProvisionError {
+    /// Not a version-1 `aria://provision` link, or its URL breaks the rules:
+    /// not https, has userinfo, not `/provision/softphone/<token>`.
+    "InvalidLink",
+    /// The server answered 404: unknown, already used, or expired.
+    "Expired",
+    /// The server could not be reached or did not answer within 10 s.
+    "Network",
+    /// The redeem returned a different line than the preview showed.
+    "Mismatch",
+    /// Any other reply: a non-200 status (redirects are not followed), more
+    /// than 16 KB, not JSON, `v` other than 1, or an unusable field.
+    "Server",
 };
