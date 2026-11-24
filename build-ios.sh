@@ -24,7 +24,6 @@ if [ "$MODE" = "release" ]; then
 fi
 
 cd "$SCRIPT_DIR"
-export CMAKE_POLICY_VERSION_MINIMUM=3.5
 
 echo "=== Building aria-mobile-core for iOS ($MODE) ==="
 
