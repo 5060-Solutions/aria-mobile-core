@@ -2290,3 +2290,53 @@ pub(crate) mod recording_tests {
         }
     }
 }
+
+/// Opus goes through the same `rtp_engine::codec` factory the media pipeline
+/// uses, so this proves the libopus this crate links (opusic-sys, libopus 1.6.1
+/// since rtp-engine 07b937b) encodes and decodes for every target that runs it.
+#[cfg(test)]
+mod opus_codec_tests {
+    use rtp_engine::codec::{create_decoder, create_encoder};
+    use rtp_engine::CodecType;
+
+    /// One 20 ms frame of a 1 kHz tone at 48 kHz.
+    fn tone_frame(frame: usize) -> Vec<i16> {
+        (0..960)
+            .map(|i| {
+                let t = (frame * 960 + i) as f64 / 48_000.0;
+                (8000.0 * (2.0 * std::f64::consts::PI * 1000.0 * t).sin()) as i16
+            })
+            .collect()
+    }
+
+    fn rms(pcm: &[i16]) -> f64 {
+        (pcm.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / pcm.len() as f64).sqrt()
+    }
+
+    #[test]
+    fn opus_round_trips_a_tone_through_the_engine_codecs() {
+        let mut enc = create_encoder(CodecType::Opus).expect("Opus encoder");
+        let mut dec = create_decoder(CodecType::Opus).expect("Opus decoder");
+        let input_rms = rms(&tone_frame(0));
+        for frame in 0..10 {
+            let mut packet = Vec::new();
+            enc.encode(&tone_frame(frame), &mut packet);
+            assert!(
+                !packet.is_empty() && packet.len() < 400,
+                "frame {frame}: unexpected Opus packet of {} bytes",
+                packet.len()
+            );
+            let mut pcm = Vec::new();
+            dec.decode(&packet, &mut pcm);
+            assert_eq!(pcm.len(), 960, "frame {frame}: one 20 ms frame decoded");
+            // Past the codec's start-up, the tone comes back at a similar level.
+            if frame >= 5 {
+                let ratio = rms(&pcm) / input_rms;
+                assert!(
+                    (0.5..1.5).contains(&ratio),
+                    "frame {frame}: decoded level {ratio:.2}x the input"
+                );
+            }
+        }
+    }
+}

@@ -53,8 +53,12 @@ aria-ai-core = { path = "../aria-ai-core", optional = true, default-features = f
     "insights",
 ] }
 
-# RTP media engine (no device feature on mobile — we use platform audio)
-rtp-engine = { git = "https://github.com/5060-Solutions/rtp-engine.git", default-features = false, features = ["g711", "opus", "srtp"] }
+# RTP media engine (no device feature on mobile — we use platform audio).
+# Pinned, because Cargo.lock is not committed: 07b937b builds Opus through
+# opusic-c / opusic-sys (reference libopus 1.6.1 from source, CMake >= 3.16,
+# pre-generated bindings), replacing audiopus. Only one libopus may be linked
+# into the app, so nothing else in the mobile stack may pull audiopus.
+rtp-engine = { git = "https://github.com/5060-Solutions/rtp-engine.git", rev = "07b937b87bf2d1187940227dec06b0e40f3a32fd", default-features = false, features = ["g711", "opus", "srtp"] }
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "macros"] }

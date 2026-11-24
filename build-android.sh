@@ -38,7 +38,6 @@ if [ -z "$PREBUILT" ]; then
     exit 1
 fi
 export PATH="$PREBUILT/bin:$PATH"
-export CMAKE_POLICY_VERSION_MINIMUM=3.5
 
 CARGO_FLAGS=""
 TARGET_DIR="debug"
