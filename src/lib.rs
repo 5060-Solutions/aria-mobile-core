@@ -952,6 +952,23 @@ impl AriaMobileEngine {
         self.register_device(registration).map(|_| ())
     }
 
+    pub fn update_alert_token(
+        &self,
+        _device_id: String,
+        alert_token: Option<String>,
+    ) -> Result<(), MobileError> {
+        // Same upsert as `update_push_token`, for the APNs alert token.
+        let mut registration = {
+            let last = self
+                .last_registration
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            last.clone().ok_or(MobileError::InvalidState)?
+        };
+        registration.alert_token = alert_token;
+        self.register_device(registration).map(|_| ())
+    }
+
     // ── Incoming Call Handling ───────────────────────────────────────
 
     pub fn handle_push_notification(
@@ -4445,6 +4462,7 @@ mod tests {
             platform: "android".into(),
             push_token: "push".into(),
             bundle_id: None,
+            alert_token: None,
             sip: SipCredentials {
                 username: "1001".into(),
                 password: "pw".into(),
@@ -4492,6 +4510,35 @@ mod tests {
                 ("/v1/calls/tok/hangup", Some("Bearer rotated")),
             ]
         );
+    }
+
+    #[test]
+    fn alert_token_is_sent_at_registration_and_on_update() {
+        let gw = MockGateway::start(|_| (200, r#"{"device_id":"d1","status":"ok"}"#.into()));
+        let (engine, _) = engine(&gw.base_url);
+        let mut reg = registration();
+        reg.platform = "ios".into();
+        reg.alert_token = Some("ab12".into());
+        engine.register_device(reg).unwrap();
+        engine
+            .update_push_token("d1".into(), "push2".into())
+            .unwrap();
+        engine
+            .update_alert_token("d1".into(), Some("cd34".into()))
+            .unwrap();
+        engine.update_alert_token("d1".into(), None).unwrap();
+
+        let bodies: Vec<serde_json::Value> = gw
+            .requests()
+            .iter()
+            .map(|r| serde_json::from_str(&r.body).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 4);
+        assert_eq!(bodies[0]["alert_token"], "ab12");
+        assert_eq!(bodies[1]["alert_token"], "ab12");
+        assert_eq!(bodies[1]["push_token"], "push2");
+        assert_eq!(bodies[2]["alert_token"], "cd34");
+        assert!(bodies[3]["alert_token"].is_null());
     }
 
     #[test]

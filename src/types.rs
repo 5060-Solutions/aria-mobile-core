@@ -26,6 +26,8 @@ pub struct DeviceRegistration {
     pub platform: String,
     pub push_token: String,
     pub bundle_id: Option<String>,
+    /// iOS only: the regular APNs device token (hex), for text-message alerts.
+    pub alert_token: Option<String>,
     pub sip: SipCredentials,
 }
 

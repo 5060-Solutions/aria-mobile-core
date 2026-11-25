@@ -21,6 +21,7 @@ fn registration() -> DeviceRegistration {
         platform: "ios".into(),
         push_token: "push".into(),
         bundle_id: None,
+        alert_token: None,
         sip: SipCredentials {
             username: "1001".into(),
             password: "the-sip-password".into(),
