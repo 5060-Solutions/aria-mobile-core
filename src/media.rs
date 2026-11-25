@@ -79,6 +79,9 @@ pub struct MobileMediaSession {
     offered_srtp_key: Arc<Mutex<Option<String>>>,
     /// Our SRTP key once SRTP is on, offered again in a re-offer.
     local_srtp_key: Arc<Mutex<Option<String>>>,
+    /// The peer's SRTP key in use, to tell a re-keying answer from one that
+    /// repeats the key (whose context, rollover counter and all, is kept).
+    remote_srtp_key: Arc<Mutex<Option<String>>>,
     /// The local conference this call is mixed into, and its leg there.
     /// `None` outside a conference. Read per frame by both RTP threads.
     conference: ConferenceSlot,
@@ -107,7 +110,72 @@ pub struct Rebinder {
     local_port: Arc<AtomicU16>,
     remote_addr: Arc<Mutex<SocketAddr>>,
     codec: AudioCodec,
-    local_srtp_key: Arc<Mutex<Option<String>>>,
+    srtp: SrtpSlots,
+}
+
+/// Shared handles on a session's SRTP state, for [`Rebinder`].
+#[derive(Clone)]
+struct SrtpSlots {
+    out: Arc<Mutex<Option<rtp_engine::srtp::SrtpContext>>>,
+    inbound: Arc<Mutex<Option<rtp_engine::srtp::SrtpContext>>>,
+    local_key: Arc<Mutex<Option<String>>>,
+    remote_key: Arc<Mutex<Option<String>>>,
+}
+
+fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl SrtpSlots {
+    fn active(&self) -> bool {
+        locked(&self.out).is_some()
+    }
+
+    /// Install `local_key` (protects what we send) and `remote_key` (opens
+    /// what we receive). A key that is already in use keeps its context, so
+    /// its rollover counter and replay window carry on.
+    fn install(&self, local_key: &str, remote_key: &str) -> Result<(), MobileError> {
+        let same_local = locked(&self.local_key).as_deref() == Some(local_key) && self.active();
+        let same_remote = locked(&self.remote_key).as_deref() == Some(remote_key)
+            && locked(&self.inbound).is_some();
+        let out = if same_local {
+            None
+        } else {
+            Some(
+                rtp_engine::srtp::SrtpContext::from_base64(local_key).map_err(|e| {
+                    log::error!("SRTP: our own key material was rejected: {e}");
+                    MobileError::MediaError
+                })?,
+            )
+        };
+        let inbound = if same_remote {
+            None
+        } else {
+            Some(
+                rtp_engine::srtp::SrtpContext::from_base64(remote_key).map_err(|e| {
+                    log::error!("SRTP: peer key material was rejected: {e}");
+                    MobileError::MediaError
+                })?,
+            )
+        };
+        if let Some(out) = out {
+            *locked(&self.out) = Some(out);
+        }
+        if let Some(inbound) = inbound {
+            *locked(&self.inbound) = Some(inbound);
+        }
+        *locked(&self.local_key) = Some(local_key.to_string());
+        *locked(&self.remote_key) = Some(remote_key.to_string());
+        Ok(())
+    }
+
+    /// Turn SRTP off: media is plain RTP from the next packet. Our key is
+    /// kept, so a later re-offer asks for SRTP again.
+    fn disable(&self) {
+        *locked(&self.out) = None;
+        *locked(&self.inbound) = None;
+        *locked(&self.remote_key) = None;
+    }
 }
 
 impl Rebinder {
@@ -157,26 +225,52 @@ impl Rebinder {
     }
 
     /// An SDP offer for the session's current socket: its codec only (the
-    /// call has one), and its SRTP key again if SRTP is on.
+    /// call has one), and, on a call that has ever agreed SRTP, RTP/SAVP with
+    /// the same key again, so a network change never quietly asks for plain
+    /// RTP. A call that was plain from the start is re-offered plain: asking
+    /// a peer that declined SRTP for it again could get the move refused.
     pub fn reoffer_sdp(&self, ip: &str, port: u16) -> String {
-        let key = self
-            .local_srtp_key
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let key = locked(&self.srtp.local_key).clone();
         build_sdp_offer(port, ip, &[self.codec], key.as_deref())
     }
 
-    /// Apply the answer to a re-offer: send to the address it gives.
-    pub fn apply_answer(&self, sdp: &str) {
+    /// Apply the answer to a re-offer: send to the address it gives, and
+    /// follow its crypto line. Returns whether media is encrypted afterwards.
+    ///
+    /// - The same key: SRTP carries on unchanged.
+    /// - A new key: the inbound context is replaced (the peer re-keyed).
+    /// - No crypto line to an offer that had one: the peer has stopped
+    ///   encrypting, so we do too (sending SRTP it cannot read would leave
+    ///   the call silent). Logged as a warning; the caller re-reports the
+    ///   call with `encrypted = false`.
+    /// - A crypto line on a plain call is ignored: we offered none.
+    pub fn apply_answer(&self, sdp: &str) -> bool {
         if let Some((addr, _)) = parse_sdp_remote(sdp) {
             if !addr.ip().is_unspecified() && addr.port() != 0 {
-                *self
-                    .remote_addr
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = addr;
+                *locked(&self.remote_addr) = addr;
             }
         }
+        let local = locked(&self.srtp.local_key).clone();
+        let Some(local) = local else {
+            return false;
+        };
+        match rtp_engine::srtp::parse_sdp_crypto(sdp) {
+            Some(remote) => {
+                if let Err(e) = self.srtp.install(&local, &remote) {
+                    log::warn!(
+                        "SRTP: unusable key in the re-offer answer ({e}); media is NOT encrypted"
+                    );
+                    self.srtp.disable();
+                }
+            }
+            None => {
+                if self.srtp.active() {
+                    log::warn!("SRTP: the answer to the media re-offer has no crypto line; media is NOT encrypted from now on");
+                }
+                self.srtp.disable();
+            }
+        }
+        self.srtp.active()
     }
 }
 
@@ -218,6 +312,7 @@ impl MobileMediaSession {
             srtp_in: Arc::new(Mutex::new(None)),
             offered_srtp_key: Arc::new(Mutex::new(None)),
             local_srtp_key: Arc::new(Mutex::new(None)),
+            remote_srtp_key: Arc::new(Mutex::new(None)),
             conference: Arc::new(Mutex::new(None)),
             recorder: Arc::new(Mutex::new(None)),
         })
@@ -254,7 +349,16 @@ impl MobileMediaSession {
             local_port: Arc::clone(&self.local_port),
             remote_addr: Arc::clone(&self.remote_addr),
             codec: self.codec,
-            local_srtp_key: Arc::clone(&self.local_srtp_key),
+            srtp: self.srtp_slots(),
+        }
+    }
+
+    fn srtp_slots(&self) -> SrtpSlots {
+        SrtpSlots {
+            out: Arc::clone(&self.srtp_out),
+            inbound: Arc::clone(&self.srtp_in),
+            local_key: Arc::clone(&self.local_srtp_key),
+            remote_key: Arc::clone(&self.remote_srtp_key),
         }
     }
 
@@ -405,7 +509,12 @@ impl MobileMediaSession {
                             continue;
                         }
 
-                        let payload = &buf[header.header_length()..len];
+                        // From the decrypted packet: on an SRTP call `buf` is
+                        // still ciphertext with the auth tag on the end, and
+                        // decoding it played noise.
+                        let Some(payload) = payload_bytes.get(header.header_length()..) else {
+                            continue;
+                        };
                         if payload.is_empty() {
                             continue;
                         }
@@ -812,7 +921,7 @@ impl MobileMediaSession {
     /// [`MobileError::MediaError`] if the peer's key material is unusable.
     pub fn apply_remote_sdp(&self, remote_sdp: &str) -> Result<(), MobileError> {
         let Some(remote_key) = rtp_engine::srtp::parse_sdp_crypto(remote_sdp) else {
-            log::info!("Peer answered without a crypto line; media is plain RTP");
+            log::warn!("SRTP: the answer has no crypto line; media is plain RTP, NOT encrypted");
             return Ok(());
         };
         let local_key = self
@@ -840,26 +949,7 @@ impl MobileMediaSession {
     /// material — SRTP is refused rather than silently downgraded to plain RTP,
     /// which would be the one outcome the user cannot detect.
     pub fn set_srtp_keys(&self, local_key: &str, remote_key: &str) -> Result<(), MobileError> {
-        let out = rtp_engine::srtp::SrtpContext::from_base64(local_key).map_err(|e| {
-            log::error!("SRTP: our own key material was rejected: {e}");
-            MobileError::MediaError
-        })?;
-        let inbound = rtp_engine::srtp::SrtpContext::from_base64(remote_key).map_err(|e| {
-            log::error!("SRTP: peer key material was rejected: {e}");
-            MobileError::MediaError
-        })?;
-        *self
-            .srtp_out
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(out);
-        *self
-            .srtp_in
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(inbound);
-        *self
-            .local_srtp_key
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(local_key.to_string());
+        self.srtp_slots().install(local_key, remote_key)?;
         log::info!("SRTP enabled for this call");
         Ok(())
     }
@@ -1253,15 +1343,29 @@ fn build_sdp_offer(
     sdp.push_str("a=rtpmap:101 telephone-event/8000\r\n");
     sdp.push_str("a=fmtp:101 0-16\r\n");
     if let Some(key) = srtp_key {
+        // The line ends in CRLF already; another would leave an empty line,
+        // which is not valid SDP.
         sdp.push_str(&rtp_engine::srtp::build_sdp_crypto_line(key));
-        sdp.push_str("\r\n");
     }
     sdp.push_str("a=sendrecv\r\n");
 
     sdp
 }
 
-fn build_sdp_answer(local_port: u16, local_ip: &str, chosen_codec: AudioCodec) -> String {
+/// Build an answer. With `crypto` (the offer's tag and our key) the media
+/// line is RTP/SAVP with one crypto line, the suite we support, under the
+/// tag of the offer's line we accepted (RFC 4568 6.1); without, RTP/AVP.
+fn build_sdp_answer(
+    local_port: u16,
+    local_ip: &str,
+    chosen_codec: AudioCodec,
+    crypto: Option<(&str, &str)>,
+) -> String {
+    let profile = if crypto.is_some() {
+        "RTP/SAVP"
+    } else {
+        "RTP/AVP"
+    };
     let pt = chosen_codec.payload_type();
     let name = chosen_codec.name();
     let rate = chosen_codec.clock_rate();
@@ -1272,7 +1376,7 @@ fn build_sdp_answer(local_port: u16, local_ip: &str, chosen_codec: AudioCodec) -
          s=Aria Mobile\r\n\
          c=IN IP4 {local_ip}\r\n\
          t=0 0\r\n\
-         m=audio {local_port} RTP/AVP {pt} 101\r\n"
+         m=audio {local_port} {profile} {pt} 101\r\n"
     );
 
     if chosen_codec == AudioCodec::Opus {
@@ -1284,9 +1388,88 @@ fn build_sdp_answer(local_port: u16, local_ip: &str, chosen_codec: AudioCodec) -
 
     sdp.push_str("a=rtpmap:101 telephone-event/8000\r\n");
     sdp.push_str("a=fmtp:101 0-16\r\n");
+    if let Some((tag, key)) = crypto {
+        sdp.push_str(&format!("a=crypto:{tag} {SRTP_SUITE} inline:{key}\r\n"));
+    }
     sdp.push_str("a=sendrecv\r\n");
 
     sdp
+}
+
+/// The one SDES suite rtp-engine implements.
+const SRTP_SUITE: &str = "AES_CM_128_HMAC_SHA1_80";
+
+/// The transport profile of the first audio media line (`RTP/AVP`,
+/// `RTP/SAVP`, ...), if there is one.
+pub(crate) fn audio_profile(sdp: &str) -> Option<&str> {
+    sdp.lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("m=audio "))
+        .and_then(|l| l.split_whitespace().nth(2))
+}
+
+/// A crypto line of an offer that we can accept: its tag and the peer's
+/// base64 key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OfferedCrypto {
+    pub tag: String,
+    pub key: String,
+}
+
+/// The first crypto line of an `RTP/SAVP` offer that we support:
+/// `AES_CM_128_HMAC_SHA1_80` with one inline key, an optional lifetime and
+/// no MKI, and no session parameters (none of which rtp-engine
+/// implements). `None` for a plain offer, or one with no usable line.
+pub(crate) fn offered_crypto(sdp: &str) -> Option<OfferedCrypto> {
+    if audio_profile(sdp) != Some("RTP/SAVP") {
+        return None;
+    }
+    sdp.lines().map(str::trim).find_map(|line| {
+        let rest = line.strip_prefix("a=crypto:")?;
+        let mut parts = rest.split_whitespace();
+        let tag = parts.next()?;
+        let suite = parts.next()?;
+        let key_params = parts.next()?;
+        if parts.next().is_some()
+            || suite != SRTP_SUITE
+            || !tag.chars().all(|c| c.is_ascii_digit())
+            || key_params.contains(';')
+        {
+            return None;
+        }
+        let mut key_parts = key_params.strip_prefix("inline:")?.split('|');
+        let key = key_parts.next()?;
+        // A lifetime (`2^31` or a number) is fine; an MKI (`1:4`) is not.
+        if key.is_empty() || key_parts.any(|p| p.contains(':')) {
+            return None;
+        }
+        Some(OfferedCrypto {
+            tag: tag.to_string(),
+            key: key.to_string(),
+        })
+    })
+}
+
+/// The plain-RTP form of our SRTP offer: the media line's profile set back
+/// to `RTP/AVP` and the crypto line removed, everything else unchanged.
+/// `None` if `sdp` is not an `RTP/SAVP` offer.
+pub fn plain_rtp_offer(sdp: &str) -> Option<String> {
+    if audio_profile(sdp) != Some("RTP/SAVP") {
+        return None;
+    }
+    let mut out = String::with_capacity(sdp.len());
+    for line in sdp.split_inclusive('\n') {
+        let trimmed = line.trim_end();
+        if trimmed.starts_with("a=crypto:") {
+            continue;
+        }
+        if trimmed.starts_with("m=audio ") {
+            out.push_str(&line.replacen(" RTP/SAVP ", " RTP/AVP ", 1));
+        } else {
+            out.push_str(line);
+        }
+    }
+    Some(out)
 }
 
 /// Parse the remote RTP address and preferred codec from an SDP.
@@ -1370,9 +1553,51 @@ pub async fn create_answer_session(
         Some(remote_addr),
     )
     .await;
-    let answer_sdp = build_sdp_answer(session.local_port(), &local_ip, chosen);
+    let key = answer_srtp(&session, offer_sdp);
+    let answer_sdp = build_sdp_answer(
+        session.local_port(),
+        &local_ip,
+        chosen,
+        key.as_ref().map(|(tag, key)| (tag.as_str(), key.as_str())),
+    );
 
     Ok((session, answer_sdp))
+}
+
+/// Agree SRTP for an incoming call, if the offer asks for it in a way we
+/// support: our own key is generated and both contexts are installed now,
+/// before the RTP threads start, so no frame of an encrypted call is ever
+/// sent or played in the clear. Returns the tag and our key for the answer.
+///
+/// `None` (answer RTP/AVP, media unencrypted, `srtp_active()` false) when
+/// the offer is plain RTP, offers only suites or parameters we do not
+/// support, or carries a key we cannot use.
+fn answer_srtp(session: &MobileMediaSession, offer_sdp: &str) -> Option<(String, String)> {
+    let Some(offered) = offered_crypto(offer_sdp) else {
+        if audio_profile(offer_sdp) == Some("RTP/SAVP") {
+            log::warn!(
+                "SRTP: the offer asks for RTP/SAVP with no crypto line we support; \
+                 answering plain RTP, media is NOT encrypted"
+            );
+        } else {
+            log::warn!("SRTP: the offer is plain RTP; media is NOT encrypted");
+        }
+        return None;
+    };
+    let (_ctx, local) = match rtp_engine::srtp::SrtpContext::generate() {
+        Ok(generated) => generated,
+        Err(e) => {
+            log::error!("SRTP: could not generate key material ({e}); media is NOT encrypted");
+            return None;
+        }
+    };
+    if session.set_srtp_keys(&local, &offered.key).is_err() {
+        log::warn!(
+            "SRTP: the offer's key is unusable; answering plain RTP, media is NOT encrypted"
+        );
+        return None;
+    }
+    Some((offered.tag, local))
 }
 
 /// Create a media session as the offerer (outgoing call).
@@ -1853,7 +2078,253 @@ mod hold_tests {
 
 #[cfg(test)]
 mod srtp_negotiation_tests {
-    use super::{build_sdp_offer, AudioCodec};
+    use super::{
+        audio_profile, build_sdp_answer, build_sdp_offer, offered_crypto, plain_rtp_offer,
+        AudioCodec, MobileMediaSession, OfferedCrypto,
+    };
+
+    const KEY: &str = "WVNfX19zZW1jdGwgKCkgewkyMjA7fQp9CnVubGVz";
+
+    fn offer(profile: &str, crypto: &str) -> String {
+        format!(
+            "v=0\r\no=pbx 1 1 IN IP4 198.51.100.1\r\ns=-\r\nc=IN IP4 198.51.100.1\r\n\
+             t=0 0\r\nm=audio 20000 {profile} 0 101\r\na=rtpmap:0 PCMU/8000\r\n{crypto}"
+        )
+    }
+
+    #[test]
+    fn a_savp_offer_with_our_suite_is_accepted_under_its_tag() {
+        let sdp = offer(
+            "RTP/SAVP",
+            &format!(
+                "a=crypto:1 AES_CM_128_HMAC_SHA1_32 inline:{KEY}\r\n\
+                 a=crypto:2 AES_CM_128_HMAC_SHA1_80 inline:{KEY}|2^31\r\n"
+            ),
+        );
+        assert_eq!(
+            offered_crypto(&sdp),
+            Some(OfferedCrypto {
+                tag: "2".into(),
+                key: KEY.into()
+            })
+        );
+    }
+
+    #[test]
+    fn offers_we_cannot_encrypt_are_not_accepted() {
+        let line = format!("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{KEY}\r\n");
+        // Plain RTP, even with a crypto line.
+        assert_eq!(offered_crypto(&offer("RTP/AVP", &line)), None);
+        // SAVP with no crypto line, or only suites we lack.
+        assert_eq!(offered_crypto(&offer("RTP/SAVP", "")), None);
+        let other = format!("a=crypto:1 AES_256_CM_HMAC_SHA1_80 inline:{KEY}\r\n");
+        assert_eq!(offered_crypto(&offer("RTP/SAVP", &other)), None);
+        // An MKI, or session parameters, which rtp-engine does not implement.
+        let mki = format!("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{KEY}|2^20|1:4\r\n");
+        assert_eq!(offered_crypto(&offer("RTP/SAVP", &mki)), None);
+        let params =
+            format!("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{KEY} UNENCRYPTED_SRTP\r\n");
+        assert_eq!(offered_crypto(&offer("RTP/SAVP", &params)), None);
+    }
+
+    #[test]
+    fn an_answer_with_crypto_is_savp_with_the_offers_tag() {
+        let sdp = build_sdp_answer(10000, "203.0.113.5", AudioCodec::Pcmu, Some(("7", KEY)));
+        assert_eq!(audio_profile(&sdp), Some("RTP/SAVP"));
+        assert!(
+            sdp.contains(&format!(
+                "a=crypto:7 AES_CM_128_HMAC_SHA1_80 inline:{KEY}\r\n"
+            )),
+            "{sdp}"
+        );
+        assert!(!sdp.contains("\r\n\r\n"), "{sdp}");
+        let crypto = sdp.find("a=crypto:").unwrap();
+        assert!(crypto > sdp.find("m=audio").unwrap());
+    }
+
+    #[test]
+    fn an_answer_without_crypto_is_plain_rtp() {
+        let sdp = build_sdp_answer(10000, "203.0.113.5", AudioCodec::Pcmu, None);
+        assert_eq!(audio_profile(&sdp), Some("RTP/AVP"));
+        assert!(!sdp.contains("a=crypto"), "{sdp}");
+    }
+
+    /// The offer's crypto line used to be followed by an empty line, which
+    /// is not valid SDP and which strict parsers refuse.
+    #[test]
+    fn the_srtp_offer_has_no_empty_line() {
+        let sdp = build_sdp_offer(10000, "203.0.113.5", &[AudioCodec::Pcmu], Some(KEY));
+        assert!(!sdp.contains("\r\n\r\n"), "{sdp}");
+        assert!(sdp.ends_with("a=sendrecv\r\n"), "{sdp}");
+    }
+
+    #[test]
+    fn the_plain_form_of_an_srtp_offer_only_drops_srtp() {
+        let savp = build_sdp_offer(
+            10000,
+            "203.0.113.5",
+            &[AudioCodec::Opus, AudioCodec::Pcmu],
+            Some(KEY),
+        );
+        let plain = plain_rtp_offer(&savp).unwrap();
+        assert_eq!(
+            plain,
+            build_sdp_offer(
+                10000,
+                "203.0.113.5",
+                &[AudioCodec::Opus, AudioCodec::Pcmu],
+                None
+            )
+        );
+        assert_eq!(plain_rtp_offer(&plain), None, "already plain");
+    }
+
+    fn rtp(seq: u16) -> Vec<u8> {
+        let mut p = vec![0x80, 0x00];
+        p.extend_from_slice(&seq.to_be_bytes());
+        p.extend_from_slice(&[0, 0, 0, 160, 0, 0, 0, 9]);
+        p.extend_from_slice(&[0x55; 160]);
+        p
+    }
+
+    fn session() -> MobileMediaSession {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(MobileMediaSession::new(
+            "127.0.0.1:9".parse().unwrap(),
+            AudioCodec::Pcmu,
+        ))
+        .unwrap()
+    }
+
+    fn opens(session: &MobileMediaSession, sealed: &[u8]) -> bool {
+        session
+            .srtp_in
+            .lock()
+            .unwrap()
+            .as_mut()
+            .is_some_and(|c| c.unprotect_rtp(sealed).is_ok())
+    }
+
+    /// An incoming SRTP offer: SRTP is installed by `answer_srtp`, before
+    /// any RTP thread runs; the far end's packets open with its key and
+    /// ours seal with the key we answered with.
+    #[test]
+    fn answering_an_srtp_offer_installs_both_keys_at_once() {
+        let (mut far_tx, far_key) = rtp_engine::srtp::SrtpContext::generate().unwrap();
+        let s = session();
+        let offer_sdp = offer(
+            "RTP/SAVP",
+            &format!("a=crypto:3 AES_CM_128_HMAC_SHA1_80 inline:{far_key}\r\n"),
+        );
+
+        let (tag, ours) = super::answer_srtp(&s, &offer_sdp).expect("SRTP agreed");
+
+        assert_eq!(tag, "3");
+        assert!(s.srtp_active());
+        assert!(opens(&s, &far_tx.protect_rtp(&rtp(1)).unwrap()));
+        let sealed = s
+            .srtp_out
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .protect_rtp(&rtp(1))
+            .unwrap();
+        let mut far_rx = rtp_engine::srtp::SrtpContext::from_base64(&ours).unwrap();
+        assert_eq!(far_rx.unprotect_rtp(&sealed).unwrap(), rtp(1));
+    }
+
+    #[test]
+    fn a_plain_offer_installs_no_srtp() {
+        let s = session();
+        assert!(super::answer_srtp(&s, &offer("RTP/AVP", "")).is_none());
+        assert!(!s.srtp_active());
+    }
+
+    #[test]
+    fn an_unusable_offered_key_falls_back_to_plain() {
+        let s = session();
+        let sdp = offer(
+            "RTP/SAVP",
+            "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:c2hvcnQ=\r\n",
+        );
+        assert!(super::answer_srtp(&s, &sdp).is_none());
+        assert!(!s.srtp_active());
+    }
+
+    /// Re-offers: the same key keeps the contexts (and their counters), a
+    /// new peer key replaces the inbound one, and an answer without crypto
+    /// turns SRTP off while the next re-offer still asks for it.
+    #[test]
+    fn reoffer_answers_follow_the_peers_crypto() {
+        let (mut far_tx, far_key) = rtp_engine::srtp::SrtpContext::generate().unwrap();
+        let s = session();
+        let (_, ours) = super::answer_srtp(
+            &s,
+            &offer(
+                "RTP/SAVP",
+                &format!("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{far_key}\r\n"),
+            ),
+        )
+        .unwrap();
+        let rebinder = s.rebinder();
+        let reoffer = rebinder.reoffer_sdp("203.0.113.9", 4000);
+        assert_eq!(audio_profile(&reoffer), Some("RTP/SAVP"));
+        assert_eq!(
+            rtp_engine::srtp::parse_sdp_crypto(&reoffer).as_deref(),
+            Some(ours.as_str())
+        );
+
+        // Same key: the inbound context carries on, so a replay of packet 1
+        // is still refused.
+        let first = far_tx.protect_rtp(&rtp(1)).unwrap();
+        assert!(opens(&s, &first));
+        let same = offer(
+            "RTP/SAVP",
+            &format!("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{far_key}\r\n"),
+        );
+        assert!(rebinder.apply_answer(&same));
+        assert!(!opens(&s, &first), "context kept, replay refused");
+
+        // New key: the new one opens, the old one no longer does.
+        let (mut new_tx, new_key) = rtp_engine::srtp::SrtpContext::generate().unwrap();
+        let rekeyed = offer(
+            "RTP/SAVP",
+            &format!("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{new_key}\r\n"),
+        );
+        assert!(rebinder.apply_answer(&rekeyed));
+        assert!(opens(&s, &new_tx.protect_rtp(&rtp(2)).unwrap()));
+        assert!(!opens(&s, &far_tx.protect_rtp(&rtp(3)).unwrap()));
+
+        // No crypto: plain from now on, and reported so.
+        assert!(!rebinder.apply_answer(&offer("RTP/AVP", "")));
+        assert!(!s.srtp_active());
+        let again = rebinder.reoffer_sdp("203.0.113.9", 4002);
+        assert_eq!(audio_profile(&again), Some("RTP/SAVP"), "asks again");
+
+        // And it comes back if the next answer has crypto.
+        assert!(rebinder.apply_answer(&same));
+        assert!(s.srtp_active());
+    }
+
+    /// A call that was plain from the start is re-offered plain.
+    #[test]
+    fn a_plain_call_is_reoffered_plain() {
+        let s = session();
+        let rebinder = s.rebinder();
+        assert_eq!(
+            audio_profile(&rebinder.reoffer_sdp("203.0.113.9", 4000)),
+            Some("RTP/AVP")
+        );
+        let crypto = offer(
+            "RTP/SAVP",
+            &format!("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{KEY}\r\n"),
+        );
+        assert!(!rebinder.apply_answer(&crypto), "crypto we never offered");
+    }
 
     /// Mobile media was never encrypted: the offer was always RTP/AVP with no
     /// crypto attribute, while the Android network security config claimed

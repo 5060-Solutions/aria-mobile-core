@@ -125,6 +125,10 @@ pub struct CallInfo {
     /// The negotiated audio codec by its SDP name (`PCMU`, `PCMA`, `opus`,
     /// `G729`), once the call has media.
     pub codec: Option<String>,
+    /// Call audio is SRTP-encrypted to the PBX, as actually negotiated (not
+    /// as configured). False until `Connected`, and on any call where the
+    /// far side declined SRTP; see "Media encryption" in the README.
+    pub encrypted: bool,
 }
 
 /// Audio codec selection.

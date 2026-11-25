@@ -111,8 +111,26 @@ pub enum MakeCallFailure {
     /// The instance could not be connected to, so the request was never
     /// delivered and may be sent elsewhere.
     NotDelivered,
+    /// The PBX refused the offered media with 488 Not Acceptable Here,
+    /// reported by the gateway as 502 `{"error":"media_not_acceptable"}`
+    /// (or any error body with `"sip_status":488`). A gateway that does not
+    /// say why gives a bare 502, which is [`Self::Error`].
+    MediaNotAcceptable,
     /// Anything else.
     Error(MobileError),
+}
+
+impl MakeCallFailure {
+    /// The error the app sees.
+    pub fn into_error(self) -> MobileError {
+        match self {
+            Self::NotDelivered => MobileError::NetworkError,
+            Self::MediaNotAcceptable => {
+                MobileError::CallFailed("the PBX refused the call's media (SIP 488)".into())
+            }
+            Self::Error(e) => e,
+        }
+    }
 }
 
 impl From<MobileError> for MakeCallFailure {
@@ -194,6 +212,21 @@ struct MakeCallRequest {
 #[derive(Deserialize)]
 struct ErrorBody {
     error: String,
+}
+
+/// A gateway error body that may say which SIP final response caused it.
+#[derive(Deserialize, Default)]
+struct SipErrorBody {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    sip_status: Option<u16>,
+}
+
+impl SipErrorBody {
+    fn media_not_acceptable(&self) -> bool {
+        self.error.as_deref() == Some("media_not_acceptable") || self.sip_status == Some(488)
+    }
 }
 
 #[derive(Serialize)]
@@ -884,10 +917,7 @@ impl GatewayClient {
     ) -> Result<(String, String, Route), MobileError> {
         self.make_call_detailed(token, destination_uri, sdp_offer, credentials, placement)
             .await
-            .map_err(|e| match e {
-                MakeCallFailure::NotDelivered => MobileError::NetworkError,
-                MakeCallFailure::Error(e) => e,
-            })
+            .map_err(MakeCallFailure::into_error)
     }
 
     /// [`Self::make_call`], telling a request that was never delivered (no
@@ -974,13 +1004,17 @@ impl GatewayClient {
             ));
         }
         if !resp.status().is_success() {
-            log::error!("Make call failed: {}", resp.status());
+            let status = resp.status();
+            log::error!("Make call failed: {status}");
+            if status == reqwest::StatusCode::BAD_GATEWAY {
+                let body: SipErrorBody = read_json_capped(resp).await.unwrap_or_default();
+                if body.media_not_acceptable() {
+                    return Err(MakeCallFailure::MediaNotAcceptable);
+                }
+            }
             return Err(MakeCallFailure::Error(status_error(
-                resp.status(),
-                MobileError::CallFailed(format!(
-                    "the call did not connect (HTTP {})",
-                    resp.status()
-                )),
+                status,
+                MobileError::CallFailed(format!("the call did not connect (HTTP {status})")),
             )));
         }
         let body: MakeCallResponse = read_json_capped(resp).await?;
@@ -1377,6 +1411,50 @@ mod transfer_tests {
                 other => panic!("unexpected error for {status}: {other:?}"),
             };
             assert_eq!(got, expected, "HTTP {status} {body}");
+        }
+    }
+
+    /// Only a 502 that says the PBX refused the media (488) is told apart,
+    /// so the core can retry with plain RTP; every other failure is not.
+    #[test]
+    fn a_488_from_the_pbx_is_told_apart_from_other_failures() {
+        let cases: [(u16, &str, bool); 6] = [
+            (
+                502,
+                r#"{"error":"media_not_acceptable","sip_status":488}"#,
+                true,
+            ),
+            (
+                502,
+                r#"{"error":"media_not_acceptable","sip_status":606}"#,
+                true,
+            ),
+            (502, r#"{"sip_status":488}"#, true),
+            (502, r#"{"error":"call_failed","sip_status":486}"#, false),
+            (502, "", false),
+            (500, r#"{"error":"media_not_acceptable"}"#, false),
+        ];
+        for (status, body, refused) in cases {
+            let gw = MockGateway::start(move |_| (status, body.into()));
+            let client = GatewayClient::new(gw.base_url.clone());
+            let attempt = std::sync::Mutex::new(None);
+            let err = block_on(client.make_call_detailed(
+                "jwt",
+                "1002",
+                "v=0",
+                &creds(),
+                Placement {
+                    client_ref: "ref",
+                    attempt: &attempt,
+                    pin: None,
+                },
+            ))
+            .unwrap_err();
+            assert_eq!(
+                matches!(err, super::MakeCallFailure::MediaNotAcceptable),
+                refused,
+                "HTTP {status} {body}: {err:?}"
+            );
         }
     }
 

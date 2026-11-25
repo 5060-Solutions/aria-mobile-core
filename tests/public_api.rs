@@ -50,6 +50,7 @@ fn public_types_are_reachable() {
         in_conference: false,
         recording: false,
         codec: None,
+        encrypted: false,
     };
     assert_eq!(info.state, CallState::Ringing);
 
