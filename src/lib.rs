@@ -2978,6 +2978,19 @@ impl AriaMobileEngine {
         self.request_recovery(true);
     }
 
+    /// See the UDL: the platform's DNS servers for SRV lookups.
+    pub fn set_dns_servers(&self, servers: Vec<String>) {
+        let ips: Vec<std::net::IpAddr> = servers
+            .iter()
+            .filter_map(|s| {
+                // Link-local scope ids ("fe80::1%wlan0") are not parsed.
+                let s = s.split('%').next().unwrap_or(s);
+                s.parse().ok()
+            })
+            .collect();
+        dns::resolver().set_servers(ips);
+    }
+
     /// Run (or queue one more) recovery pass; `media` also moves live calls.
     fn request_recovery(&self, media: bool) {
         if media {

@@ -545,6 +545,13 @@ interface AriaMobileEngine {
     /// A burst of changes is coalesced.
     void notify_network_change();
 
+    /// The DNS servers of the active network (Android: `LinkProperties
+    /// .dnsServers`, as IP address strings). The core resolves SRV through
+    /// exactly these, never a built-in public resolver; call it before
+    /// `notify_network_change` whenever the network changes. An empty list
+    /// falls back to the system configuration.
+    void set_dns_servers(sequence<string> servers);
+
     // ── On-device AI ────────────────────────────────────────────────────────
 
     /// Was this binary built with transcription support?

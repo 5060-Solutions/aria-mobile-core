@@ -336,6 +336,10 @@ const MAKE_CALL_TIMEOUT: Duration = Duration::from_secs(45);
 /// call has already ended locally, so it must not hang around.
 pub const HANGUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A heartbeat that is not answered by now means the path is dead (a
+/// half-open socket after a network change): fail it and try elsewhere.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Default timeout for every other request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -665,6 +669,7 @@ impl GatewayClient {
             .client
             .post(route.url(&path))
             .bearer_auth(token)
+            .timeout(HEARTBEAT_TIMEOUT)
             .send()
             .await
         {
@@ -674,7 +679,7 @@ impl GatewayClient {
                 404 | 410 => HeartbeatOutcome::UnknownDevice,
                 s => HeartbeatOutcome::Failed(format!("heartbeat refused (HTTP {s})")),
             },
-            Err(e) if e.is_connect() => HeartbeatOutcome::Unreachable,
+            Err(e) if e.is_connect() || e.is_timeout() => HeartbeatOutcome::Unreachable,
             Err(e) => HeartbeatOutcome::Failed(e.to_string()),
         }
     }

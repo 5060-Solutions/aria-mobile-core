@@ -460,6 +460,8 @@ fn engine(instances: &[&Instance]) -> (AriaMobileEngine, App, Arc<Speaker>) {
         first: Duration::from_millis(200),
         max: Duration::from_millis(400),
     };
+    // Quiet unless a test speeds it up (`fast_supervisor`).
+    *engine.registrar.supervisor_timing.write().unwrap() = slow_supervisor();
     let urls: Vec<String> = instances.iter().map(|i| i.url()).collect();
     let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
     engine.gateway.set_test_routes(&urls);
@@ -468,6 +470,22 @@ fn engine(instances: &[&Instance]) -> (AriaMobileEngine, App, Arc<Speaker>) {
     let speaker = Arc::new(Speaker::default());
     engine.set_audio_bridge(Box::new(Bridge(Arc::clone(&speaker))));
     (engine, app, speaker)
+}
+
+fn slow_supervisor() -> registration::SupervisorTiming {
+    registration::SupervisorTiming {
+        keepalive: Duration::from_secs(3600),
+        first: Duration::from_secs(3600),
+        max: Duration::from_secs(3600),
+    }
+}
+
+fn fast_supervisor(engine: &AriaMobileEngine, keepalive_ms: u64) {
+    *engine.registrar.supervisor_timing.write().unwrap() = registration::SupervisorTiming {
+        keepalive: Duration::from_millis(keepalive_ms),
+        first: Duration::from_millis(50),
+        max: Duration::from_millis(200),
+    };
 }
 
 fn flush(engine: &AriaMobileEngine) {
@@ -759,4 +777,52 @@ fn an_offer_held_by_the_other_instance_is_found() {
     );
     assert_eq!(gw2.count("GET", "/v1/calls/gw2-call9"), 1);
     let _ = engine.reject_incoming_call("gw2-call9".into());
+}
+
+/// A recovery that fails (the gateway is down) is retried by itself, with
+/// no further network change, until the gateway answers: the device ends
+/// `registered`, having reported `failed` on the way.
+#[test]
+fn a_failed_recovery_is_retried_until_the_gateway_is_back() {
+    let gw1 = Instance::start("gw1");
+    let (engine, app, _) = engine(&[&gw1]);
+    engine.register_device(registration()).unwrap();
+    fast_supervisor(&engine, 3_600_000);
+    gw1.kill();
+    engine.notify_network_change();
+    wait_until("failed reported", Duration::from_secs(3), || {
+        flush(&engine);
+        app.statuses().iter().any(|s| s == "failed")
+    });
+    let tries = gw1.count("POST", "/v1/devices/");
+    gw1.revive();
+    wait_until("registered again", Duration::from_secs(5), || {
+        flush(&engine);
+        app.statuses().last().map(String::as_str) == Some("registered")
+    });
+    assert!(gw1.count("POST", "/v1/devices/") > tries);
+}
+
+/// With nothing wrong, the core heartbeats on its own, silently.
+#[test]
+fn the_core_heartbeats_by_itself_without_noise() {
+    let gw1 = Instance::start("gw1");
+    let (engine, app, _) = engine(&[&gw1]);
+    engine.register_device(registration()).unwrap();
+    fast_supervisor(&engine, 80);
+    // The supervisor sleeps the old (long) interval once; a failure wakes it.
+    gw1.kill();
+    engine.notify_network_change();
+    gw1.revive();
+    wait_until("several heartbeats", Duration::from_secs(5), || {
+        gw1.count("POST", "/v1/devices/") >= 4
+    });
+    wait_until("settled registered", Duration::from_secs(3), || {
+        flush(&engine);
+        app.statuses().last().map(String::as_str) == Some("registered")
+    });
+    let n = app.statuses().len();
+    std::thread::sleep(Duration::from_millis(400));
+    flush(&engine);
+    assert_eq!(app.statuses().len(), n, "keepalives report nothing");
 }

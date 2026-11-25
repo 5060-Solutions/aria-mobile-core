@@ -19,7 +19,7 @@
 //!   instance no longer knows the device or cannot be reached, and reports
 //!   each step through `on_registration_changed`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
@@ -61,6 +61,37 @@ impl Default for FailbackTiming {
     }
 }
 
+/// Keepalive and retry timing of the supervisor.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SupervisorTiming {
+    /// Between heartbeats while all is well.
+    pub keepalive: Duration,
+    /// First retry after a failure; doubles up to `max`.
+    pub first: Duration,
+    pub max: Duration,
+}
+
+impl Default for SupervisorTiming {
+    fn default() -> Self {
+        Self {
+            keepalive: Duration::from_secs(300),
+            first: Duration::from_secs(5),
+            max: Duration::from_secs(300),
+        }
+    }
+}
+
+impl SupervisorTiming {
+    /// The wait before the next attempt after `failures` failures in a row.
+    fn delay(&self, failures: u32) -> Duration {
+        if failures == 0 {
+            return self.keepalive;
+        }
+        let exp = self.first.saturating_mul(1u32 << (failures - 1).min(16));
+        exp.min(self.max)
+    }
+}
+
 /// `d` scaled by a random factor in 0.8..1.2.
 fn jittered(d: Duration) -> Duration {
     d.mul_f64(0.8 + 0.4 * rand::random::<f64>())
@@ -81,6 +112,16 @@ pub(crate) struct Registrar {
     /// moves then.
     busy: RwLock<Option<Busy>>,
     me: Weak<Registrar>,
+    pub supervisor_timing: RwLock<SupervisorTiming>,
+    supervisor_running: AtomicBool,
+    /// Failed attempts in a row since the last good heartbeat.
+    failures: AtomicU32,
+    /// `failed` or `recovering` was reported and `registered` has not been
+    /// since: the next success is reported too.
+    degraded: AtomicBool,
+    /// Wakes the supervisor when a recovery fails, so it retries on the
+    /// backoff, not at the next keepalive.
+    wake: tokio::sync::Notify,
 }
 
 type Busy = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -102,6 +143,11 @@ impl Registrar {
             failback_running: AtomicBool::new(false),
             failback_timing: RwLock::new(FailbackTiming::default()),
             auth_blocked: AtomicBool::new(false),
+            supervisor_timing: RwLock::new(SupervisorTiming::default()),
+            supervisor_running: AtomicBool::new(false),
+            failures: AtomicU32::new(0),
+            degraded: AtomicBool::new(false),
+            wake: tokio::sync::Notify::new(),
         })
     }
 
@@ -136,6 +182,20 @@ impl Registrar {
     }
 
     fn report(&self, status: &str, error: Option<String>) {
+        match status {
+            status::RECOVERING | status::FAILED | status::AUTH_REQUIRED => {
+                self.degraded.store(true, Ordering::Relaxed);
+            }
+            status::REGISTERED => self.degraded.store(false, Ordering::Relaxed),
+            _ => {}
+        }
+        log::info!(
+            "Registration status: {status}{}",
+            error
+                .as_deref()
+                .map(|e| format!(" ({e})"))
+                .unwrap_or_default()
+        );
         let did = self.device_id().unwrap_or_default();
         self.events
             .registration_changed(did, status.to_string(), error);
@@ -162,8 +222,10 @@ impl Registrar {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(resp.device_id.clone());
         self.auth_blocked.store(false, Ordering::Relaxed);
+        self.failures.store(0, Ordering::Relaxed);
         self.report(status::REGISTERED, None);
         self.ensure_failback();
+        self.ensure_supervisor();
         Ok(resp)
     }
 
@@ -192,12 +254,20 @@ impl Registrar {
     /// the device is registered, reporting `recovering` and then
     /// `registered`, `failed` or `auth_required`.
     pub async fn recover(&self) -> Result<(), MobileError> {
+        self.recover_inner(false).await
+    }
+
+    /// `periodic`: a keepalive, silent while all is well.
+    async fn recover_inner(&self, periodic: bool) -> Result<(), MobileError> {
         let Some(device_id) = self.device_id() else {
             // Never registered: nothing to recover.
             return Ok(());
         };
-        self.report(status::RECOVERING, None);
-        crate::dns::resolver().clear_cache();
+        let quiet = periodic && !self.degraded.load(Ordering::Relaxed);
+        if !quiet {
+            self.report(status::RECOVERING, None);
+        }
+        crate::dns::resolver().network_changed();
         let _ = self.gateway.resolve_gateway().await;
 
         let route = self
@@ -206,13 +276,12 @@ impl Registrar {
             .unwrap_or_else(|| self.gateway.primary_route());
         let (token, generation) = self.auth.snapshot();
         let outcome = self.gateway.heartbeat_on(&route, &token, &device_id).await;
-        log::info!(
-            "Heartbeat on {} after network change: {outcome:?}",
-            route.target()
-        );
+        log::info!("Heartbeat on {}: {outcome:?}", route.target());
         let result = match outcome {
             HeartbeatOutcome::Ok => {
-                self.report(status::REGISTERED, None);
+                if !quiet {
+                    self.report(status::REGISTERED, None);
+                }
                 Ok(())
             }
             HeartbeatOutcome::Unauthorized => {
@@ -240,6 +309,14 @@ impl Registrar {
             HeartbeatOutcome::Unreachable => self.move_off(&route).await,
             HeartbeatOutcome::Failed(why) => Err(MobileError::CallFailed(why)),
         };
+        match &result {
+            Ok(()) => self.failures.store(0, Ordering::Relaxed),
+            Err(MobileError::AuthenticationError) => {}
+            Err(_) => {
+                self.failures.fetch_add(1, Ordering::Relaxed);
+                self.wake.notify_one();
+            }
+        }
         if let Err(e) = &result {
             if matches!(e, MobileError::AuthenticationError) {
                 self.auth_blocked.store(true, Ordering::Relaxed);
@@ -252,6 +329,52 @@ impl Registrar {
             }
         }
         result
+    }
+
+    /// Start the supervisor (one task): a heartbeat every `keepalive`, and
+    /// after a failed recovery, by whatever trigger, a retry on a capped
+    /// exponential backoff that never gives up. A 401 waits for
+    /// `set_gateway_token`, which recovers by itself.
+    pub fn ensure_supervisor(&self) {
+        let Some(me) = self.me.upgrade() else { return };
+        if self.supervisor_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        crate::runtime().spawn(async move {
+            me.supervise().await;
+            me.supervisor_running.store(false, Ordering::SeqCst);
+        });
+    }
+
+    async fn supervise(&self) {
+        loop {
+            let timing = *self
+                .supervisor_timing
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let failures = self.failures.load(Ordering::Relaxed);
+            let wait = jittered(timing.delay(failures));
+            log::debug!("Next registration check in {wait:?} ({failures} failures)");
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                () = self.wake.notified() => {
+                    // A recovery just failed: wait the backoff, not the
+                    // keepalive, then try again.
+                    let failures = self.failures.load(Ordering::Relaxed);
+                    tokio::time::sleep(jittered(timing.delay(failures))).await;
+                }
+            }
+            if self.device_id().is_none() {
+                return;
+            }
+            if self.auth_blocked.load(Ordering::Relaxed) {
+                continue;
+            }
+            if let Err(e) = self.recover_inner(true).await {
+                log::warn!("Registration check failed: {e}");
+            }
+            self.ensure_failback();
+        }
     }
 
     /// Start the failback probe if the device is off its preferred instance
