@@ -1114,6 +1114,9 @@ impl AriaMobileEngine {
             in_conference: false,
             recording: false,
             codec: media.as_ref().map(media::MobileMediaSession::codec_name),
+            encrypted: media
+                .as_ref()
+                .is_some_and(media::MobileMediaSession::srtp_active),
         };
 
         // From here an `active` status is this handset answering.
@@ -1385,6 +1388,7 @@ impl AriaMobileEngine {
             in_conference: false,
             recording: false,
             codec: None,
+            encrypted: false,
         };
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         let (outcome_tx, outcome_rx) = tokio::sync::watch::channel(None);
@@ -1518,20 +1522,27 @@ impl AriaMobileEngine {
         let registrar = Arc::clone(&self.registrar);
         let destination = uri.clone();
         let mut request = tokio::spawn(async move {
-            let place = || {
-                gateway.make_call_detailed(
-                    &token,
-                    &destination,
-                    &sdp_offer,
-                    &credentials,
-                    gateway_client::Placement {
-                        client_ref: &client_ref,
-                        attempt: &attempt,
-                        pin: pin.as_ref(),
-                    },
-                )
+            let place = |sdp_offer: String| {
+                let (gateway, token, destination, credentials) =
+                    (&gateway, &token, &destination, &credentials);
+                let (client_ref, attempt, pin) = (&client_ref, &attempt, pin.as_ref());
+                async move {
+                    gateway
+                        .make_call_detailed(
+                            token,
+                            destination,
+                            &sdp_offer,
+                            credentials,
+                            gateway_client::Placement {
+                                client_ref,
+                                attempt,
+                                pin,
+                            },
+                        )
+                        .await
+                }
             };
-            let mut result = place().await;
+            let mut result = place(sdp_offer.clone()).await;
             // The registered instance could not be connected to, so the
             // request was never delivered: move the registration to another
             // instance and place the call there. Not for a call pinned to
@@ -1540,16 +1551,35 @@ impl AriaMobileEngine {
             {
                 if let Some(dead) = gateway.registered_route() {
                     match registrar.move_off(&dead).await {
-                        Ok(()) => result = place().await,
+                        Ok(()) => result = place(sdp_offer.clone()).await,
                         Err(e) => log::warn!("Could not move the registration: {e}"),
                     }
                 }
             }
+            // The PBX refused SRTP outright (488, as the gateway reports
+            // it): place the call once more offering plain RTP. The call is
+            // then reported `encrypted = false`. Only on that explicit
+            // report; a bare failure is never retried, since it may be
+            // anything (busy, no route) and a second INVITE would ring the
+            // far end twice.
+            let mut downgraded = false;
+            if matches!(
+                result,
+                Err(gateway_client::MakeCallFailure::MediaNotAcceptable)
+            ) {
+                if let Some(plain) = media::plain_rtp_offer(&sdp_offer) {
+                    log::warn!(
+                        "The PBX refused SRTP (488); retrying once with plain RTP. \
+                         The call will NOT be encrypted"
+                    );
+                    downgraded = true;
+                    result = place(plain).await;
+                }
+            }
             let _ = done_tx.send(true);
-            result.map_err(|e| match e {
-                gateway_client::MakeCallFailure::NotDelivered => MobileError::NetworkError,
-                gateway_client::MakeCallFailure::Error(e) => e,
-            })
+            result
+                .map(|(t, sdp, r)| (t, sdp, r, downgraded))
+                .map_err(gateway_client::MakeCallFailure::into_error)
         });
 
         let answer = tokio::select! {
@@ -1561,13 +1591,13 @@ impl AriaMobileEngine {
                 if let Some(media) = &media {
                     media.stop();
                 }
-                let answered = async move { request.await.ok()?.ok().map(|(t, _, r)| (t, r)) };
+                let answered = async move { request.await.ok()?.ok().map(|(t, _, r, _)| (t, r)) };
                 self.hang_up_if_answered(call_id.clone(), answered, outcome_rx);
                 return Err(MobileError::Cancelled);
             }
         };
 
-        let (call_token, sdp_answer, route) = match answer {
+        let (call_token, sdp_answer, route, downgraded) = match answer {
             Ok(answer) => answer,
             Err(e) => {
                 if let Some(media) = &media {
@@ -1596,14 +1626,26 @@ impl AriaMobileEngine {
             // Enable SRTP if the far end accepted our crypto line. Applied
             // before the RTP threads start, so no frame is ever sent in the
             // clear on a call that negotiated encryption.
+            if downgraded {
+                // Our key was never sent with the offer that was answered.
+                media_session.set_offered_srtp_key(None);
+            }
             if let Err(e) = media_session.apply_remote_sdp(&sdp_answer) {
-                log::warn!("SRTP negotiation failed, continuing without it: {e:?}");
+                log::warn!(
+                    "SRTP negotiation failed ({e:?}); {call_id} continues in plain RTP, NOT encrypted"
+                );
             }
         }
 
         // Transition to connected
         info.state = CallState::Connected;
         info.codec = media.as_ref().map(media::MobileMediaSession::codec_name);
+        info.encrypted = media
+            .as_ref()
+            .is_some_and(media::MobileMediaSession::srtp_active);
+        if !info.encrypted {
+            log::warn!("{call_id} is connected with plain RTP: call audio is NOT encrypted");
+        }
         let poll_stop = Arc::new(AtomicBool::new(false));
 
         // Move the call from pending to active in one step with respect to
@@ -1737,6 +1779,7 @@ impl AriaMobileEngine {
                         in_conference: false,
                         recording: false,
                         codec: None,
+                        encrypted: false,
                     },
                     EndReason::Cancelled,
                 );
@@ -2603,6 +2646,7 @@ impl AriaMobileEngine {
                         in_conference: false,
                         recording: false,
                         codec: None,
+                        encrypted: false,
                     },
                     events: Arc::clone(&events),
                     accepting: false,
@@ -3027,6 +3071,7 @@ impl AriaMobileEngine {
             let gateway = Arc::clone(&self.gateway);
             let auth = Arc::clone(&self.auth);
             let events = Arc::clone(&self.events);
+            let calls = Arc::clone(&self.calls);
             let budget = self.rebind_stun_budget;
             let advertise = self.advertise_override.clone();
             runtime().spawn(async move {
@@ -3044,8 +3089,11 @@ impl AriaMobileEngine {
                     .await
                 {
                     Ok(answer) => {
-                        rebinder.apply_answer(&answer);
-                        log::info!("Media of {call_id} moved to {ip}:{port}");
+                        let encrypted = rebinder.apply_answer(&answer);
+                        log::info!(
+                            "Media of {call_id} moved to {ip}:{port} (encrypted: {encrypted})"
+                        );
+                        report_encryption(&calls, &events, &call_id, encrypted);
                     }
                     Err(MobileError::AuthenticationError) => {
                         report_auth_rejected(&auth, &events, generation);
@@ -3058,6 +3106,26 @@ impl AriaMobileEngine {
             });
         }
     }
+}
+
+/// Re-report `call_id` when its media encryption is no longer what was last
+/// reported, so the app's padlock follows the call (a media re-offer whose
+/// answer drops SRTP must not go unnoticed).
+fn report_encryption(calls: &CallMap, events: &Arc<Dispatcher>, call_id: &str, encrypted: bool) {
+    let mut calls = calls
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(call) = calls.get_mut(call_id) else {
+        return;
+    };
+    if call.info.encrypted == encrypted {
+        return;
+    }
+    call.info.encrypted = encrypted;
+    if !encrypted {
+        log::warn!("{call_id}: call audio is NOT encrypted any more");
+    }
+    call.events.emit(events, call.info.clone());
 }
 
 impl AriaMobileEngine {
@@ -3303,6 +3371,7 @@ mod tests {
                     in_conference: false,
                     recording: false,
                     codec: None,
+                    encrypted: false,
                 },
                 seq: engine.next_seq.fetch_add(1, Ordering::Relaxed),
                 media: None,
@@ -4724,6 +4793,7 @@ mod tests {
             in_conference: false,
             recording: false,
             codec: None,
+            encrypted: false,
         };
         assert!(events.emit(&engine.events, info(CallState::Ringing)));
         assert!(events.emit(&engine.events, info(CallState::Ended)));

@@ -31,6 +31,23 @@ struct Relay {
     from_ports: Arc<Mutex<Vec<u16>>>,
     dropped: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    /// SDES-SRTP like the PBX relay's per-leg SRTP: when on, the relay
+    /// answers RTP/SAVP with its own key, opens what the phone sends with the
+    /// phone's key, and seals what it sends.
+    srtp: Arc<Mutex<RelaySrtp>>,
+    /// Packets from the signalled address that failed to authenticate.
+    undecryptable: Arc<AtomicU64>,
+}
+
+#[derive(Default)]
+struct RelaySrtp {
+    on: bool,
+    /// The relay's key, as in its crypto line.
+    key: String,
+    out: Option<rtp_engine::srtp::SrtpContext>,
+    inbound: Option<rtp_engine::srtp::SrtpContext>,
+    /// The phone's key the inbound context was made from.
+    phone_key: Option<String>,
 }
 
 impl Relay {
@@ -45,6 +62,8 @@ impl Relay {
             from_ports: Arc::default(),
             dropped: Arc::default(),
             stop: Arc::default(),
+            srtp: Arc::default(),
+            undecryptable: Arc::default(),
         });
         let r = Arc::clone(&relay);
         std::thread::spawn(move || {
@@ -55,6 +74,13 @@ impl Relay {
                 if let Ok((n, from)) = r.socket.recv_from(&mut buf) {
                     if n >= 12 {
                         if *r.signaled.lock().unwrap() == Some(from) {
+                            let mut srtp = r.srtp.lock().unwrap();
+                            if let Some(ctx) = srtp.inbound.as_mut() {
+                                if ctx.unprotect_rtp(&buf[..n]).is_err() {
+                                    r.undecryptable.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+                            }
                             r.from_ports.lock().unwrap().push(from.port());
                         } else {
                             r.dropped.fetch_add(1, Ordering::Relaxed);
@@ -65,7 +91,11 @@ impl Relay {
                     next_send += Duration::from_millis(20);
                     let to = *r.signaled.lock().unwrap();
                     if let Some(to) = to {
-                        let _ = r.socket.send_to(&pcmu_tone(seq), to);
+                        let mut packet = pcmu_tone(seq);
+                        if let Some(ctx) = r.srtp.lock().unwrap().out.as_mut() {
+                            packet = ctx.protect_rtp(&packet).unwrap();
+                        }
+                        let _ = r.socket.send_to(&packet, to);
                         seq = seq.wrapping_add(1);
                     }
                 }
@@ -87,12 +117,74 @@ impl Relay {
             .and_then(|p| p.parse::<u16>().ok())
             .expect("an m=audio port");
         *self.signaled.lock().unwrap() = Some(SocketAddr::from(([127, 0, 0, 1], port)));
+        // Follow the phone's crypto line: its key opens what it sends.
+        let mut srtp = self.srtp.lock().unwrap();
+        let phone_key = rtp_engine::srtp::parse_sdp_crypto(sdp).filter(|_| srtp.on);
+        let Some(key) = phone_key else {
+            srtp.out = None;
+            srtp.inbound = None;
+            srtp.phone_key = None;
+            return;
+        };
+        if srtp.phone_key.as_deref() != Some(key.as_str()) {
+            srtp.inbound = Some(rtp_engine::srtp::SrtpContext::from_base64(&key).unwrap());
+            srtp.phone_key = Some(key);
+            if srtp.out.is_none() {
+                srtp.out = Some(rtp_engine::srtp::SrtpContext::from_base64(&srtp.key).unwrap());
+            }
+        }
+    }
+
+    /// Answer RTP/SAVP with the relay's own key from now on (`on`), or
+    /// plain RTP/AVP.
+    fn use_srtp(&self, on: bool) {
+        let mut srtp = self.srtp.lock().unwrap();
+        srtp.on = on;
+        if on && srtp.key.is_empty() {
+            srtp.key = rtp_engine::srtp::SrtpContext::generate().unwrap().1;
+        }
+    }
+
+    fn relay_key(&self) -> String {
+        self.srtp.lock().unwrap().key.clone()
     }
 
     fn answer_sdp(&self) -> String {
+        let srtp = self.srtp.lock().unwrap();
+        let (profile, crypto) = if srtp.on && srtp.phone_key.is_some() {
+            (
+                "RTP/SAVP",
+                rtp_engine::srtp::build_sdp_crypto_line(&srtp.key),
+            )
+        } else {
+            ("RTP/AVP", String::new())
+        };
         format!(
             "v=0\r\no=pbx 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
-             m=audio {} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n",
+             m=audio {} {profile} 0\r\na=rtpmap:0 PCMU/8000\r\n{crypto}a=sendrecv\r\n",
+            self.port()
+        )
+    }
+
+    /// An incoming call's offer, as the PBX sends it: RTP/SAVP with the
+    /// relay's key when SRTP is on (tag 7, to check the answer echoes it).
+    fn offer_sdp(&self) -> String {
+        let srtp = self.srtp.lock().unwrap();
+        let (profile, crypto) = if srtp.on {
+            (
+                "RTP/SAVP",
+                format!(
+                    "a=crypto:7 AES_CM_128_HMAC_SHA1_80 inline:{}|2^31\r\n",
+                    srtp.key
+                ),
+            )
+        } else {
+            ("RTP/AVP", String::new())
+        };
+        format!(
+            "v=0\r\no=pbx 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+             m=audio {} {profile} 0 101\r\na=rtpmap:0 PCMU/8000\r\n\
+             a=rtpmap:101 telephone-event/8000\r\n{crypto}a=sendrecv\r\n",
             self.port()
         )
     }
@@ -142,6 +234,9 @@ struct InstanceState {
     relay: Mutex<Option<Arc<Relay>>>,
     /// Answer 401 to heartbeats (an expired token).
     reject_tokens: AtomicBool,
+    /// Refuse an RTP/SAVP call offer as a PBX without SRTP does (488),
+    /// reported the way the gateway reports it (`Some(body)` is the 502 body).
+    refuse_savp: Mutex<Option<String>>,
 }
 
 /// One gateway instance on loopback.
@@ -160,6 +255,7 @@ impl Instance {
             next: AtomicUsize::new(1),
             relay: Mutex::new(None),
             reject_tokens: AtomicBool::new(false),
+            refuse_savp: Mutex::new(None),
         });
         Self::serve(Arc::clone(&state), listener);
         Self(state)
@@ -304,10 +400,20 @@ fn respond(state: &InstanceState, method: &str, path: &str, body: &str) -> (u16,
                 "call_token": tok,
                 "caller_uri": "2000@pbx",
                 "caller_name": null,
-                "sdp_offer": "v=0\r\nc=IN IP4 127.0.0.1\r\nm=audio 4000 RTP/AVP 0\r\n",
+                "sdp_offer": relay.map_or_else(
+                    || "v=0\r\nc=IN IP4 127.0.0.1\r\nm=audio 4000 RTP/AVP 0\r\n".to_string(),
+                    |r| r.offer_sdp(),
+                ),
             })
             .to_string(),
         ),
+        ("POST", ["v1", "calls", _, "accept"]) => {
+            if let Some(relay) = relay {
+                let req: serde_json::Value = serde_json::from_str(body).unwrap();
+                relay.signal(req["sdp_answer"].as_str().unwrap());
+            }
+            (200, "{}".into())
+        }
         ("POST", ["v1", "devices", id, "heartbeat"]) => {
             if state.devices.lock().unwrap().contains(*id) {
                 (204, String::new())
@@ -328,7 +434,13 @@ fn respond(state: &InstanceState, method: &str, path: &str, body: &str) -> (u16,
                 return (502, String::new());
             };
             let offer: serde_json::Value = serde_json::from_str(body).unwrap();
-            relay.signal(offer["sdp_offer"].as_str().unwrap());
+            let sdp = offer["sdp_offer"].as_str().unwrap();
+            if let Some(refusal) = state.refuse_savp.lock().unwrap().clone() {
+                if sdp.contains("RTP/SAVP") {
+                    return (502, refusal);
+                }
+            }
+            relay.signal(sdp);
             let n = state.next.fetch_add(1, Ordering::Relaxed);
             let answer = serde_json::json!({
                 "call_token": format!("{}-call{n}", state.name),
@@ -361,6 +473,9 @@ struct Speaker {
     /// Loud frames played, so silence (hold, nothing arriving) is not
     /// counted as audio.
     loud_frames: AtomicU64,
+    /// Frames that are exactly the relay's tone, decoded: proof that SRTP
+    /// was opened, since sealed bytes played as PCMU are loud noise too.
+    tone_frames: AtomicU64,
 }
 
 struct Bridge(Arc<Speaker>);
@@ -369,6 +484,14 @@ impl media::PlatformAudioBridge for Bridge {
     fn on_playback_audio(&self, samples: Vec<i16>, _sample_rate: u32) {
         if samples.iter().any(|s| s.unsigned_abs() > 1000) {
             self.0.loud_frames.fetch_add(1, Ordering::Relaxed);
+        }
+        let is_tone = samples.len() >= 2
+            && samples[0] != samples[1]
+            && samples
+                .chunks(2)
+                .all(|p| p.len() < 2 || (p[0], p[1]) == (samples[0], samples[1]));
+        if is_tone {
+            self.0.tone_frames.fetch_add(1, Ordering::Relaxed);
         }
     }
     fn on_capture_audio(&self, _sample_rate: u32, frame_size: u32) -> Vec<i16> {
@@ -838,4 +961,326 @@ fn dropping_the_engine_ends_the_supervisor() {
     wait_until("registrar freed", Duration::from_secs(3), || {
         weak.upgrade().is_none()
     });
+}
+
+// ── Media encryption ──────────────────────────────────────────────────────
+
+fn tone(speaker: &Speaker) -> u64 {
+    speaker.tone_frames.load(Ordering::Relaxed)
+}
+
+fn last_event(app: &App, call_id: &str) -> CallInfo {
+    app.calls
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|c| c.call_id == call_id)
+        .cloned()
+        .expect("an event for the call")
+}
+
+fn bodies(gw: &Instance, suffix: &str) -> Vec<String> {
+    gw.0.seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.method == "POST" && s.path.ends_with(suffix))
+        .map(|s| s.body.clone())
+        .collect()
+}
+
+fn sdp_of(body: &str, field: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    v[field].as_str().unwrap().to_string()
+}
+
+/// An outgoing call to a PBX that answers RTP/SAVP: audio is SRTP both ways
+/// (the relay authenticates every packet with the phone's key, the phone
+/// plays the relay's tone only after opening it), and the call is reported
+/// encrypted from `Connected` on.
+#[test]
+fn an_outgoing_call_is_srtp_both_ways_when_the_pbx_answers_savp() {
+    let gw = Instance::start("gw1");
+    let relay = Relay::start();
+    relay.use_srtp(true);
+    gw.with_relay(&relay);
+    let (engine, app, speaker) = engine(&[&gw]);
+    engine.register_device(registration()).unwrap();
+    let call_id = call(&engine);
+
+    let offer = sdp_of(&bodies(&gw, "/v1/calls")[0], "sdp_offer");
+    assert!(offer.contains(" RTP/SAVP "), "{offer}");
+    assert!(
+        offer.contains("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:"),
+        "{offer}"
+    );
+    assert!(
+        !offer.contains("\r\n\r\n"),
+        "no empty line in the SDP:\n{offer}"
+    );
+
+    let port = local_port_of(&engine, &call_id);
+    wait_until("SRTP both ways", Duration::from_secs(3), || {
+        relay.heard_from(port) >= 10 && tone(&speaker) >= 10
+    });
+    assert_eq!(relay.undecryptable.load(Ordering::Relaxed), 0);
+    flush(&engine);
+    let connected = app
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|c| c.call_id == call_id && c.state == CallState::Connected)
+        .cloned()
+        .unwrap();
+    assert!(connected.encrypted, "Connected must say encrypted");
+    assert!(engine.call_is_encrypted(call_id.clone()));
+    assert!(engine.get_active_call().unwrap().encrypted);
+    engine.set_mute(call_id.clone(), true).unwrap();
+    flush(&engine);
+    assert!(
+        last_event(&app, &call_id).encrypted,
+        "carried on later events"
+    );
+    engine.hangup(call_id).unwrap();
+}
+
+/// A PBX that answers without a crypto line: the call works in plain RTP
+/// and is reported unencrypted.
+#[test]
+fn an_outgoing_call_answered_without_crypto_is_plain_and_says_so() {
+    let gw = Instance::start("gw1");
+    let relay = Relay::start();
+    gw.with_relay(&relay);
+    let (engine, app, speaker) = engine(&[&gw]);
+    engine.register_device(registration()).unwrap();
+    let call_id = call(&engine);
+
+    let port = local_port_of(&engine, &call_id);
+    wait_until("plain audio both ways", Duration::from_secs(3), || {
+        relay.heard_from(port) >= 10 && tone(&speaker) >= 10
+    });
+    flush(&engine);
+    assert!(!last_event(&app, &call_id).encrypted);
+    assert!(!engine.call_is_encrypted(call_id.clone()));
+    engine.hangup(call_id).unwrap();
+}
+
+/// A PBX that refuses SRTP outright (488, reported by the gateway as 502
+/// `media_not_acceptable`): the call is placed once more with plain RTP,
+/// connects, and is reported unencrypted.
+#[test]
+fn a_488_to_the_srtp_offer_is_retried_once_with_plain_rtp() {
+    let gw = Instance::start("gw1");
+    let relay = Relay::start();
+    gw.with_relay(&relay);
+    *gw.0.refuse_savp.lock().unwrap() =
+        Some(r#"{"error":"media_not_acceptable","sip_status":488}"#.into());
+    let (engine, app, speaker) = engine(&[&gw]);
+    engine.register_device(registration()).unwrap();
+    let call_id = call(&engine);
+
+    let offers: Vec<String> = bodies(&gw, "/v1/calls")
+        .iter()
+        .map(|b| sdp_of(b, "sdp_offer"))
+        .collect();
+    assert_eq!(offers.len(), 2, "one retry");
+    assert!(offers[0].contains(" RTP/SAVP "));
+    assert!(offers[1].contains(" RTP/AVP "), "{}", offers[1]);
+    assert!(!offers[1].contains("a=crypto"), "{}", offers[1]);
+    let port = local_port_of(&engine, &call_id);
+    wait_until("plain audio both ways", Duration::from_secs(3), || {
+        relay.heard_from(port) >= 10 && tone(&speaker) >= 10
+    });
+    flush(&engine);
+    assert!(!last_event(&app, &call_id).encrypted);
+    engine.hangup(call_id).unwrap();
+}
+
+/// A bare 502 says nothing about why: no retry, the call fails.
+#[test]
+fn a_failure_that_does_not_say_488_is_not_retried() {
+    let gw = Instance::start("gw1");
+    let relay = Relay::start();
+    gw.with_relay(&relay);
+    *gw.0.refuse_savp.lock().unwrap() = Some(String::new());
+    let (engine, _app, _) = engine(&[&gw]);
+    engine.register_device(registration()).unwrap();
+
+    let r = engine.make_call_with_id(
+        new_outgoing_call_id(),
+        "1002".into(),
+        registration().sip,
+        vec![AudioCodec::Pcmu],
+    );
+
+    assert!(r.is_err());
+    assert_eq!(bodies(&gw, "/v1/calls").len(), 1);
+}
+
+/// A network switch on an SRTP call: the re-INVITE offers RTP/SAVP with the
+/// same key, the relay keeps its key, and audio stays SRTP both ways on the
+/// new socket with no change reported.
+#[test]
+fn a_network_switch_keeps_srtp_with_the_same_key() {
+    let gw = Instance::start("gw1");
+    let relay = Relay::start();
+    relay.use_srtp(true);
+    gw.with_relay(&relay);
+    let (engine, app, speaker) = engine(&[&gw]);
+    engine.register_device(registration()).unwrap();
+    let call_id = call(&engine);
+    let first_offer = sdp_of(&bodies(&gw, "/v1/calls")[0], "sdp_offer");
+    let key = rtp_engine::srtp::parse_sdp_crypto(&first_offer).unwrap();
+    let wifi_port = local_port_of(&engine, &call_id);
+    wait_until("SRTP on Wi-Fi", Duration::from_secs(3), || {
+        relay.heard_from(wifi_port) >= 10 && tone(&speaker) >= 10
+    });
+
+    engine.notify_network_change();
+    wait_until("re-INVITE sent", Duration::from_secs(3), || {
+        !bodies(&gw, "/media").is_empty()
+    });
+    let reoffer = sdp_of(&bodies(&gw, "/media")[0], "sdp");
+    assert!(reoffer.contains(" RTP/SAVP "), "{reoffer}");
+    assert_eq!(
+        rtp_engine::srtp::parse_sdp_crypto(&reoffer).as_deref(),
+        Some(key.as_str()),
+        "the same key is offered again"
+    );
+    let cell_port = local_port_of(&engine, &call_id);
+    assert_ne!(cell_port, wifi_port);
+    let before = tone(&speaker);
+    wait_until("SRTP on cellular", Duration::from_secs(3), || {
+        relay.heard_from(cell_port) >= 10 && tone(&speaker) >= before + 10
+    });
+    assert_eq!(relay.undecryptable.load(Ordering::Relaxed), 0);
+    flush(&engine);
+    assert!(app
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.call_id == call_id && c.state != CallState::Ringing)
+        .all(|c| c.encrypted));
+    assert!(engine.call_is_encrypted(call_id.clone()));
+    engine.hangup(call_id).unwrap();
+}
+
+/// The PBX answers the re-INVITE without crypto: media goes plain (so the
+/// call is not silent), and the call is re-reported `encrypted = false`.
+#[test]
+fn a_reoffer_answered_without_crypto_is_reported_unencrypted() {
+    let gw = Instance::start("gw1");
+    let relay = Relay::start();
+    relay.use_srtp(true);
+    gw.with_relay(&relay);
+    let (engine, app, speaker) = engine(&[&gw]);
+    engine.register_device(registration()).unwrap();
+    let call_id = call(&engine);
+    wait_until("SRTP", Duration::from_secs(3), || tone(&speaker) >= 10);
+    flush(&engine);
+    assert!(last_event(&app, &call_id).encrypted);
+    let events_before = app.calls.lock().unwrap().len();
+
+    relay.use_srtp(false);
+    engine.notify_network_change();
+    wait_until("re-reported unencrypted", Duration::from_secs(3), || {
+        flush(&engine);
+        !last_event(&app, &call_id).encrypted
+    });
+    let after = app.calls.lock().unwrap()[events_before..].to_vec();
+    assert_eq!(after.len(), 1, "one re-report: {after:?}");
+    assert_eq!(after[0].state, CallState::Connected);
+    assert!(!engine.call_is_encrypted(call_id.clone()));
+    let cell_port = local_port_of(&engine, &call_id);
+    let before = tone(&speaker);
+    wait_until("plain audio both ways", Duration::from_secs(3), || {
+        relay.heard_from(cell_port) >= 10 && tone(&speaker) >= before + 10
+    });
+    // The next move asks for SRTP again.
+    engine.notify_network_change();
+    wait_until("second re-INVITE", Duration::from_secs(3), || {
+        bodies(&gw, "/media").len() >= 2
+    });
+    assert!(sdp_of(&bodies(&gw, "/media")[1], "sdp").contains(" RTP/SAVP "));
+    engine.hangup(call_id).unwrap();
+}
+
+fn accept(engine: &AriaMobileEngine) -> CallInfo {
+    engine
+        .accept_incoming_call("gw1-in1".into(), vec![AudioCodec::Pcmu])
+        .expect("the call is answered")
+}
+
+/// An incoming RTP/SAVP offer is answered RTP/SAVP with our own key under
+/// the offer's tag; SRTP is on before the first frame, both ways.
+#[test]
+fn an_incoming_srtp_offer_is_answered_savp_and_media_is_srtp() {
+    let gw = Instance::start("gw1");
+    let relay = Relay::start();
+    relay.use_srtp(true);
+    gw.with_relay(&relay);
+    let (engine, app, speaker) = engine(&[&gw]);
+    engine.register_device(registration()).unwrap();
+
+    let info = accept(&engine);
+
+    assert!(info.encrypted, "{info:?}");
+    let answer = sdp_of(&bodies(&gw, "/accept")[0], "sdp_answer");
+    assert!(answer.contains(" RTP/SAVP 0 101"), "{answer}");
+    assert!(
+        answer.contains("a=crypto:7 AES_CM_128_HMAC_SHA1_80 inline:"),
+        "{answer}"
+    );
+    assert!(!answer.contains("\r\n\r\n"), "{answer}");
+    let ours = rtp_engine::srtp::parse_sdp_crypto(&answer).unwrap();
+    assert_ne!(ours, relay.relay_key(), "our own key, not the offer's");
+    let port = local_port_of(&engine, &info.call_id);
+    wait_until("SRTP both ways", Duration::from_secs(3), || {
+        relay.heard_from(port) >= 10 && tone(&speaker) >= 10
+    });
+    assert_eq!(
+        relay.undecryptable.load(Ordering::Relaxed),
+        0,
+        "no frame was sent in the clear"
+    );
+    flush(&engine);
+    assert!(last_event(&app, &info.call_id).encrypted);
+    assert!(engine.call_is_encrypted(info.call_id.clone()));
+
+    // And its network-change re-offer keeps our key.
+    engine.notify_network_change();
+    wait_until("re-INVITE sent", Duration::from_secs(3), || {
+        !bodies(&gw, "/media").is_empty()
+    });
+    let reoffer = sdp_of(&bodies(&gw, "/media")[0], "sdp");
+    assert_eq!(
+        rtp_engine::srtp::parse_sdp_crypto(&reoffer).as_deref(),
+        Some(ours.as_str())
+    );
+    engine.hangup(info.call_id).unwrap();
+}
+
+/// A plain incoming offer is answered RTP/AVP and reported unencrypted.
+#[test]
+fn an_incoming_plain_offer_is_answered_plain_and_says_so() {
+    let gw = Instance::start("gw1");
+    let relay = Relay::start();
+    gw.with_relay(&relay);
+    let (engine, _app, speaker) = engine(&[&gw]);
+    engine.register_device(registration()).unwrap();
+
+    let info = accept(&engine);
+
+    assert!(!info.encrypted);
+    let answer = sdp_of(&bodies(&gw, "/accept")[0], "sdp_answer");
+    assert!(answer.contains(" RTP/AVP "), "{answer}");
+    assert!(!answer.contains("a=crypto"), "{answer}");
+    wait_until("plain audio", Duration::from_secs(3), || {
+        tone(&speaker) >= 10
+    });
+    assert!(!engine.call_is_encrypted(info.call_id.clone()));
+    engine.hangup(info.call_id).unwrap();
 }

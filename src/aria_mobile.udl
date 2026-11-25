@@ -178,6 +178,13 @@ dictionary CallInfo {
     /// The negotiated audio codec by its SDP name (`PCMU`, `PCMA`, `opus`,
     /// `G729`), once the call has media; null before then.
     string? codec = null;
+    /// Call audio is SRTP-encrypted to the PBX, as actually negotiated:
+    /// set on `Connected` and carried on every later event, and re-reported
+    /// whenever it changes (a media re-offer after a network change). False
+    /// before `Connected` and whenever the far side declined SRTP: the app
+    /// must then say the call is not encrypted. Same value as
+    /// `call_is_encrypted`. See "Media encryption" in the README.
+    boolean encrypted = false;
 };
 
 /// Audio codec selection.

@@ -137,6 +137,29 @@ Push stays the incoming path in every case. The gateway keeps the SIP registrati
 
 `CallInfo.codec` carries the negotiated codec's SDP name (`PCMU`, `PCMA`, `opus`, `G729`) once the call has media.
 
+## Media encryption
+
+Call audio is SDES-SRTP (RFC 4568, `AES_CM_128_HMAC_SHA1_80`, the one suite rtp-engine implements) between the phone and the PBX's media relay. The keys travel in the SDP: phone to gateway over HTTPS, and gateway to PBX in SIP. They are protected on that SIP hop only when the gateway reaches the PBX over TLS (`sip_transport = tls`). The gateway carries the SDP and the RTP unchanged.
+
+`CallInfo.encrypted` is `true` when the call's audio is encrypted, **as negotiated**, not as configured. It is `false` on `Ringing`, and on any call where the far side did not agree SRTP. It is set on `Connected` and carried on every later event (mute, hold, conference, recording, `Ended`). When it changes during a call, the call is re-reported with the new value. `call_is_encrypted(call_id)` returns the same value. **Apps must say so plainly when a connected call is not encrypted**: plain RTP is a fallback, never silent.
+
+| Case | What the core does | `encrypted` |
+|---|---|---|
+| Outgoing call | Offers `RTP/SAVP` with a fresh per-call key (`a=crypto:1`). | |
+| ... answered with a crypto line | SRTP both ways, installed before the first RTP frame is sent. | `true` |
+| ... answered without crypto (`RTP/AVP`) | Continues in plain RTP. | `false` |
+| ... refused with SIP 488 / 606 | The gateway reports `502 {"error":"media_not_acceptable","sip_status":488}`. The core places the call **once more** with the same offer as `RTP/AVP` with no crypto line, and the call connects in plain RTP. Older gateways send a bare 502, which cannot be told apart from busy or no route, so it is not retried: the call fails with `CallFailed`. | `false` |
+| Incoming offer `RTP/SAVP` with a supported crypto line | Answers `RTP/SAVP` with our own fresh key, under the tag of the offer's line it accepted. Both SRTP contexts are installed before the answer is sent and before any frame, so nothing is sent or played in the clear. | `true` |
+| Incoming offer `RTP/AVP` | Answers `RTP/AVP`. | `false` |
+| Incoming `RTP/SAVP` with no usable crypto line | Answers `RTP/AVP` and logs a warning; the PBX may refuse the answer. This covers other suites, an MKI, session parameters, or an unusable key. | `false` |
+| Network change (media re-offer) on an encrypted call | Re-offers `RTP/SAVP` with the **same** key. Same key in the answer: SRTP carries on (rollover counter and replay window kept). New key: the inbound context is replaced. | `true` |
+| ... the re-offer's answer has no crypto | Media goes plain so the call is not silent, a warning is logged, and the call is re-reported. The next re-offer asks for SRTP again; if it is agreed, `true` is reported again. | `false` |
+| Network change on a plain call | Re-offers plain `RTP/AVP` (asking a peer that declined SRTP again could get the move refused). | `false` |
+
+A packet that fails SRTP authentication is dropped, never played. A frame that cannot be protected is dropped, never sent in the clear.
+
+Out of scope: media beyond the PBX (PBX to carrier/PSTN) is whatever the PBX and the carrier agree, usually plain RTP; `encrypted` describes the phone to PBX leg only.
+
 ## One-click setup links
 
 `provision_preview(link)` and `provision_redeem(link)` implement the desktop softphone's setup-link contract, so the same link works on every platform. They are namespace functions: no engine is needed, and they block (call them off the UI thread).
