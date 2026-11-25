@@ -2978,6 +2978,16 @@ impl AriaMobileEngine {
         self.request_recovery(true);
     }
 
+    /// See the UDL: the platform's DNS servers for SRV lookups.
+    pub fn set_dns_servers(&self, servers: Vec<String>) {
+        // "fe80::1%wlan0" keeps its scope: the interface it is reachable on.
+        let ips: Vec<dns::Server> = servers
+            .iter()
+            .filter_map(|s| dns::Server::parse(s))
+            .collect();
+        dns::resolver().set_servers(ips);
+    }
+
     /// Run (or queue one more) recovery pass; `media` also moves live calls.
     fn request_recovery(&self, media: bool) {
         if media {
