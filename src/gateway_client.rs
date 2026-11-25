@@ -166,6 +166,9 @@ struct GatewayCallOffer {
     caller_uri: String,
     caller_name: Option<String>,
     sdp_offer: String,
+    /// The INVITE's `X-Aria-Move` header, when the gateway passes it on.
+    #[serde(default)]
+    x_aria_move: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -808,6 +811,7 @@ impl GatewayClient {
                 caller_uri: body.caller_uri,
                 caller_name: body.caller_name,
                 sdp_offer: body.sdp_offer,
+                move_id: body.x_aria_move.filter(|m| !m.is_empty()),
             },
             route,
         ))
@@ -1201,6 +1205,20 @@ mod tests {
             build_target_url("http", "127.0.0.1", 8080, ""),
             "http://127.0.0.1:8080"
         );
+    }
+
+    #[test]
+    fn call_offer_carries_the_move_header() {
+        let with: GatewayCallOffer = serde_json::from_str(
+            r#"{"call_token":"t","caller_uri":"sip:a@b","caller_name":null,"sdp_offer":"","x_aria_move":"m-1"}"#,
+        )
+        .unwrap();
+        assert_eq!(with.x_aria_move.as_deref(), Some("m-1"));
+        let without: GatewayCallOffer = serde_json::from_str(
+            r#"{"call_token":"t","caller_uri":"sip:a@b","caller_name":null,"sdp_offer":""}"#,
+        )
+        .unwrap();
+        assert_eq!(without.x_aria_move, None);
     }
 
     // The pinned client must build successfully so TLS can validate against the

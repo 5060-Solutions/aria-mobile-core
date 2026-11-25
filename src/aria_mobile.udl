@@ -116,6 +116,8 @@ dictionary CallOffer {
     string caller_uri;
     string? caller_name;
     string sdp_offer;
+    /// The INVITE's X-Aria-Move value when the PBX is moving a call here.
+    string? move_id;
 };
 
 /// Current call state.

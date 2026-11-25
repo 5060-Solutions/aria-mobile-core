@@ -45,6 +45,9 @@ pub struct CallOffer {
     pub caller_uri: String,
     pub caller_name: Option<String>,
     pub sdp_offer: String,
+    /// The `X-Aria-Move` value when this INVITE is the PBX moving a call to
+    /// this device; the app compares it with the move it requested.
+    pub move_id: Option<String>,
 }
 
 /// Current call state.
