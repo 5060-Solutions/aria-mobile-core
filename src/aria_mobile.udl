@@ -97,6 +97,10 @@ dictionary DeviceRegistration {
     string platform;
     string push_token;
     string? bundle_id;
+    /// iOS only: the regular APNs device token (hex), distinct from the PushKit
+    /// token in `push_token`. The gateway sends text-message alerts only to
+    /// devices that registered one. Android's FCM `push_token` serves both.
+    string? alert_token = null;
     SipCredentials sip;
 };
 
@@ -304,6 +308,11 @@ interface AriaMobileEngine {
     /// Update the push token (e.g., after token refresh).
     [Throws=MobileError]
     void update_push_token(string device_id, string new_token);
+
+    /// Re-register with a new (or no) APNs alert token, e.g. after iOS hands
+    /// out a different one.
+    [Throws=MobileError]
+    void update_alert_token(string device_id, string? alert_token);
 
     // ── Incoming Call Handling (via push gateway) ───────────────────
 
