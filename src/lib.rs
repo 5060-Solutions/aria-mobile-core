@@ -2980,13 +2980,10 @@ impl AriaMobileEngine {
 
     /// See the UDL: the platform's DNS servers for SRV lookups.
     pub fn set_dns_servers(&self, servers: Vec<String>) {
-        let ips: Vec<std::net::IpAddr> = servers
+        // "fe80::1%wlan0" keeps its scope: the interface it is reachable on.
+        let ips: Vec<dns::Server> = servers
             .iter()
-            .filter_map(|s| {
-                // Link-local scope ids ("fe80::1%wlan0") are not parsed.
-                let s = s.split('%').next().unwrap_or(s);
-                s.parse().ok()
-            })
+            .filter_map(|s| dns::Server::parse(s))
             .collect();
         dns::resolver().set_servers(ips);
     }

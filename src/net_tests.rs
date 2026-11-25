@@ -826,3 +826,16 @@ fn the_core_heartbeats_by_itself_without_noise() {
     flush(&engine);
     assert_eq!(app.statuses().len(), n, "keepalives report nothing");
 }
+
+/// The supervisor holds the registrar weakly: dropping the engine frees it.
+#[test]
+fn dropping_the_engine_ends_the_supervisor() {
+    let gw1 = Instance::start("gw1");
+    let (engine, _app, _) = engine(&[&gw1]);
+    engine.register_device(registration()).unwrap();
+    let weak = Arc::downgrade(&engine.registrar);
+    drop(engine);
+    wait_until("registrar freed", Duration::from_secs(3), || {
+        weak.upgrade().is_none()
+    });
+}

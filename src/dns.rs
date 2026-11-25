@@ -48,7 +48,7 @@ struct CacheEntry {
 pub struct SrvResolver {
     resolver: Mutex<Option<Arc<TokioAsyncResolver>>>,
     /// Servers the platform supplied; `None` means read the system config.
-    servers: RwLock<Option<Vec<IpAddr>>>,
+    servers: RwLock<Option<Vec<Server>>>,
     builds: std::sync::atomic::AtomicUsize,
     cache: Mutex<HashMap<String, CacheEntry>>,
     /// Timeout for individual DNS queries.
@@ -93,9 +93,22 @@ impl SrvResolver {
             .clone();
         match servers {
             Some(ips) if !ips.is_empty() => Ok((config_for(&ips), Self::opts())),
-            _ => hickory_resolver::system_conf::read_system_conf()
-                .map(|(c, _)| (c, Self::opts()))
-                .map_err(|e| format!("no usable system DNS configuration: {e}")),
+            _ => Ok(match hickory_resolver::system_conf::read_system_conf() {
+                Ok((c, _)) if !c.name_servers().is_empty() => (c, Self::opts()),
+                other => {
+                    // Android and iOS have no resolv.conf, and the platform
+                    // supplied nothing: use hickory's default resolver, as
+                    // before, rather than losing SRV altogether.
+                    log::warn!(
+                        "No DNS servers supplied and no usable system configuration ({}); \
+                         using the default resolver",
+                        other
+                            .err()
+                            .map_or_else(|| "empty".to_string(), |e| e.to_string())
+                    );
+                    (ResolverConfig::default(), Self::opts())
+                }
+            }),
         }
     }
 
@@ -127,7 +140,7 @@ impl SrvResolver {
 
     /// The platform's DNS servers changed (the active network's
     /// `LinkProperties`): use them from now on.
-    pub fn set_servers(&self, servers: Vec<IpAddr>) {
+    pub fn set_servers(&self, servers: Vec<Server>) {
         log::info!(
             "DNS servers set by the platform: {} server(s)",
             servers.len()
@@ -135,7 +148,7 @@ impl SrvResolver {
         *self
             .servers
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(servers);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(usable(servers));
         self.network_changed();
     }
 
@@ -373,13 +386,81 @@ fn clamp_ttl(d: Duration) -> Duration {
     d.clamp(MIN_TTL, MAX_TTL)
 }
 
-/// A resolver configuration naming exactly `ips` (port 53, UDP then TCP).
-fn config_for(ips: &[IpAddr]) -> ResolverConfig {
-    ResolverConfig::from_parts(
-        None,
-        vec![],
-        NameServerConfigGroup::from_ips_clear(ips, 53, true),
-    )
+/// A resolver configuration naming exactly `servers` (port 53, UDP then
+/// TCP). A link-local IPv6 server keeps its scope id, which says which
+/// interface it is on.
+///
+/// Not covered: Android's Private DNS (DNS over TLS) in strict mode. The
+/// network's servers are used regardless of that setting, so a network that
+/// only answers over TLS yields no SRV answers, and the lookup falls back to
+/// A/AAAA through the platform resolver.
+fn config_for(servers: &[Server]) -> ResolverConfig {
+    use hickory_resolver::config::{NameServerConfig, Protocol};
+    let mut group = NameServerConfigGroup::new();
+    for s in servers {
+        for protocol in [Protocol::Udp, Protocol::Tcp] {
+            group.push(NameServerConfig {
+                socket_addr: s.socket_addr(53),
+                protocol,
+                tls_dns_name: None,
+                trust_negative_responses: false,
+                bind_addr: None,
+            });
+        }
+    }
+    ResolverConfig::from_parts(None, vec![], group)
+}
+
+/// A DNS server address, with the interface scope for link-local IPv6.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Server {
+    pub ip: IpAddr,
+    pub scope_id: u32,
+}
+
+impl Server {
+    fn socket_addr(&self, port: u16) -> SocketAddr {
+        match self.ip {
+            IpAddr::V6(v6) => {
+                SocketAddr::V6(std::net::SocketAddrV6::new(v6, port, 0, self.scope_id))
+            }
+            IpAddr::V4(v4) => SocketAddr::new(IpAddr::V4(v4), port),
+        }
+    }
+
+    fn is_link_local(&self) -> bool {
+        matches!(self.ip, IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80)
+    }
+
+    /// "192.168.1.1", "fe80::1%wlan0" or "fe80::1%23" (an interface name or index).
+    pub fn parse(s: &str) -> Option<Self> {
+        let (addr, scope) = match s.split_once('%') {
+            Some((a, z)) => (a, Some(z)),
+            None => (s, None),
+        };
+        let ip: IpAddr = addr.parse().ok()?;
+        let scope_id = scope.map_or(0, |z| z.parse().unwrap_or_else(|_| interface_index(z)));
+        Some(Self { ip, scope_id })
+    }
+}
+
+/// The index of the interface called `name`, 0 if there is none.
+fn interface_index(name: &str) -> u32 {
+    let Ok(c) = std::ffi::CString::new(name) else {
+        return 0;
+    };
+    // SAFETY: `c` is a valid NUL-terminated string for the call.
+    unsafe { libc::if_nametoindex(c.as_ptr()) }
+}
+
+/// Link-local servers are dropped when any other server exists: their
+/// scope may not match the interface a query leaves on.
+fn usable(servers: Vec<Server>) -> Vec<Server> {
+    if servers.iter().any(|s| !s.is_link_local()) {
+        servers.into_iter().filter(|s| !s.is_link_local()).collect()
+    } else {
+        servers
+    }
 }
 
 /// Global shared resolver instance.
@@ -409,8 +490,8 @@ pub async fn resolve_sip_server(
 mod tests {
     use super::*;
 
-    fn ip(s: &str) -> IpAddr {
-        s.parse().unwrap()
+    fn ip(s: &str) -> Server {
+        Server::parse(s).unwrap()
     }
 
     #[test]
@@ -421,7 +502,7 @@ mod tests {
             .iter()
             .map(|n| n.socket_addr.ip())
             .collect();
-        assert_eq!(addrs, [ip("192.168.1.1"), ip("fd00::1")].into());
+        assert_eq!(addrs, [ip("192.168.1.1").ip, ip("fd00::1").ip].into());
         assert!(
             cfg.name_servers()
                 .iter()
@@ -439,7 +520,7 @@ mod tests {
         assert!(cfg
             .name_servers()
             .iter()
-            .all(|n| n.socket_addr.ip() == ip("10.0.0.1")));
+            .all(|n| n.socket_addr.ip() == ip("10.0.0.1").ip));
         runtime_guard(|| {
             r.resolver().unwrap();
             r.resolver().unwrap();
@@ -451,7 +532,7 @@ mod tests {
             assert!(cfg
                 .name_servers()
                 .iter()
-                .all(|n| n.socket_addr.ip() == ip("10.9.9.9")));
+                .all(|n| n.socket_addr.ip() == ip("10.9.9.9").ip));
         });
     }
 
@@ -468,6 +549,32 @@ mod tests {
             r.resolver().unwrap();
             assert_eq!(r.builds(), 2);
         });
+    }
+
+    #[test]
+    fn link_local_servers_keep_their_scope_and_yield_to_others() {
+        let ll = Server::parse("fe80::1%7").unwrap();
+        assert_eq!(ll.scope_id, 7);
+        match ll.socket_addr(53) {
+            SocketAddr::V6(a) => assert_eq!(a.scope_id(), 7),
+            SocketAddr::V4(_) => panic!("v6"),
+        }
+        assert!(ll.is_link_local());
+        let kept = usable(vec![ll.clone(), ip("10.0.0.1")]);
+        assert_eq!(kept, vec![ip("10.0.0.1")]);
+        assert_eq!(usable(vec![ll.clone()]), vec![ll]);
+    }
+
+    #[test]
+    fn with_nothing_supplied_and_no_system_config_the_default_resolver_is_used() {
+        let r = SrvResolver::new();
+        // No list at all, and an empty one: both come out with name servers
+        // (the system's where it can be read, hickory's default where not).
+        let (cfg, _) = r.config().unwrap();
+        assert!(!cfg.name_servers().is_empty());
+        r.set_servers(vec![]);
+        let (cfg, _) = r.config().unwrap();
+        assert!(!cfg.name_servers().is_empty());
     }
 
     #[test]

@@ -121,7 +121,9 @@ pub(crate) struct Registrar {
     degraded: AtomicBool,
     /// Wakes the supervisor when a recovery fails, so it retries on the
     /// backoff, not at the next keepalive.
-    wake: tokio::sync::Notify,
+    wake: Arc<tokio::sync::Notify>,
+    /// One recovery at a time, whoever asks (network change, keepalive).
+    gate: tokio::sync::Mutex<()>,
 }
 
 type Busy = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -147,7 +149,8 @@ impl Registrar {
             supervisor_running: AtomicBool::new(false),
             failures: AtomicU32::new(0),
             degraded: AtomicBool::new(false),
-            wake: tokio::sync::Notify::new(),
+            wake: Arc::default(),
+            gate: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -263,11 +266,24 @@ impl Registrar {
             // Never registered: nothing to recover.
             return Ok(());
         };
-        let quiet = periodic && !self.degraded.load(Ordering::Relaxed);
+        // Single flight: a keepalive that finds a recovery running leaves
+        // it to that one; a network change waits its turn.
+        let _gate = if periodic {
+            match self.gate.try_lock() {
+                Ok(g) => g,
+                Err(_) => return Ok(()),
+            }
+        } else {
+            self.gate.lock().await
+        };
+        let degraded = self.degraded.load(Ordering::Relaxed);
+        let quiet = periodic && !degraded;
         if !quiet {
             self.report(status::RECOVERING, None);
+            // A network change, or a retry after a failure: start DNS
+            // afresh. A healthy keepalive keeps its resolver and cache.
+            crate::dns::resolver().network_changed();
         }
-        crate::dns::resolver().network_changed();
         let _ = self.gateway.resolve_gateway().await;
 
         let route = self
@@ -336,44 +352,54 @@ impl Registrar {
     /// exponential backoff that never gives up. A 401 waits for
     /// `set_gateway_token`, which recovers by itself.
     pub fn ensure_supervisor(&self) {
-        let Some(me) = self.me.upgrade() else { return };
         if self.supervisor_running.swap(true, Ordering::SeqCst) {
             return;
         }
+        let me = self.me.clone();
+        let wake = Arc::clone(&self.wake);
         crate::runtime().spawn(async move {
-            me.supervise().await;
-            me.supervisor_running.store(false, Ordering::SeqCst);
+            Self::supervise(me.clone(), wake).await;
+            if let Some(r) = me.upgrade() {
+                r.supervisor_running.store(false, Ordering::SeqCst);
+            }
         });
     }
 
-    async fn supervise(&self) {
+    /// Holds only a `Weak`: the task ends when the engine (and its
+    /// registrar) is dropped, or the device is unregistered.
+    async fn supervise(me: Weak<Registrar>, wake: Arc<tokio::sync::Notify>) {
         loop {
-            let timing = *self
+            let Some(this) = me.upgrade() else { return };
+            let timing = *this
                 .supervisor_timing
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let failures = self.failures.load(Ordering::Relaxed);
+            let failures = this.failures.load(Ordering::Relaxed);
+            drop(this);
             let wait = jittered(timing.delay(failures));
             log::debug!("Next registration check in {wait:?} ({failures} failures)");
             tokio::select! {
                 () = tokio::time::sleep(wait) => {}
-                () = self.wake.notified() => {
+                () = wake.notified() => {
                     // A recovery just failed: wait the backoff, not the
                     // keepalive, then try again.
-                    let failures = self.failures.load(Ordering::Relaxed);
+                    let Some(this) = me.upgrade() else { return };
+                    let failures = this.failures.load(Ordering::Relaxed);
+                    drop(this);
                     tokio::time::sleep(jittered(timing.delay(failures))).await;
                 }
             }
-            if self.device_id().is_none() {
+            let Some(this) = me.upgrade() else { return };
+            if this.device_id().is_none() {
                 return;
             }
-            if self.auth_blocked.load(Ordering::Relaxed) {
+            if this.auth_blocked.load(Ordering::Relaxed) {
                 continue;
             }
-            if let Err(e) = self.recover_inner(true).await {
+            if let Err(e) = this.recover_inner(true).await {
                 log::warn!("Registration check failed: {e}");
             }
-            self.ensure_failback();
+            this.ensure_failback();
         }
     }
 
