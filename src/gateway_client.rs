@@ -1295,6 +1295,25 @@ mod tests {
             .contains(['"', '<', '>']));
     }
 
+    #[test]
+    fn a_hold_return_name_that_cleans_to_nothing_is_none_and_a_long_one_is_capped() {
+        let body: GatewayCallOffer = serde_json::from_str(
+            r#"{"call_token":"t","caller_uri":"u","sdp_offer":"v=0","x_aria_hold_return":"hw-1","x_aria_hold_return_name":"<>\""}"#,
+        )
+        .unwrap();
+        assert_eq!(offer_from(body).hold_return_name, None);
+
+        let long = "a".repeat(100);
+        let json = format!(
+            r#"{{"call_token":"t","caller_uri":"u","sdp_offer":"v=0","x_aria_hold_return":"hw-1","x_aria_hold_return_name":"{long}"}}"#
+        );
+        let body: GatewayCallOffer = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            offer_from(body).hold_return_name.unwrap().chars().count(),
+            64
+        );
+    }
+
     // The pinned client must build successfully so TLS can validate against the
     // domain while connecting to the resolved IP.
     #[test]
