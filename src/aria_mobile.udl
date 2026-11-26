@@ -118,6 +118,10 @@ dictionary CallOffer {
     string sdp_offer;
     /// The INVITE's X-Aria-Move value when the PBX is moving a call here.
     string? move_id;
+    /// The INVITE's X-Aria-Hold-Return value: the PBX is ringing this device because the far party of a Hold for me wait is back.
+    string? hold_return_id;
+    /// The INVITE's X-Aria-Hold-Return-Name value: who is back.
+    string? hold_return_name;
 };
 
 /// Current call state.

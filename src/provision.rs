@@ -335,7 +335,7 @@ fn get_str<'a>(map: &'a JsonMap, key: &str) -> Option<&'a str> {
 
 /// Display text: control characters, quotes, backslashes and angle brackets
 /// dropped (a display name goes into a SIP quoted-string), length capped.
-fn clean_text(s: &str, max_chars: usize) -> String {
+pub(crate) fn clean_text(s: &str, max_chars: usize) -> String {
     s.chars()
         .filter(|c| !c.is_control() && !matches!(c, '"' | '\\' | '<' | '>'))
         .take(max_chars)

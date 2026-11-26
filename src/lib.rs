@@ -4214,6 +4214,8 @@ mod tests {
             caller_name: Some("Alice".to_string()),
             sdp_offer: String::new(),
             move_id: None,
+            hold_return_id: None,
+            hold_return_name: None,
         }
     }
 

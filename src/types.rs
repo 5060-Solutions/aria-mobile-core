@@ -48,6 +48,10 @@ pub struct CallOffer {
     /// The `X-Aria-Move` value when this INVITE is the PBX moving a call to
     /// this device; the app compares it with the move it requested.
     pub move_id: Option<String>,
+    /// The `X-Aria-Hold-Return` value: the far party of a Hold for me wait is back.
+    pub hold_return_id: Option<String>,
+    /// The `X-Aria-Hold-Return-Name` value: who is back.
+    pub hold_return_name: Option<String>,
 }
 
 /// Current call state.
