@@ -93,6 +93,8 @@ pub enum EndReason {
     Failed,
     /// An outgoing call was hung up before it was answered.
     Cancelled,
+    /// The PBX released this handset into a Hold for me wait; the far party is still on the line.
+    HeldForYou,
 }
 
 impl EndReason {
@@ -106,6 +108,7 @@ impl EndReason {
             Some("rejected" | "declined") => EndReason::Rejected,
             Some("answered_elsewhere") => EndReason::AnsweredElsewhere,
             Some("no_ack" | "gateway_lost") => EndReason::Failed,
+            Some("held_for_you") => EndReason::HeldForYou,
             _ => fallback,
         }
     }

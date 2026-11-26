@@ -161,6 +161,8 @@ enum EndReason {
     "Failed",
     /// An outgoing call was hung up before it was answered.
     "Cancelled",
+    /// The PBX released this handset into a Hold for me wait; the far party is still on the line.
+    "HeldForYou",
 };
 
 /// Information about an active call.

@@ -4469,6 +4469,27 @@ mod tests {
         }
     }
 
+    /// A Hold for me release takes its reason from the gateway's `/status`.
+    #[test]
+    fn a_held_for_you_end_takes_its_reason_from_the_gateway() {
+        let gw = MockGateway::start(|_| {
+            (
+                200,
+                r#"{"status":"ended","reason":"held_for_you"}"#.to_string(),
+            )
+        });
+        let (engine, recorder) = engine(&gw.base_url);
+        let stop = insert_call(&engine, "c1", "tok");
+        engine.start_call_status_poll(
+            "c1".into(),
+            "tok".into(),
+            engine.gateway.primary_route(),
+            stop,
+        );
+        let states = recorder.wait_for(1);
+        assert_eq!(states[0].end_reason, Some(EndReason::HeldForYou));
+    }
+
     #[test]
     fn gateway_reasons_map_to_end_reasons() {
         use EndReason::*;
@@ -4484,6 +4505,8 @@ mod tests {
                 AnsweredElsewhere,
             ),
             (Some("no_ack"), RemoteHangup, Failed),
+            (Some("held_for_you"), RemoteHangup, HeldForYou),
+            (Some("held_for_you"), CallerCancelled, HeldForYou),
             (Some("something_new"), RemoteHangup, RemoteHangup),
             (None, CallerCancelled, CallerCancelled),
         ] {
