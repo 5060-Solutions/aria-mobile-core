@@ -4213,6 +4213,7 @@ mod tests {
             caller_uri: "sip:1001@pbx.example.com".to_string(),
             caller_name: Some("Alice".to_string()),
             sdp_offer: String::new(),
+            move_id: None,
         }
     }
 
