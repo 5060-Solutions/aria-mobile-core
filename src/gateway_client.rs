@@ -10,6 +10,7 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use crate::dns;
+use crate::provision;
 use crate::types::*;
 
 /// Maximum size of a gateway JSON response we will buffer. Gateway payloads are
@@ -187,6 +188,27 @@ struct GatewayCallOffer {
     /// The INVITE's `X-Aria-Move` header, when the gateway passes it on.
     #[serde(default)]
     x_aria_move: Option<String>,
+    /// The INVITE's `X-Aria-Hold-Return` header, when the gateway passes it on.
+    #[serde(default)]
+    x_aria_hold_return: Option<String>,
+    /// The INVITE's `X-Aria-Hold-Return-Name` header.
+    #[serde(default)]
+    x_aria_hold_return_name: Option<String>,
+}
+
+fn offer_from(body: GatewayCallOffer) -> CallOffer {
+    CallOffer {
+        call_token: body.call_token,
+        caller_uri: body.caller_uri,
+        caller_name: body.caller_name,
+        sdp_offer: body.sdp_offer,
+        move_id: body.x_aria_move.filter(|m| !m.is_empty()),
+        hold_return_id: body.x_aria_hold_return.filter(|v| !v.is_empty()),
+        hold_return_name: body
+            .x_aria_hold_return_name
+            .map(|n| provision::clean_text(&n, 64))
+            .filter(|n| !n.is_empty()),
+    }
 }
 
 #[derive(Serialize)]
@@ -838,16 +860,7 @@ impl GatewayClient {
         }
 
         let body: GatewayCallOffer = read_json_capped(resp).await?;
-        Ok((
-            CallOffer {
-                call_token: body.call_token,
-                caller_uri: body.caller_uri,
-                caller_name: body.caller_name,
-                sdp_offer: body.sdp_offer,
-                move_id: body.x_aria_move.filter(|m| !m.is_empty()),
-            },
-            route,
-        ))
+        Ok((offer_from(body), route))
     }
 
     /// Accept an incoming call by sending the SDP answer.
@@ -1253,6 +1266,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(without.x_aria_move, None);
+    }
+
+    #[test]
+    fn call_offer_carries_the_hold_return() {
+        let body: GatewayCallOffer = serde_json::from_str(r#"{"call_token":"t","caller_uri":"u","sdp_offer":"v=0","x_aria_hold_return":"hw-1","x_aria_hold_return_name":"Acme Bank"}"#).unwrap();
+        let offer = offer_from(body);
+        assert_eq!(offer.hold_return_id.as_deref(), Some("hw-1"));
+        assert_eq!(offer.hold_return_name.as_deref(), Some("Acme Bank"));
+        assert_eq!(offer.move_id, None);
+    }
+
+    #[test]
+    fn an_offer_without_hold_return_keys_still_decodes() {
+        let body: GatewayCallOffer =
+            serde_json::from_str(r#"{"call_token":"t","caller_uri":"u","sdp_offer":"v=0"}"#)
+                .unwrap();
+        let offer = offer_from(body);
+        assert!(offer.hold_return_id.is_none() && offer.hold_return_name.is_none());
+    }
+
+    #[test]
+    fn a_hold_return_name_is_cleaned_in_the_core_too() {
+        let body: GatewayCallOffer = serde_json::from_str(r#"{"call_token":"t","caller_uri":"u","sdp_offer":"v=0","x_aria_hold_return":"hw-1","x_aria_hold_return_name":"Acme\"<b>"}"#).unwrap();
+        assert!(!offer_from(body)
+            .hold_return_name
+            .unwrap()
+            .contains(['"', '<', '>']));
+    }
+
+    #[test]
+    fn a_hold_return_name_that_cleans_to_nothing_is_none_and_a_long_one_is_capped() {
+        let body: GatewayCallOffer = serde_json::from_str(
+            r#"{"call_token":"t","caller_uri":"u","sdp_offer":"v=0","x_aria_hold_return":"hw-1","x_aria_hold_return_name":"<>\""}"#,
+        )
+        .unwrap();
+        assert_eq!(offer_from(body).hold_return_name, None);
+
+        let long = "a".repeat(100);
+        let json = format!(
+            r#"{{"call_token":"t","caller_uri":"u","sdp_offer":"v=0","x_aria_hold_return":"hw-1","x_aria_hold_return_name":"{long}"}}"#
+        );
+        let body: GatewayCallOffer = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            offer_from(body).hold_return_name.unwrap().chars().count(),
+            64
+        );
     }
 
     // The pinned client must build successfully so TLS can validate against the

@@ -48,6 +48,10 @@ pub struct CallOffer {
     /// The `X-Aria-Move` value when this INVITE is the PBX moving a call to
     /// this device; the app compares it with the move it requested.
     pub move_id: Option<String>,
+    /// The `X-Aria-Hold-Return` value: the far party of a Hold for me wait is back.
+    pub hold_return_id: Option<String>,
+    /// The `X-Aria-Hold-Return-Name` value: who is back.
+    pub hold_return_name: Option<String>,
 }
 
 /// Current call state.
@@ -89,6 +93,8 @@ pub enum EndReason {
     Failed,
     /// An outgoing call was hung up before it was answered.
     Cancelled,
+    /// The PBX released this handset into a Hold for me wait; the far party is still on the line.
+    HeldForYou,
 }
 
 impl EndReason {
@@ -102,6 +108,7 @@ impl EndReason {
             Some("rejected" | "declined") => EndReason::Rejected,
             Some("answered_elsewhere") => EndReason::AnsweredElsewhere,
             Some("no_ack" | "gateway_lost") => EndReason::Failed,
+            Some("held_for_you") => EndReason::HeldForYou,
             _ => fallback,
         }
     }
