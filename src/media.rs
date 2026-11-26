@@ -49,7 +49,9 @@ pub struct MobileMediaSession {
     /// Shared remote address — updated by update_remote() and symmetric RTP
     remote_addr: Arc<Mutex<SocketAddr>>,
     local_port: Arc<AtomicU16>,
-    codec: AudioCodec,
+    /// What the call is on. Set at offer time from the first preference,
+    /// then from the answer: the far end may pick another codec of the offer.
+    codec: Mutex<AudioCodec>,
     muted: Arc<AtomicBool>,
     on_hold: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
@@ -295,7 +297,7 @@ impl MobileMediaSession {
             rtp_socket: Arc::new(std::sync::RwLock::new(Arc::new(socket))),
             remote_addr: Arc::new(Mutex::new(remote_addr)),
             local_port: Arc::new(AtomicU16::new(local_port)),
-            codec,
+            codec: Mutex::new(codec),
             muted: Arc::new(AtomicBool::new(false)),
             on_hold: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(true)),
@@ -348,7 +350,7 @@ impl MobileMediaSession {
             socket: Arc::clone(&self.rtp_socket),
             local_port: Arc::clone(&self.local_port),
             remote_addr: Arc::clone(&self.remote_addr),
-            codec: self.codec,
+            codec: self.codec(),
             srtp: self.srtp_slots(),
         }
     }
@@ -362,9 +364,24 @@ impl MobileMediaSession {
         }
     }
 
+    /// The codec this call is on.
+    pub fn codec(&self) -> AudioCodec {
+        *locked(&self.codec)
+    }
+
+    /// Move the call to the codec the far end's answer chose. Must be applied
+    /// before the RTP threads start: they take the codec once.
+    ///
+    /// The offer lists every codec we accept but the session starts on the
+    /// first; a PBX that bridges to a carrier on G.711 answers with that, and
+    /// an Opus encoder sending payload type 111 into it is noise to both ends.
+    pub fn set_codec(&self, codec: AudioCodec) {
+        *locked(&self.codec) = codec;
+    }
+
     /// The negotiated codec, by its SDP name (`PCMU`, `PCMA`, `opus`, `G729`).
     pub fn codec_name(&self) -> String {
-        self.codec.name().to_string()
+        self.codec().name().to_string()
     }
 
     /// Update the remote RTP address (e.g., after receiving SDP answer).
@@ -378,9 +395,10 @@ impl MobileMediaSession {
 
     /// Start the RTP receive and send loops with a platform audio bridge.
     pub fn start_with_bridge(&self, bridge: Arc<dyn PlatformAudioBridge>) {
-        let codec_type = self.codec.to_rtp_codec();
-        let sample_rate = self.codec.clock_rate();
-        let frame_samples: u32 = match self.codec {
+        let codec = self.codec();
+        let codec_type = codec.to_rtp_codec();
+        let sample_rate = codec.clock_rate();
+        let frame_samples: u32 = match codec {
             AudioCodec::Opus => 960, // 20ms at 48kHz
             _ => 160,                // 20ms at 8kHz
         };
@@ -582,7 +600,7 @@ impl MobileMediaSession {
             let on_hold = self.on_hold.clone();
             let remote_addr = self.remote_addr.clone(); // shared with RX for symmetric RTP
             let ssrc = self.ssrc;
-            let pt = self.codec.payload_type();
+            let pt = codec.payload_type();
             let pkts_tx = self.packets_sent.clone();
             let bytes_tx = self.bytes_sent.clone();
             let tx_level = self.tx_level.clone();
@@ -751,8 +769,8 @@ impl MobileMediaSession {
     /// silence both ways, as outside a conference.
     pub fn join_conference(first: &MobileMediaSession, second: &MobileMediaSession) {
         let conference = Arc::new(Conference::new(
-            first.codec.clock_rate(),
-            second.codec.clock_rate(),
+            first.codec().clock_rate(),
+            second.codec().clock_rate(),
         ));
         *second
             .conference
@@ -767,7 +785,7 @@ impl MobileMediaSession {
 
     /// The codec's sample rate: what the RTP loops decode to and encode from.
     pub fn sample_rate(&self) -> u32 {
-        self.codec.clock_rate()
+        self.codec().clock_rate()
     }
 
     /// Attach (or with `None`, detach) a call recorder. Audio reaches it from
@@ -2809,5 +2827,86 @@ mod opus_codec_tests {
                 );
             }
         }
+    }
+}
+
+/// Regression: an outgoing call to the PBX, which answers SDES, played noise
+/// (carrier calls from the Android app, 2026-11-26). The receive loop
+/// authenticated and decrypted each packet, then handed the decoder the bytes
+/// of the original datagram: ciphertext, with the 10-byte tag on the end.
+/// Incoming calls were unaffected because their answer carried no crypto.
+#[cfg(test)]
+mod srtp_receive_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct Collect(Mutex<Vec<Vec<i16>>>);
+
+    impl PlatformAudioBridge for Collect {
+        fn on_playback_audio(&self, samples: Vec<i16>, _sample_rate: u32) {
+            self.0.lock().unwrap().push(samples);
+        }
+
+        fn on_capture_audio(&self, _sample_rate: u32, frame_size: u32) -> Vec<i16> {
+            vec![0; frame_size as usize]
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_srtp_call_plays_the_decrypted_audio() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let session = MobileMediaSession::new(peer.local_addr().expect("addr"), AudioCodec::Pcmu)
+            .await
+            .expect("media session");
+        let port = session.local_port();
+
+        let (_ctx, ours) = rtp_engine::srtp::SrtpContext::generate().expect("key");
+        let (mut theirs_ctx, theirs) = rtp_engine::srtp::SrtpContext::generate().expect("key");
+        session.set_srtp_keys(&ours, &theirs).expect("keys");
+        let bridge = Arc::new(Collect::default());
+        session.start_with_bridge(bridge.clone());
+
+        // A recognisable payload: 160 distinct µ-law bytes.
+        let payload: Vec<u8> = (0..160_u32).map(|i| (i * 7 % 251) as u8).collect();
+        let mut expected = Vec::new();
+        rtp_engine::codec::create_decoder(rtp_engine::CodecType::Pcmu)
+            .expect("decoder")
+            .decode(&payload, &mut expected);
+
+        let target: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        for seq in 0..10_u16 {
+            let mut pkt = vec![0x80, 0];
+            pkt.extend_from_slice(&seq.to_be_bytes());
+            pkt.extend_from_slice(&(u32::from(seq) * 160).to_be_bytes());
+            pkt.extend_from_slice(&0x1234_5678_u32.to_be_bytes());
+            pkt.extend_from_slice(&payload);
+            let sealed = theirs_ctx.protect_rtp(&pkt).expect("protect");
+            peer.send_to(&sealed, target).await.expect("send");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        session.stop();
+
+        let played = bridge.0.lock().unwrap();
+        assert!(!played.is_empty(), "nothing reached the speaker");
+        assert!(
+            played.iter().all(|frame| *frame == expected),
+            "playback is not the peer's audio"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_answers_codec_replaces_the_first_preference() {
+        let placeholder: SocketAddr = "0.0.0.0:0".parse().expect("addr");
+        let session = MobileMediaSession::new(placeholder, AudioCodec::Opus)
+            .await
+            .expect("media session");
+        let answer = "v=0\r\nc=IN IP4 198.51.100.1\r\nm=audio 20000 RTP/SAVP 0 101\r\n\
+                      a=rtpmap:0 PCMU/8000\r\n";
+        let (_, answered) = parse_sdp_remote(answer).expect("answer");
+        session.set_codec(answered);
+        assert_eq!(session.codec_name(), "PCMU");
+        assert_eq!(session.sample_rate(), 8000);
     }
 }

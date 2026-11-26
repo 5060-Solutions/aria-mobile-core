@@ -1619,8 +1619,11 @@ impl AriaMobileEngine {
 
         if let Some(media_session) = &media {
             // Parse the SDP answer to get the remote RTP address
-            if let Some((remote_addr, _codec)) = media::parse_sdp_remote_pub(&sdp_answer) {
+            if let Some((remote_addr, answered_codec)) = media::parse_sdp_remote_pub(&sdp_answer) {
                 media_session.update_remote(remote_addr);
+                // The answer's codec is the one the far end will send and
+                // expect, whatever our first preference was.
+                media_session.set_codec(answered_codec);
             }
 
             // Enable SRTP if the far end accepted our crypto line. Applied
